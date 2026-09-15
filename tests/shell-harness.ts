@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -309,6 +309,100 @@ export function removeWhenFree(dir: string): void {
   }
 }
 
+/**
+ * 找到 `dsh` 启动器真正要跑的脚本（`@deepseek-ai/dsh/lib/bin.js`）。
+ *
+ * 走 PATH 上的 `dsh` 垫片而不是把本机的绝对路径写进仓库：垫片就在安装目录顶层，
+ * 它指向的 `node_modules/@deepseek-ai/dsh/lib/bin.js` 是启动器本体。`DSH_BIN` 可以
+ * 直接指定本体，供装在别处的人用。
+ *
+ * @returns 绝对路径，找不到时 undefined。
+ */
+export function resolveDshBinScript(): string | undefined {
+  const explicit = process.env.DSH_BIN
+  if (explicit !== undefined && explicit !== '' && existsSync(explicit)) return explicit
+  const located = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['dsh'], {
+    encoding: 'utf8',
+    windowsHide: true,
+  })
+  const first = (located.stdout ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '')[0]
+  if (first === undefined) return undefined
+  const candidate = join(dirname(first), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  return existsSync(candidate) ? candidate : undefined
+}
+
+/** 本仓库的包名：它在宿主里同时是插件 id 与启动图里的键。 */
+export function repoPackageName(): string {
+  const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as { name?: string }
+  if (typeof manifest.name !== 'string') throw new Error('package.json has no name')
+  return manifest.name
+}
+
+/** 一个临时 harness home，以及它那个装好本插件的 profile。 */
+export interface TempDshHome {
+  /** 临时 `DSH_HOME`：把它交给外壳，DSH 的一切就都落在这里，用户自己的 `~/.dsh` 一个字节都不碰。 */
+  home: string
+  /** profile 名（`dsh --profile <name>`）。 */
+  profile: string
+  /** profile 目录（`<home>/profiles/<name>`）。 */
+  profileDir: string
+  /** 删掉整个临时 home。**只能走 `removeWhenFree`**（Windows 上句柄还没释放时裸删会 EPERM）。 */
+  remove: () => void
+}
+
+/**
+ * 现搭一个临时 `DSH_HOME`，里面有一个装好本插件的 profile。
+ *
+ * 形状照用户 `~/.dsh/profiles/dshviewer` 抄：`dependencies` 里是本仓库的 `link:`，
+ * `node_modules` 里是指向仓库的目录联接，`dsh.profile.bundles` 列三个 bundle。
+ * `@deepseek-ai/dsh-base` / `dsh-web-app` 由启动器自己解析（它们在 dsh 包内部），
+ * 所以不用为它们建联接。
+ *
+ * @param options - profile 名，以及要额外挂上去的 bundle（票 #12 的探针就是这样一个）。
+ * @returns 临时 home 的描述与清理口。
+ */
+export function makeTempDshHome(options: {
+  profile: string
+  extraBundles?: Array<{ name: string; dir: string }>
+}): TempDshHome {
+  const name = repoPackageName()
+  const extra = options.extraBundles ?? []
+  const link = (dir: string): string => `link:${dir.replace(/\\/g, '/')}`
+  const home = mkdtempSync(join(tmpdir(), 'dsh-t12-home-'))
+  const profileDir = join(home, 'profiles', options.profile)
+  mkdirSync(join(profileDir, 'node_modules'), { recursive: true })
+  writeFileSync(
+    join(profileDir, 'package.json'),
+    JSON.stringify(
+      {
+        name: `dsh-profile-${options.profile}`,
+        private: true,
+        dependencies: {
+          [name]: link(REPO_ROOT),
+          ...Object.fromEntries(extra.map((bundle) => [bundle.name, link(bundle.dir)])),
+        },
+        dsh: {
+          profile: {
+            bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', name, ...extra.map((b) => b.name)],
+            patchReload: 'live',
+          },
+        },
+      },
+      undefined,
+      2,
+    ) + '\n',
+  )
+  // 用户层 patch 是空的：本插件的配置只能来自外壳给的环境变量（这正是"外壳起了没有"的判据）。
+  writeFileSync(join(profileDir, 'cordis.patch.yml'), '[]\n')
+  writeFileSync(join(profileDir, 'pnpm-workspace.yaml'), 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n')
+  symlinkSync(REPO_ROOT, join(profileDir, 'node_modules', name), 'junction')
+  for (const bundle of extra) symlinkSync(bundle.dir, join(profileDir, 'node_modules', bundle.name), 'junction')
+  return { home, profile: options.profile, profileDir, remove: () => removeWhenFree(home) }
+}
+
 /** Options accepted by {@link startShell}. */
 export interface StartShellOptions {
   /** How long to wait for the handshake. */
@@ -323,6 +417,14 @@ export interface StartShellOptions {
    * handed the same profile as the first, and the profile has to outlive the first shell.
    */
   userDataDir?: string
+  /**
+   * 追加/覆盖外壳进程自己的环境变量。
+   *
+   * 票 #12 需要它：外壳用 `--dsh` 起的子进程继承**外壳自己的**环境，所以"别碰用户
+   * `~/.dsh`"这件事只能在外壳这一层做——把 `DSH_HOME` 指到临时 harness home 上，
+   * DSH 就会把 profile、会话、凭据全写在临时目录里。
+   */
+  env?: NodeJS.ProcessEnv
 }
 
 /** Options accepted by {@link ShellProcess.stop}. */
@@ -350,7 +452,6 @@ export async function startShell(
   args: string[] = [],
   options: StartShellOptions = {},
 ): Promise<ShellProcess> {
-  const timeoutMs = options.timeoutMs ?? START_TIMEOUT_MS
   const sizeArgs =
     options.windowSize === undefined
       ? []
@@ -360,13 +461,50 @@ export async function startShell(
   // unless the caller needs the same profile twice, in which case it owns the directory.
   const ownedProfile = options.userDataDir === undefined
   const userDataDir = options.userDataDir ?? mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-test-'))
+  return launchShellProcess({
+    command: electronExecutable(),
+    argv: [SHELL_MAIN, '--user-data-dir', userDataDir, ...sizeArgs, ...args],
+    userDataDir,
+    ownedProfile,
+    options,
+  })
+}
+
+/** {@link launchShellProcess} 的输入：一条命令、它的参数，以及谁拥有那个档案目录。 */
+export interface LaunchShellInput {
+  /** 要跑的可执行文件（默认路径下是 Electron 本身）。 */
+  command: string
+  /** 完整参数，已经拼好——这里不再补 `shell/main.js`。 */
+  argv: string[]
+  /** 本次运行用的档案目录。 */
+  userDataDir: string
+  /** 档案目录是不是这次调用自己建的（是的话 {@link ShellProcess.stop} 会删掉它）。 */
+  ownedProfile: boolean
+  /** 超时与环境变量。 */
+  options: StartShellOptions
+}
+
+/**
+ * 起一个"会把握手打到 stdout"的外壳进程，并等它的第一行握手。
+ *
+ * {@link startShell} 是它的常规用法（Electron + `shell/main.js`）。票 #12 需要它多做一件事：
+ * **跑一条真正的命令**（`npm run shell`），因为那张票的验收就是"一条命令起得来"——
+ * 只断言 `package.json` 里那个字符串，等于把一个可能写错的命令锁进测试里。
+ *
+ * @param input - 命令、参数、档案目录与环境。
+ * @returns 跑起来的外壳。
+ */
+export async function launchShellProcess(input: LaunchShellInput): Promise<ShellProcess> {
+  const { options, userDataDir, ownedProfile } = input
+  const timeoutMs = options.timeoutMs ?? START_TIMEOUT_MS
   const child = spawn(
-    electronExecutable(),
-    [SHELL_MAIN, '--user-data-dir', userDataDir, ...sizeArgs, ...args],
+    input.command,
+    input.argv,
     {
       cwd: REPO_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      ...(options.env === undefined ? {} : { env: { ...process.env, ...options.env } }),
     },
   )
   let out = ''

@@ -35,7 +35,8 @@
     "check:client": "node scripts/build-client.mjs --check",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --config vitest.config.ts",
-    "shell": "electron shell/main.js"
+    "shell": "electron shell/main.js --dsh",
+    "shell:fixture": "electron shell/main.js"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",

@@ -30,6 +30,13 @@ npm install
 `npm_config_<key>` 环境变量,但会打 warn;若将来 npm 不再透传,请直接在环境里设
 `ELECTRON_MIRROR`。
 
+## 自己验收（用户视角）
+
+想按自己的节奏逐条试一遍，看 **[`docs/acceptance-checklist.md`](docs/acceptance-checklist.md)**：
+每条都写清「做什么 → 应该看到什么」，并标明**是谁验的**（✅ 自动化 / 🔬 实现者实测 / 👤 必须你本人），
+以及**本期不做什么**（人机仲裁、多标签、旧截图流）。里面还有三条"本项目至今没有真实证据"的，
+需要你和 Agent 对话来验。
+
 ## 跑接缝测试(一条命令)
 
 ```pwsh
@@ -44,12 +51,18 @@ T3 的 `ref` 与 bounds、T4 的各类动作**外部效果**(点击改 DOM、填
 `innerText` 逐字一致且按上限截断、表达式取到只有页面知道的值、接口数据与页面侧记录的实收载荷一致、
 截图像素由测试自己解析且作为附件交付、控制台错误与失败请求先由页面自证再被工具读到)。
 
+票 #12 那一层(`tests/acceptance.spec.ts`,9 条)走的是**用户那条路**:真的敲 `npm run shell`、
+起真 `dsh` 宿主、从**操作系统**读回进程树与端口归属(两个外壳同时起,六个端口两两不同)、
+从一个只读探针插件里读回**宿主自己的工具注册表**,并让工具**经注册表**真的驱动那一格、
+把截图存进**部署自己的附件 store** 再读回来。它比其它 spec 慢(约 40 秒、四个真宿主),也更要紧:
+那几条验收以前没有一次真实证据。
+
 ### 跑测试需要什么
 
 | 需要 | 为什么 | 缺了会怎样 |
 |---|---|---|
 | Node + 已 `npm install`(含 Electron) | 大多数用例真的要起真 Electron 外壳 | 起不来 |
-| **`dsh` 启动器在 PATH 上**(或用 `DSH_BIN` 指向 `@deepseek-ai/dsh/lib/bin.js`) | `tests/no-shell.spec.ts` 要起一个**真 `dsh` 宿主**来验"没有外壳时插件照常加载"(票 #11 的验收 1) | **明确失败,不会静默跳过** |
+| **`dsh` 启动器在 PATH 上**(或用 `DSH_BIN` 指向 `@deepseek-ai/dsh/lib/bin.js`) | `tests/no-shell.spec.ts` 要起一个**真 `dsh` 宿主**来验"没有外壳时插件照常加载"(票 #11 的验收 1);`tests/acceptance.spec.ts` 要起**四个**真宿主(票 #12 的验收 1 与"注册表本体/附件 store") | **明确失败,不会静默跳过** |
 | Windows | `tests/cleanup.spec.ts` 那条 EPERM 断言是 Windows 文件锁的事实 | 该用例失败 |
 
 那两条依赖是**故意**的:一个永远被跳过的检查,正是票 #11 要消灭的那种"静默失效"。
@@ -58,15 +71,30 @@ T3 的 `ref` 与 bounds、T4 的各类动作**外部效果**(点击改 DOM、填
 ## 直接用外壳
 
 ```pwsh
-# 默认:窗口装内置夹具 /shell,视图装内置夹具 /view
+# ① 一条命令:完整产品 —— 外壳 + DSH + 那一格
+npm run shell
+
+# ② 只要外壳 + 内置夹具(离线、不起 DSH、不碰你的 ~/.dsh)
+npm run shell:fixture
+
+# ③ 手工写法与全部开关,仍然照旧(--help 有全部开关)
 npx electron shell/main.js
-
-# 窗口装任意地址
 npx electron shell/main.js --url https://example.com --view-url https://example.org
-
-# 真的拉起 DSH:装配好的地址,并通过环境变量把视图身份交给它
 npx electron shell/main.js --dsh
 ```
+
+- **①** 就是 `electron shell/main.js --dsh`:外壳**自己拉起** DSH、**让系统挑端口**(`--port 0`)、
+  **不打开你的系统默认浏览器**(`--no-open`);窗口里装的是 DSH 的界面,侧边栏那一格交给原生浏览器视图。
+  这三件事怎么被**行为**证明(而不是靠断言 argv 里有几个字符),见
+  [`docs/research/t12-one-command-and-the-three-first-evidence.md`](docs/research/t12-one-command-and-the-three-first-evidence.md)。
+- **②** 是开发用的那条路:没有 DSH,窗口与视图都装内置夹具页(`/shell`、`/view`)。
+- **③** `shell/main.js` 的所有开关(`--url` / `--view-url` / `--bounds` / `--cdp-port` / `--proxy` …)
+  照旧可用;往脚本上追加参数也一样:`npm run shell -- --view-url https://www.bing.com`。
+- **同时开两个外壳**:给每个一个自己的档案目录
+  (`npm run shell -- --user-data-dir $env:TEMP\dsh-shell-2`)。共用默认目录"能用",但第二个外壳的
+  磁盘缓存会报 `Unable to move the cache: 拒绝访问`(实测,见上面那份底稿 §4.3)。
+
+它需要 **`dsh` 在 PATH 上**(外壳自己起不动宿主时会明确报错,不会静默给你一个空壳)。
 
 `--dsh` 默认拉起 **`dshviewer`** 这个 profile(本插件装在那里),即
 `dsh --profile dshviewer --no-open --port 0`。**不要**用 `dsh web`:它是 `--profile web` 的
@@ -287,7 +315,10 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 | `tests/identity.spec.ts` | T6 接缝测试:UA 与读回一致、两个页面的 `navigator.webdriver`、档案互不可见、优雅重启后登录态还在、代理两半(含真实日志代理) |
 | `tests/spaces.spec.ts` | T7 接缝测试:空间命名与请求的纯逻辑、创建/使用/关闭、页面与存储的释放(含重启后目录真的被删)、同站两空间互不影响、继承默认档案及其边界、工具只作用于当前空间 |
 | `tests/client-half.spec.ts` | 客户端半边:宿主加载契约、tab 类型 + guide 入口、body、生成物是否陈旧 |
-| `tests/shell-harness.ts` | 测试用外壳进程夹具 |
+| `tests/shell-harness.ts` | 测试用外壳进程夹具(也能跑**任意一条会打印握手的命令**——票 #12 用它跑真的 `npm run shell`;`makeTempDshHome` 现搭一个临时 `DSH_HOME`,用户自己的 `.dsh` 一个字节都不碰) |
+| `tests/acceptance.spec.ts` | 票 #12 的验收:`npm run shell` 一条命令起完整外壳、不抢端口(两个外壳同时)、不打开系统浏览器、真宿主 `ctx.tools` 注册表本体、经注册表驱动那一格、截图进真附件 store 并读回 |
+| `tests/fixtures/dsh-probe/` | 只读探针插件:装进临时 profile,在真宿主里读回注册表本体并驱动那一格(票 #12 用) |
+| `docs/acceptance-checklist.md` | 给用户看的验收清单(每条标明谁验的、以及本期不做什么) |
 | `tests/fixtures/fake-dsh-web.mjs` | 假的 DSH,用来验证环境变量与 argv 交接 |
 
 ## 本仓库**不**包含

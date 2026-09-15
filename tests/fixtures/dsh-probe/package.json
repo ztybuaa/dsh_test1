@@ -1,0 +1,16 @@
+{
+  "name": "dsh-t12-probe",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Test probe plugin: reads back the real host's tool registry and drives the adopted view through it (ticket #12).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
