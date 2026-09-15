@@ -50,3 +50,26 @@
 - 非 100% 的页面缩放（Ctrl +/- 或 `webContents.setZoomFactor`）下是否仍然 1:1
 - 多显示器不同缩放比之间拖动窗口时的行为
 - 侧边栏浮动/停靠过程中的中间态
+
+## 附加实测：原生视图的**屏幕位置**无法通过 CDP 读回
+
+**结论：Electron 44 不提供 Browser 域的窗口命令，所以"这块视图在屏幕上的位置"用 CDP 问不到。** 2026-09-15 实测（真起外壳 + `playwright.connectOverCDP`，两种 CDP 会话都试了）：
+
+```
+browserSession.getVersion                  → "Chrome/152.0.7977.78"                （可用）
+browserSession.getWindowForTarget(view)    → ERR  'Browser.getWindowForTarget' wasn't found
+browserSession.getWindowForTarget(window)  → ERR  'Browser.getWindowForTarget' wasn't found
+browserSession.getWindowBounds(1)          → ERR  'Browser.getWindowBounds' wasn't found
+pageSession .getWindowForTarget(page)      → ERR  'Browser.getWindowForTarget' wasn't found
+viewPage.getLayoutMetrics                  → {"clientWidth":440,"clientHeight":800}  （可用）
+viewPage.innerSize                         → {"innerWidth":440,"innerHeight":800,"dpr":1.5}
+```
+
+**推论**：
+
+- **不要**设计任何"用 CDP 读回视图屏幕矩形、与期望值比对"的验证。它在 Electron 上做不到，写出来只会得到一个永远失败或永远空转的测试。
+- 能读回的是**视图自己文档的布局尺寸**（`Page.getLayoutMetrics` / `window.innerWidth/Height`）。这是"视图确实按那个尺寸被摆放"的**间接**证据：把外壳发布并实际 `applied` 的矩形，与视图文档读回的尺寸对照，两端一致就说明摆放生效了。
+- 若要拿**屏幕坐标**（例如将来做独立窗口叠放方案），只能用 Electron 侧自己的 API（`win.getContentBounds()` / `view.getBounds()` / `screenX/screenY`），不能走 CDP。
+
+（一次性的复现脚本曾被放在 `G:\dsh_test1\.scratch\probe-browser-domain.mjs`；`.scratch/` 不入库，故此处保留原始输出。）
+
