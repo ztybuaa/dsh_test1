@@ -46,6 +46,10 @@ $env:ELECTRON_MIRROR = 'https://mirrors.huaweicloud.com/electron/'
 
 **已经校验过的现成产物**：`G:\electron-mirror\electron-v44.3.0-win32-x64.zip`，150.82 MB，SHA256 `26bf9a617d58d81772b3d68305d59ee48272969c15083c06db634a77358a8d9d`，与 `electron@44.3.0` 包内 `checksums.json` 一致。
 
+**为什么 `.npmrc` 里的 `electron_mirror=` 确实生效**（源码依据）：`@electron/get` 的 `dist/artifact-utils.js:20-34` 的 `mirrorVar()` **第一个**就读 `process.env.npm_config_electron_mirror`，而 npm 正是把 `.npmrc` 的 `electron_mirror` 转成这个环境变量。所以镜像键不必再另外设 `ELECTRON_MIRROR`。
+
+**缓存已经命中**：`%LOCALAPPDATA%\electron\Cache` 里已经躺着 `electron-v44.3.0-win32-x64.zip`（150.82 MB）。因此后续的 `npm install` **通常不需要再下载**，直接从缓存解包。判断"下载是否真的在跑"要看这个缓存目录与 `node_modules/electron/dist` 是否出现，而不是看安装耗时。
+
 `electron` 的 `install.js` 判定"已安装"的条件是：`dist/version` 等于包版本 **且** `path.txt` 内容为 `electron.exe`（win32）**且** `dist/electron.exe` 存在。三者满足时它会直接 `exit 0`，**不再联网**——所以手工把二进制摆到位也是一个合法解。
 
 ## 4. 一次性原型的存放约定
