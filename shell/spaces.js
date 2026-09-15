@@ -61,6 +61,14 @@ const REQUEST_FILE_NAME = 'request.json'
 const STATE_FILE_NAME = 'state.json'
 
 /**
+ * 外壳写的下载日志（ADR-0011）。
+ *
+ * 与 `state.json` **同方向、同目录**：外壳写、插件读。它是既有通道上的一个新文件，
+ * 不是一条新通道 —— 插件→外壳那一半（`request.json`）一个字节都没动。
+ */
+const DOWNLOAD_JOURNAL_FILE_NAME = 'downloads.json'
+
+/**
  * "这些 partition 的目录下次启动要删掉"。
  *
  * 关闭空间时**删不掉目录**（Windows 文件锁，实测见 docs/research/task-space-isolation.md 第 4 节），
@@ -133,7 +141,7 @@ function spaceStoragePath(userDataDir, name) {
  * "这次运行的状态"和"上次运行的状态"有机会对不上。
  *
  * @param {string} userDataDir - 外壳的档案目录。
- * @returns {{dir: string, requestFile: string, stateFile: string, pendingDeletionFile: string, protocol: number}} 通道事实。
+ * @returns {{dir: string, requestFile: string, stateFile: string, downloadJournalFile: string, pendingDeletionFile: string, protocol: number}} 通道事实。
  */
 function spaceChannel(userDataDir) {
   const dir = path.join(userDataDir, SPACES_DIR_NAME)
@@ -141,6 +149,7 @@ function spaceChannel(userDataDir) {
     dir,
     requestFile: path.join(dir, REQUEST_FILE_NAME),
     stateFile: path.join(dir, STATE_FILE_NAME),
+    downloadJournalFile: path.join(dir, DOWNLOAD_JOURNAL_FILE_NAME),
     pendingDeletionFile: path.join(dir, PENDING_DELETION_FILE_NAME),
     protocol: SPACE_PROTOCOL,
   }
@@ -254,6 +263,7 @@ function reconcile(input) {
 module.exports = {
   DEFAULT_PARTITION,
   DEFAULT_SPACE,
+  DOWNLOAD_JOURNAL_FILE_NAME,
   PENDING_DELETION_FILE_NAME,
   REQUEST_FILE_NAME,
   SPACE_NAME_PATTERN,

@@ -102,6 +102,9 @@ export function apply(ctx: Context, config: Config): void {
       maxChars: config.maxChars,
       ...(targetId !== undefined && targetId !== '' ? { targetId } : {}),
       ...(url !== undefined && url !== '' ? { url } : {}),
+      // 没有空间通道时，外壳的下载日志也无处可寻：`browser_download` 会如实说
+      // "没有外壳可问"，而不是假装没有下载过（ADR-0011）。
+      ...(channel !== undefined ? { downloadJournalFile: channel.downloadJournalFile } : {}),
     }).catch((error: unknown) => {
       // Let the next call retry instead of replaying a stale rejection.
       pending = undefined

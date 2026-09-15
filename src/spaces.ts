@@ -1,5 +1,6 @@
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { DOWNLOAD_JOURNAL_FILE } from './downloads.ts'
 import { AdoptedViewSession } from './session.ts'
 
 /**
@@ -105,6 +106,8 @@ export interface SpaceChannel {
   requestFile: string
   /** 外壳写、插件读：实际状态。 */
   stateFile: string
+  /** 外壳写、插件读：它真正下载了什么、落在哪（与 stateFile **同方向**，ADR-0011）。 */
+  downloadJournalFile: string
 }
 
 /** 默认空间的名字（外壳永远保留它，且它不可关闭）。 */
@@ -113,7 +116,6 @@ export const DEFAULT_SPACE = 'default'
 /** 通道里的两个文件名。与 `shell/spaces.js` 里的常量是同一份协议。 */
 const REQUEST_FILE_NAME = 'request.json'
 const STATE_FILE_NAME = 'state.json'
-
 /** 空间的四个动作。 */
 export type SpaceAction = 'list' | 'create' | 'use' | 'close'
 
@@ -154,7 +156,12 @@ const DEFAULT_POLL_MS = 50
  */
 export function spaceChannelFrom(dir: string | undefined): SpaceChannel | undefined {
   if (dir === undefined || dir.trim() === '') return undefined
-  return { dir, requestFile: join(dir, REQUEST_FILE_NAME), stateFile: join(dir, STATE_FILE_NAME) }
+  return {
+    dir,
+    requestFile: join(dir, REQUEST_FILE_NAME),
+    stateFile: join(dir, STATE_FILE_NAME),
+    downloadJournalFile: join(dir, DOWNLOAD_JOURNAL_FILE),
+  }
 }
 
 /**
@@ -346,11 +353,22 @@ export class SpaceManager {
       dir: options.dir,
       requestFile: join(options.dir, REQUEST_FILE_NAME),
       stateFile: join(options.dir, STATE_FILE_NAME),
+      downloadJournalFile: join(options.dir, DOWNLOAD_JOURNAL_FILE),
     }
     this.timeoutMs = options.timeoutMs
     this.maxElements = options.maxElements
     this.maxChars = options.maxChars
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS
+  }
+
+  /**
+   * 外壳发布的下载日志在哪。
+   *
+   * 与会话需要的是同一个路径，所以它从通道算出来一次、两处共用：一个地方说
+   * "下载日志在通道目录里叫什么"，比两处各写一遍字符串可靠。
+   */
+  get downloadJournalFile(): string {
+    return this.channel.downloadJournalFile
   }
 
   /** 通道的文件位置，诊断用。 */
@@ -410,6 +428,9 @@ export class SpaceManager {
       timeoutMs: this.timeoutMs,
       maxElements: this.maxElements,
       maxChars: this.maxChars,
+      // 下载日志与空间状态**在同一个通道目录里**：都是外壳写、插件读的那一半
+      // （ADR-0011）。没有通道就没有下载日志，`browser_download` 会如实说"没人可问"。
+      ...(this.downloadJournalFile !== undefined ? { downloadJournalFile: this.downloadJournalFile } : {}),
     })
     this.sessions.set(record.name, session)
     return session

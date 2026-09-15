@@ -2,12 +2,16 @@ import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { AttachmentId, AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { basename, resolve } from 'node:path'
+import { describeDialog } from './dialogs.ts'
+import { describeDownload, renderDownloadList } from './downloads.ts'
 import type {
   AdoptedViewSession,
+  DownloadReading,
   ExtractedText,
   NavigationResult,
   PageDiagnostics,
   PageSnapshot,
+  UploadResult,
 } from './session.ts'
 import { cutText } from './session.ts'
 import type { SpaceAction, SpaceCommandOutcome } from './spaces.ts'
@@ -46,6 +50,10 @@ const snapshotSchema = {
           role: { type: 'string', required: true },
           name: { type: 'string', required: true },
           state: { type: 'string' },
+          // 元素在哪一个框架里（T9）。**缺席 = 主框架**：一个页面绝大多数元素都在主框架里，
+          // 给每一条都写一遍"主框架"只会把快照变长，而"缺席即最常见的那种"是这份快照
+          // 一直以来的写法（`state` 也是这么处理的）。
+          frame: { type: 'string' },
           bounds: {
             type: 'object',
             required: true,
@@ -84,6 +92,28 @@ const actionSchema = {
 /** Render one action outcome as the single line the model reads. */
 function renderAction(_args: unknown, value: { message: string }): { type: 'text'; text: string }[] {
   return [{ type: 'text', text: value.message }]
+}
+
+/**
+ * 跑一次动作，并取回"这次动作期间顺带发生了什么"。
+ *
+ * 动作从来不只做一件事：一次点击可能弹出一个 `confirm`、可能开始一次下载。只报
+ * "clicked ref 3" 会让模型以为页面没变，而实际上文件已经被存下来了（票 #10 明确要求
+ * 这一点如实）。标记是在动作**之前**取的，所以归因不靠时间戳的比较。
+ *
+ * @param session - 会话。
+ * @param run - 动作本身。
+ * @returns 给模型看的那几行附注（可能是空的）。
+ */
+async function activityNotes(session: AdoptedViewSession, run: () => Promise<unknown>): Promise<string[]> {
+  const mark = session.activityMark()
+  await run()
+  return session.describeActivity(session.activitySince(mark))
+}
+
+/** 把动作自己的那句话与附注拼成工具结果里的一行（没有附注就一字不加）。 */
+function withNotes(message: string, notes: readonly string[]): string {
+  return notes.length === 0 ? message : `${message}\n${notes.join('\n')}`
 }
 
 /** Render a plain string result (an expression's value, the captured JSON). */
@@ -453,7 +483,10 @@ function renderSnapshot(_args: unknown, value: PageSnapshot): { type: 'text'; te
     const { x, y, width, height } = element.bounds
     const name = element.name === '' ? '(unnamed)' : `"${element.name}"`
     const state = element.state === undefined ? '' : ` (${element.state})`
-    lines.push(`[${element.ref}] ${element.role} ${name}${state} {x=${x},y=${y},w=${width},h=${height}}`)
+    // 框架里的元素单独标出来：同一个页面里两个框架可以有长得一模一样的控件，
+    // 而 ref 落在哪一个框架里是它含义的一部分（T9）。
+    const frame = element.frame === undefined ? '' : ` (in frame ${element.frame})`
+    lines.push(`[${element.ref}] ${element.role} ${name}${state} {x=${x},y=${y},w=${width},h=${height}}${frame}`)
   }
   if (value.elements.length === 0) lines.push('(none)')
   if (value.truncated === true) {
@@ -529,8 +562,8 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
-        await session.clickRef(args.ref)
-        return { ok: true, message: `clicked ref ${args.ref}` }
+        const notes = await activityNotes(session, () => session.clickRef(args.ref))
+        return { ok: true, message: withNotes(`clicked ref ${args.ref}`, notes) }
       },
     }),
     defineTool({
@@ -547,8 +580,8 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
-        await session.fillRef(args.ref, args.text)
-        return { ok: true, message: `set ref ${args.ref} to ${JSON.stringify(args.text)}` }
+        const notes = await activityNotes(session, () => session.fillRef(args.ref, args.text))
+        return { ok: true, message: withNotes(`set ref ${args.ref} to ${JSON.stringify(args.text)}`, notes) }
       },
     }),
     defineTool({
@@ -564,8 +597,11 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
-        await session.typeRef(args.ref, args.text)
-        return { ok: true, message: `typed ${JSON.stringify(args.text)} into ref ${args.ref} key by key` }
+        const notes = await activityNotes(session, () => session.typeRef(args.ref, args.text))
+        return {
+          ok: true,
+          message: withNotes(`typed ${JSON.stringify(args.text)} into ref ${args.ref} key by key`, notes),
+        }
       },
     }),
     defineTool({
@@ -583,10 +619,13 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
-        await session.pressKey(args.key, args.ref)
+        const notes = await activityNotes(session, () => session.pressKey(args.key, args.ref))
         return {
           ok: true,
-          message: args.ref === undefined ? `pressed ${args.key}` : `pressed ${args.key} in ref ${args.ref}`,
+          message: withNotes(
+            args.ref === undefined ? `pressed ${args.key}` : `pressed ${args.key} in ref ${args.ref}`,
+            notes,
+          ),
         }
       },
     }),
@@ -601,8 +640,8 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
-        await session.hoverRef(args.ref)
-        return { ok: true, message: `hovered ref ${args.ref}` }
+        const notes = await activityNotes(session, () => session.hoverRef(args.ref))
+        return { ok: true, message: withNotes(`hovered ref ${args.ref}`, notes) }
       },
     }),
     defineTool({
@@ -617,8 +656,16 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
+        const mark = session.activityMark()
         const selected = await session.selectRef(args.ref, args.option)
-        return { ok: true, message: `selected ${JSON.stringify(args.option)} in ref ${args.ref} (now: ${selected.join(', ')})` }
+        const notes = session.describeActivity(session.activitySince(mark))
+        return {
+          ok: true,
+          message: withNotes(
+            `selected ${JSON.stringify(args.option)} in ref ${args.ref} (now: ${selected.join(', ')})`,
+            notes,
+          ),
+        }
       },
     }),
     defineTool({
@@ -633,8 +680,11 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
-        await session.dragRef(args.fromRef, args.toRef)
-        return { ok: true, message: `dragged ref ${args.fromRef} onto ref ${args.toRef}` }
+        const notes = await activityNotes(session, () => session.dragRef(args.fromRef, args.toRef))
+        return {
+          ok: true,
+          message: withNotes(`dragged ref ${args.fromRef} onto ref ${args.toRef}`, notes),
+        }
       },
     }),
     defineTool({
@@ -651,24 +701,25 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
+        const mark = session.activityMark()
+        let message: string
         if (args.ref !== undefined) {
           const bounds = await session.scrollToRef(args.ref)
-          return {
-            ok: true,
-            message:
-              `scrolled ref ${args.ref} into view: {x=${bounds.x},y=${bounds.y},w=${bounds.width},h=${bounds.height}} ` +
-              '(viewport coordinates, as in the snapshot)',
+          message =
+            `scrolled ref ${args.ref} into view: {x=${bounds.x},y=${bounds.y},w=${bounds.width},h=${bounds.height}} ` +
+            '(viewport coordinates, as in the snapshot)'
+        } else {
+          if (args.direction !== 'up' && args.direction !== 'down') {
+            throw new Error(
+              `browser-view: browser_scroll needs a ref, or direction "up"/"down" ` +
+                `(got direction=${JSON.stringify(args.direction)})`,
+            )
           }
+          const amount = args.amount ?? 500
+          await session.scroll(args.direction, amount)
+          message = `scrolled ${args.direction} by ${amount}px`
         }
-        if (args.direction !== 'up' && args.direction !== 'down') {
-          throw new Error(
-            `browser-view: browser_scroll needs a ref, or direction "up"/"down" ` +
-              `(got direction=${JSON.stringify(args.direction)})`,
-          )
-        }
-        const amount = args.amount ?? 500
-        await session.scroll(args.direction, amount)
-        return { ok: true, message: `scrolled ${args.direction} by ${amount}px` }
+        return { ok: true, message: withNotes(message, session.describeActivity(session.activitySince(mark))) }
       },
     }),
     defineTool({
@@ -686,13 +737,20 @@ export function desktopViewTools(
       output: { schema: actionSchema, render: renderAction },
       async execute(args): Promise<{ ok: boolean; message: string }> {
         const session = await adopt()
+        const mark = session.activityMark()
         const result = await session.wait({
           ...(args.ms !== undefined ? { ms: args.ms } : {}),
           ...(args.selector !== undefined ? { selector: args.selector } : {}),
           ...(args.text !== undefined ? { text: args.text } : {}),
           ...(args.timeout !== undefined ? { timeoutMs: args.timeout } : {}),
         })
-        return { ok: true, message: `waited ${result.elapsedMs}ms for ${result.waited}` }
+        return {
+          ok: true,
+          message: withNotes(
+            `waited ${result.elapsedMs}ms for ${result.waited}`,
+            session.describeActivity(session.activitySince(mark)),
+          ),
+        }
       },
     }),
     defineTool({
@@ -802,6 +860,145 @@ export function desktopViewTools(
       async execute(): Promise<PageDiagnostics> {
         const session = await adopt()
         return session.diagnostics()
+      },
+    }),
+    defineTool({
+      name: 'browser_upload',
+      description:
+        'Give a local file to a file input on the page, named by `ref` from the most recent snapshot. Point it at ' +
+        'the file input itself when the snapshot lists one; when the real input is hidden behind a styled control, ' +
+        'point it at that control (the label the snapshot lists) and the file chooser it opens is what receives the ' +
+        'file. The result reports the file name and size the input now holds, read back from the page — not merely ' +
+        'that the call was made.',
+      parameters: {
+        ref: {
+          type: 'number',
+          required: true,
+          description: 'The 1-based ref of the file input, or of the control that opens its file chooser',
+        },
+        path: { type: 'string', required: true, description: 'Absolute path of the local file to hand over' },
+      },
+      output: { schema: actionSchema, render: renderAction },
+      async execute(args): Promise<{ ok: boolean; message: string }> {
+        const session = await adopt()
+        const mark = session.activityMark()
+        const result: UploadResult = await session.uploadRef(args.ref, args.path)
+        const notes = session.describeActivity(session.activitySince(mark))
+        return {
+          ok: true,
+          message: withNotes(
+            `gave ${result.path} to ref ${result.ref} (${result.element}) through the ${result.via === 'input' ? 'file input itself' : 'file chooser it opened'}; ` +
+              `the input now holds ${result.count} file(s): ${result.name} (${result.size} bytes)`,
+            notes,
+          ),
+        }
+      },
+    }),
+    defineTool({
+      name: 'browser_dialog',
+      description:
+        'Dialogs (alert / confirm / prompt / beforeunload) are answered the moment they appear, so a page can never ' +
+        'be left waiting: with no argument this reports the dialogs that have appeared and the answer being given. ' +
+        'Pass `answer` to change what happens from now on — "accept" makes the next confirm/prompt be accepted ' +
+        '(with `text` for a prompt, defaulting to the page\'s own default), "dismiss" refuses them. A beforeunload ' +
+        'guard is always refused: accepting it neither lets the navigation through nor returns promptly, and the ' +
+        'refusal is what makes the navigation report itself as refused instead of hanging.',
+      parameters: {
+        answer: {
+          type: 'string',
+          description: 'Optional: "accept" or "dismiss", the answer to give dialogs from now on',
+        },
+        text: {
+          type: 'string',
+          description: 'With answer "accept": the text to type into a prompt; defaults to the page\'s own default',
+        },
+      },
+      output: { schema: textSchema, render: renderText },
+      async execute(args): Promise<string> {
+        const session = await adopt()
+        const lines: string[] = []
+        if (args.answer !== undefined) {
+          if (args.answer !== 'accept' && args.answer !== 'dismiss') {
+            throw new Error(
+              `browser-view: browser_dialog needs answer to be "accept" or "dismiss" (got ${JSON.stringify(args.answer)})`,
+            )
+          }
+          const policy = session.setDialogPolicy({
+            answer: args.answer,
+            ...(args.text !== undefined ? { promptText: args.text } : {}),
+          })
+          lines.push(
+            `Dialogs from now on are ${policy.answer === 'accept' ? 'accepted' : 'dismissed'}` +
+              (policy.promptText === undefined ? '' : `; a prompt is accepted with ${JSON.stringify(policy.promptText)}`) +
+              '.',
+          )
+        }
+        const policy = session.currentDialogPolicy()
+        lines.push(
+          `Answer in force: ${policy.answer === 'accept' ? 'accept' : 'dismiss'}` +
+            (policy.promptText === undefined ? '' : ` (prompt text: ${JSON.stringify(policy.promptText)})`) +
+            '. A beforeunload guard is always dismissed.',
+        )
+        const records = session.dialogRecordsSoFar()
+        if (records.length === 0) {
+          lines.push('No dialog has appeared in this view yet.')
+        } else {
+          lines.push(`Dialogs seen (${records.length}, oldest first):`)
+          for (const record of records) lines.push(`  ${describeDialog(record)}`)
+        }
+        return lines.join('\n')
+      },
+    }),
+    defineTool({
+      name: 'browser_download',
+      description:
+        'Report what the desktop shell downloaded and where the files really are. Downloads are saved silently into ' +
+        'the browser profile\'s own downloads directory (a native "save as" dialog would block an agent-driven ' +
+        'browser forever), and the shell records every one of them with the path it actually wrote. Call it with no ' +
+        'argument to list them, or with an `id` to get one download\'s path plus a preview of the bytes on disk. A ' +
+        'click that starts a download says so in its own result — a download is not a page change.',
+      parameters: {
+        id: {
+          type: 'number',
+          description: 'Optional: the download to read, as listed (its `#id`) — its path and a content preview',
+        },
+        maxChars: {
+          type: 'number',
+          description: 'With an id: cut the preview at this many characters; defaults to the configured cap (20000)',
+        },
+      },
+      output: { schema: textSchema, render: renderText },
+      async execute(args): Promise<string> {
+        const session = await adopt()
+        if (args.id === undefined) {
+          const journal = await session.downloads()
+          const started = session
+            .activitySince({ dialogs: 0, downloads: 0 })
+            .downloads.filter((start) => !journal.downloads.some((record) => record.url === start.url))
+          const lines = [renderDownloadList(journal)]
+          if (started.length > 0) {
+            lines.push(
+              `Seen by this session but not yet recorded by the shell: ${started
+                .map((start) => `${start.filename} (${start.url})`)
+                .join(', ')} — a download that is still running has no file yet.`,
+            )
+          }
+          return lines.join('\n')
+        }
+        const reading: DownloadReading = await session.readDownload(args.id, args.maxChars)
+        const lines = [describeDownload(reading.record)]
+        if (reading.unreadable !== undefined) {
+          lines.push(`No content preview: ${reading.unreadable}.`)
+          return lines.join('\n')
+        }
+        const preview = reading.preview
+        if (preview === undefined) return lines.join('\n')
+        lines.push(
+          `Content (${preview.binary ? 'not text' : 'text'}, ${String(preview.totalBytes)} byte(s)` +
+            `${preview.truncated ? `, cut at ${String(preview.text.length)} characters` : ''}):`,
+        )
+        lines.push(preview.text)
+        return lines.join('\n')
       },
     }),
     defineTool({

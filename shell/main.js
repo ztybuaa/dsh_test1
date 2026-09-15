@@ -24,9 +24,13 @@ const { app, BrowserWindow, WebContentsView, ipcMain, session, webContents } = r
 const { parseArgv, usage } = require('./args.js')
 const { startFixtureServer } = require('./fixture.js')
 const cdp = require('./cdp.js')
+const downloads = require('./downloads.js')
 const geometry = require('./geometry.js')
 const identity = require('./identity.js')
 const spaces = require('./spaces.js')
+
+/** `fs` 里这一份文件用到的几个同步操作，单独取出来，读起来比 `fs.xyzSync` 短。 */
+const { existsSync, mkdirSync, statSync } = fs
 
 /** stdout prefix carrying the view identity to whoever launched the shell. */
 const HANDSHAKE_PREFIX = 'DSH_DESKTOP_VIEW_HANDSHAKE '
@@ -157,6 +161,16 @@ const state = {
   proxy: undefined,
   /** Pending "re-place after navigation" timer. */
   settleTimer: undefined,
+  /**
+   * 下载日志：这一层是外壳对"下载了什么、落在哪"的唯一权威（ADR-0011）。
+   *
+   * 启动时从通道目录读回来（同一个档案里的历史下载仍然看得到），此后每次下载都并进去、
+   * 原子写盘、并对外发一行。有界（{@link downloads.MAX_DOWNLOAD_RECORDS} 条），
+   * 丢掉多少条记在日志自己身上。
+   */
+  downloadJournal: undefined,
+  /** 下载记录的编号来源；跨重启接着上次的最大值往下发。 */
+  downloadId: 0,
 }
 
 /** @param {string} line - one log line on stdout (stable, machine-readable). */
@@ -254,6 +268,19 @@ function activeView() {
 state.spaceChannel = spaces.spaceChannel(userDataDir)
 fs.mkdirSync(state.spaceChannel.dir, { recursive: true })
 cleanupPendingDeletions(userDataDir)
+// 下载日志与空间状态**在同一个目录、同一个方向**（外壳写、插件读，ADR-0011）。
+// 上一次运行的记录读回来接着用：一个档案里的下载历史不该因为重启就消失。
+state.downloadJournal = (() => {
+  let raw
+  try {
+    raw = fs.readFileSync(downloads.journalFile(state.spaceChannel), 'utf8')
+  } catch {
+    // 还没有日志（这个档案没下载过东西）：那不是错误，是"从零开始"。
+    raw = ''
+  }
+  return downloads.parseJournal(raw, Date.now()) ?? downloads.emptyJournal(Date.now())
+})()
+state.downloadId = state.downloadJournal.downloads.reduce((highest, record) => Math.max(highest, record.id), 0)
 
 /** The window's content area, in the same pixels the panel measures in. */
 function windowSize() {
@@ -512,7 +539,86 @@ function createSpace(name) {
   // `targetIdSource: 'remembered'`，不能让它变成"没有"。
   const entry = { name, partition, session: viewSession, view, inherited: undefined, targetId: undefined }
   state.spaces.set(name, entry)
+  attachDownloadHandling(viewSession)
   return entry
+}
+
+/**
+ * 让**每一个空间**的 session 自己决定下载落在哪（ADR-0011）。
+ *
+ * 不装这个处理器会怎样（实测，见 `docs/research/dialogs-upload-download-iframes.md` 第 3 节）：
+ * Electron 走默认的"原生另存为对话框"，而 Agent 驱动下没人去点它，于是下载永远不完成、
+ * Playwright 的 `download.path()` / `saveAs()` 一起挂死，触发下载的那次点击还会挂满超时。
+ * 所以"静默存到一个确定的目录"不是可选偏好，是这个能力能不能成立的前提。
+ *
+ * 每一个空间的 session 都要装：空间各有各的 partition，也就是各有各的 session，
+ * 只装默认空间会让新建空间里的下载又回到弹对话框那条路上。
+ *
+ * @param {object} viewSession - Electron 的 `Session`。
+ */
+function attachDownloadHandling(viewSession) {
+  viewSession.on('will-download', (_event, item) => {
+    const directory = downloads.downloadsDir(userDataDir)
+    const savePath = downloads.uniqueTarget(directory, item.getFilename(), isDownloadTargetTaken)
+    // 目录交给 Electron 建是它文档里的行为，但这里显式建一次：`isDownloadTargetTaken`
+    // 靠 `existsSync` 判断重名，而"目录不在"与"目录空着"在那件事上不该是同一个答案。
+    mkdirSync(directory, { recursive: true })
+    // 设了路径，Electron 就不弹对话框了；没设，`download` 事件照样会到 Playwright，
+    // 但文件永远不落盘（这正是测量里看到的形状）。
+    item.setSavePath(savePath)
+    state.downloadId += 1
+    const id = state.downloadId
+    const base = {
+      id,
+      url: item.getURL(),
+      filename: path.basename(savePath),
+      savePath,
+      startedAt: Date.now(),
+    }
+    publishDownload({ ...base, state: 'started', bytes: 0 })
+    item.on('done', (_doneEvent, downloadState) => {
+      const finalState = downloads.mapDoneState(downloadState)
+      let bytes = item.getReceivedBytes()
+      if (finalState === 'completed') {
+        try {
+          bytes = statSync(savePath).size
+        } catch {
+          // 文件读不到就不猜大小：报 Electron 收到的字节数，同时状态仍是 completed。
+        }
+      }
+      publishDownload({ ...base, state: finalState, bytes, finishedAt: Date.now() })
+    })
+  })
+}
+
+/**
+ * 这个落盘路径是不是已经被占了（本次运行认领了，或者磁盘上已经有了）。
+ *
+ * 两条都要看：一次下载在 `will-download` 里就认领了路径，而文件要到结束时才出现，
+ * 只看磁盘会让同一毫秒内的两次同名下载撞在一起。
+ *
+ * @param {string} candidate - 候选路径。
+ * @returns {boolean} 被占了为真。
+ */
+function isDownloadTargetTaken(candidate) {
+  if (state.downloadJournal.downloads.some((record) => record.savePath === candidate)) return true
+  return existsSync(candidate)
+}
+
+/**
+ * 把一条下载记录并进日志、原子写盘、并对外发布一行。
+ *
+ * 三件事一起做是刻意的：插件读的是**文件**，而测试与人都要看**stdout**，
+ * 两者说的必须是同一件事、同一时刻的。
+ *
+ * @param {object} record - 一条下载记录。
+ */
+function publishDownload(record) {
+  const now = Date.now()
+  state.downloadJournal = downloads.appendRecord(state.downloadJournal, record, now)
+  const file = downloads.journalFile(state.spaceChannel)
+  writeJsonAtomic(file, state.downloadJournal)
+  emit(`DSH_SHELL DOWNLOAD ${JSON.stringify(record)}`)
 }
 
 /**
@@ -1005,6 +1111,9 @@ async function main() {
     // 空间控制通道与开局的空间表：插件从这里知道"空间开关往哪写、现在有哪些空间、
     // 每个空间的 targetId 是什么"。表里的值全部从 Electron 读回（见 describeSpaces）。
     spaceChannel: { ...state.spaceChannel },
+    // 下载落在哪（ADR-0011）。插件不靠这个字段找文件（日志里有绝对路径），它在这里是为了
+    // 让"下载进了哪个目录"这件事对人和测试都是**外壳说过的一句话**，而不是从别处推断的。
+    downloadsDir: downloads.downloadsDir(userDataDir),
     activeSpace: published.active,
     spaces: published.spaces,
   }

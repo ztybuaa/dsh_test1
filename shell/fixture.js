@@ -472,10 +472,233 @@ const SLOW_PAGE = {
 const SLOW_PAGE_DELAY_MS = 2500
 
 /**
- * Path -> {body, type, status}. Every interactive page exposes the same `#hit` / `#out` pair.
+ * T9 的对话框页：三种原生对话框各一个按钮，外加一条"离开这一页"的链接。
+ *
+ * `#dlg-log` 是唯一的读回口：每个按钮在**弹对话框之前**先记一行、弹完再记一行，
+ * 所以"页面被对话框挡住了"在日志上就是"只有 before、没有 after"，而"挡住了多久"
+ * 由两行自己的时间戳说出来 —— 不需要问 Playwright，也不需要信任何一方的说法。
+ *
+ * `#dlg-arm-unload` 装的是一个真的 `beforeunload` 守卫：它只在**用户手势之后**才装，
+ * 因为 Chromium 对没有手势的页面根本不弹这个框（这条本身也是要量的东西之一）。
+ */
+const DIALOG_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>dialog-page</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 13px system-ui; padding: 8px; }
+  button, a { display: block; margin: 4px 0; width: 220px; }
+  #dlg-log { display: block; font: 11px monospace; white-space: pre-wrap; margin-top: 8px; }
+</style></head>
+<body>
+<h1 id="heading">dialog-page</h1>
+<button id="dlg-alert" onclick="note('alert-before'); alert('the alert said: hello from the fixture'); note('alert-after')">open an alert</button>
+<button id="dlg-confirm" onclick="note('confirm-before'); note('confirm-returned=' + String(confirm('the confirm asked: proceed?'))); note('confirm-after')">open a confirm</button>
+<button id="dlg-prompt" onclick="note('prompt-before'); note('prompt-returned=' + String(prompt('the prompt asked: your name?', 'default-name'))); note('prompt-after')">open a prompt</button>
+<a id="dlg-leave" href="/other">leave this page</a>
+<button id="dlg-arm-unload" onclick="armUnload()">arm the unload guard</button>
+<output id="dlg-log"></output>
+<script>
+  var lines = [];
+  function note(text) {
+    lines.push(text + ' @' + String(Date.now()));
+    document.getElementById('dlg-log').textContent = lines.join('\\n');
+  }
+  function armUnload() {
+    window.addEventListener('beforeunload', function (event) {
+      event.preventDefault();
+      event.returnValue = 'unsaved changes';
+    });
+    note('unload-armed');
+  }
+</script>
+</body></html>`
+
+/**
+ * T9 的上传页：一个**藏起来的** file input 加一个可见的 `<label for>`。
+ *
+ * 这是真实站点的常见形状（"把 input 藏起来，用好看的按钮触发"），也是 ADR-0001 的
+ * 张力所在：快照只列 `:visible` 的元素，所以藏起来的 input **不该**有 ref，而
+ * `<label>` 又不是快照选择器认的元素（它没有 role、不是 a/button/input/…）。
+ *
+ * `#up-visible` 是对照组：一个**看得见**的 file input，它该照常进快照。
+ *
+ * `#up-log` 把文件名、大小与**文件内容**都写出来 —— 断言由此读页面自己写下的东西，
+ * 而不是读"我们调了某个 API"。
+ */
+const UPLOAD_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>upload-page</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 13px system-ui; padding: 8px; }
+  #up-label { display: inline-block; margin: 8px 0; padding: 6px 10px; border: 1px solid #4a6fa5;
+              background: #eef3f8; cursor: pointer; }
+  #up-visible { display: block; }
+  #up-log { display: block; font: 11px monospace; white-space: pre-wrap; margin-top: 8px; }
+</style></head>
+<body>
+<h1 id="heading">upload-page</h1>
+<input type="file" id="up-hidden" style="display:none">
+<label id="up-label" for="up-hidden">choose a file to upload</label>
+<input type="file" id="up-visible">
+<output id="up-log">no file yet</output>
+<script>
+  function record(input) {
+    var file = input.files && input.files.length > 0 ? input.files[0] : null;
+    if (file === null) { document.getElementById('up-log').textContent = 'no file yet'; return; }
+    var reader = new FileReader();
+    reader.onload = function () {
+      document.getElementById('up-log').textContent =
+        'name=' + file.name + ' size=' + String(file.size) + ' content=' + String(reader.result);
+    };
+    reader.readAsText(file);
+  }
+  document.getElementById('up-hidden').addEventListener('change', function () { record(this); });
+  document.getElementById('up-visible').addEventListener('change', function () { record(this); });
+</script>
+</body></html>`
+
+/**
+ * T9 的"标签页"：**隐藏真控件 + 可见 `<label>`** 的两种真实形状。
+ *
+ * 这是 ADR-0012 那条规则的通用性证据，不是上传的附属品：真实站点里"把真控件藏起来、
+ * 用一个好看的 label 触发"最常见的其实不是文件选择，而是**自定义样式的复选框/单选框**。
+ * 这类控件今天同样"看得见却动不了"—— label 是页面上唯一能被点的东西，而它没有 ref。
+ *
+ * 三个 label 分三类，缺一不可：
+ *  - `lbl-check` 标注一个 `display: none` 的复选框 —— **该进快照**（它标注的控件没被列出）；
+ *  - `lbl-text` 标注一个**看得见**的文本框 —— **不该进快照**（控件自己已经在里面了）；
+ *  - `lbl-none` 谁都不标注（没有 `for`，里面也没有控件）—— **不该进快照**（它不带任何东西）。
+ *
+ * 点 label 的效果由页面自己写出来（`#lbl-log`），所以"这个 ref 真的点在那个复选框上"
+ * 是从页面上读回来的，而不是从"我们调了某个 API"推出来的。
+ */
+const LABELS_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>labels-page</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 13px system-ui; padding: 8px; }
+  #lbl-check, #lbl-none { display: inline-block; margin: 4px 0; padding: 6px 10px; border: 1px solid #4a6fa5;
+                          background: #eef3f8; cursor: pointer; }
+  #lbl-log { display: block; font: 11px monospace; white-space: pre-wrap; margin-top: 8px; }
+</style></head>
+<body>
+<h1 id="heading">labels-page</h1>
+<input type="checkbox" id="lbl-hidden" style="display:none">
+<label id="lbl-check" for="lbl-hidden">a styled checkbox label</label>
+<label id="lbl-text" for="lbl-visible">a label for a visible field</label>
+<input id="lbl-visible" type="text" placeholder="a visible field">
+<label id="lbl-none">a label for nothing</label>
+<output id="lbl-log">nothing yet</output>
+<script>
+  var notes = [];
+  function note(text) {
+    notes.push(text);
+    document.getElementById('lbl-log').textContent = notes.join('\\n');
+  }
+  document.getElementById('lbl-hidden').addEventListener('change', function () {
+    note('checkbox-changed checked=' + String(this.checked));
+  });
+  document.getElementById('lbl-visible').addEventListener('input', function () {
+    note('field-input value=' + String(this.value));
+  });
+</script>
+</body></html>`
+
+/**
+ * T9 的下载页：一个带 `download` 属性的链接，外加一个"由脚本点它"的按钮。
+ *
+ * 两条路径都要有，因为"下载是怎么开始的"不止一种：人点链接，或者页面自己 `click()`。
+ * `#dl-effect` 让"点这一下本身有没有别的效果"也读得回来 —— 下载页上的一次点击，
+ * 不该被报成"页面变了"。
+ */
+const DOWNLOAD_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>download-page</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 13px system-ui; padding: 8px; }
+  button, a { display: block; margin: 4px 0; }
+</style></head>
+<body>
+<h1 id="heading">download-page</h1>
+<a id="dl-link" href="/download/report.txt" download="report.txt">download the report</a>
+<button id="dl-via-script" onclick="document.getElementById('dl-link').click(); document.getElementById('dl-effect').textContent='script-clicked-the-link'">download by clicking the link from script</button>
+<button id="dl-hit" onclick="document.getElementById('dl-effect').textContent='clicked-the-plain-button'">a plain button</button>
+<output id="dl-effect">none</output>
+</body></html>`
+
+/**
+ * T9 下载响应体的内容。
+ *
+ * 它是**逐字比对**的基准：断言读的是真正落到磁盘上的那些字节，所以这份文本必须足够
+ * 独特到不可能被别的什么东西碰巧写出来，也必须短到一眼能看完。
+ */
+const DOWNLOAD_BODY = 't9-download-fixture: the report body, written by the fixture server.\nline two.\n'
+
+/**
+ * T9 的 iframe 内容页（同源与跨源**用的是同一份**标记，只有 id 前缀不同）。
+ *
+ * 三个控件各有一个稳定的 id，且父页面上没有同名元素，所以"这个 ref 落在哪个框架里"
+ * 可以被逐项读回。`#<prefix>-out` 是动作真的落到框架内元素上的证据。
+ *
+ * 前缀是参数而不是常量：跨源那一份由**另一个 origin**（测试自己起的第二个端口）供应，
+ * 两边用同一份标记、不同的 id 前缀，于是"动作落到了另一个框架里"在页面自己写下的
+ * 文本上就看得见，而不必去猜。
+ *
+ * @param {string} prefix - 这一份页面里三个 id 的前缀。
+ * @returns {string} 页面 HTML。
+ */
+function frameInnerPage(prefix) {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>frame-inner</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 12px system-ui; padding: 6px; }
+  #${prefix}-button { display: block; width: 160px; height: 28px; }
+  #${prefix}-input { display: block; width: 160px; height: 24px; margin-top: 4px; }
+  #${prefix}-out { display: block; white-space: pre-wrap; margin-top: 4px; }
+</style></head>
+<body>
+<button id="${prefix}-button" onclick="document.getElementById('${prefix}-out').textContent='frame-button-clicked'">frame button</button>
+<input id="${prefix}-input" type="text" placeholder="frame text field">
+<output id="${prefix}-out">frame-initial</output>
+</body></html>`
+}
+
+/**
+ * T9 的 iframe 父页：一个同源框架，外加（可选）一个由查询串指定的**跨源**框架。
+ *
+ * 跨源的 URL 从 `?cross=` 进来而不是写死：外壳只起一个 HTTP 服务，跨源这件事需要
+ * **第二个端口**，那个服务由测试自己起（`/frames` 因此对"跨源"这件事保持无知）。
+ */
+function framesPage(crossTag) {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>frames-page</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 13px system-ui; padding: 8px; }
+  iframe { display: block; border: 1px solid #888; margin-top: 6px; }
+</style></head>
+<body>
+<h1 id="heading">frames-page</h1>
+<button id="frames-top" onclick="document.getElementById('frames-top-out').textContent='top-button-clicked'">top button</button>
+<iframe id="frames-same" src="/frame-inner" width="240" height="140"></iframe>
+${crossTag}
+<output id="frames-top-out">top-initial</output>
+</body></html>`
+}
+
+/**
+ * Path -> {body, type, status, headers}. Every interactive page exposes the same `#hit` / `#out` pair.
  *
  * `status` is optional and defaults to 200; the T5 routes are the only ones that use it,
  * because "the request failed with a status" needs a route that really fails.
+ *
+ * `headers` is optional too, and exists for the T9 download route: "this response is an
+ * attachment" is carried by `Content-Disposition` and by nothing else, so a download
+ * without it would not be a download.
+ *
+ * A route function is handed the request's `URL`, so a page can be told something by its
+ * own query string (the T9 cross-origin frame lives at an origin this server does not own).
  */
 const ROUTES = {
   '/shell': () => ({ body: page('shell-page', '<p>Stand-in for the DSH web UI inside the BrowserWindow.</p>'), type: 'text/html; charset=utf-8' }),
@@ -500,6 +723,26 @@ const ROUTES = {
   '/slow': () => ({ slow: SLOW_PAGE, type: 'text/html; charset=utf-8' }),
   '/panel': () => ({ body: PANEL_PAGE, type: 'text/html; charset=utf-8' }),
   '/panel-rect.js': () => ({ body: PANEL_RECT_JS, type: 'text/javascript; charset=utf-8' }),
+  // T9：对话框 / 上传 / 下载 / iframe 四条长尾能力各自的夹具页。
+  '/dialogs': () => ({ body: DIALOG_PAGE, type: 'text/html; charset=utf-8' }),
+  '/upload': () => ({ body: UPLOAD_PAGE, type: 'text/html; charset=utf-8' }),
+  '/labels': () => ({ body: LABELS_PAGE, type: 'text/html; charset=utf-8' }),
+  '/download': () => ({ body: DOWNLOAD_PAGE, type: 'text/html; charset=utf-8' }),
+  // 附件响应：`Content-Disposition` 是"这是一次下载"的唯一来源，没有它浏览器只会显示。
+  '/download/report.txt': () => ({
+    body: DOWNLOAD_BODY,
+    type: 'text/plain; charset=utf-8',
+    headers: { 'content-disposition': 'attachment; filename="report.txt"' },
+  }),
+  '/frame-inner': () => ({ body: frameInnerPage('fi'), type: 'text/html; charset=utf-8' }),
+  '/frames': (url) => {
+    const cross = url.searchParams.get('cross') ?? ''
+    const tag =
+      cross === ''
+        ? '<p id="frames-cross-note">no cross-origin frame was asked for</p>'
+        : `<iframe id="frames-cross" src="${cross}" width="240" height="140"></iframe>`
+    return { body: framesPage(tag), type: 'text/html; charset=utf-8' }
+  },
 }
 
 /**
@@ -517,8 +760,11 @@ async function startFixtureServer(options = {}) {
       response.end(page('not-found', `<p>No fixture route for ${url.pathname}</p>`))
       return
     }
-    const resolved = route()
-    response.writeHead(resolved.status ?? 200, { 'content-type': resolved.type })
+    const resolved = route(url)
+    response.writeHead(resolved.status ?? 200, {
+      'content-type': resolved.type,
+      ...(resolved.headers ?? {}),
+    })
     if (resolved.slow !== undefined) {
       // Two chunks with a pause between them: the browser commits the document on the
       // first, and only sees `load` after the second.
@@ -545,4 +791,4 @@ async function startFixtureServer(options = {}) {
   }
 }
 
-module.exports = { startFixtureServer, ROUTES }
+module.exports = { startFixtureServer, ROUTES, frameInnerPage, DOWNLOAD_BODY }

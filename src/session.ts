@@ -1,5 +1,31 @@
-import type { Browser, BrowserContext, ElementHandle, Page, Response } from 'playwright'
+import { readFile, stat } from 'node:fs/promises'
+import { basename, resolve } from 'node:path'
+import type {
+  Browser,
+  BrowserContext,
+  Dialog,
+  ElementHandle,
+  FileChooser,
+  Frame,
+  Page,
+  Response,
+} from 'playwright'
 import { chromium } from 'playwright'
+import {
+  DEFAULT_DIALOG_POLICY,
+  describeDialogActivity,
+  planDialogAnswer,
+  type DialogPolicy,
+  type DialogRecord,
+} from './dialogs.ts'
+import {
+  DOWNLOAD_JOURNAL_FILE,
+  parseDownloadJournal,
+  previewDownload,
+  type DownloadJournal,
+  type DownloadPreview,
+  type DownloadRecord,
+} from './downloads.ts'
 import {
   MARK_PLANS,
   clearOverlay,
@@ -47,6 +73,14 @@ export interface AdoptOptions extends ViewHandle {
    * Defaults to {@link DEFAULT_MAX_CHARS}.
    */
   maxChars?: number
+  /**
+   * Where the shell publishes what it downloaded, as the shell's own space channel
+   * names it (`<channel dir>/downloads.json`).
+   *
+   * Absent means there is no shell to ask: `downloads()` then says so instead of
+   * pretending nothing was downloaded (ADR-0011).
+   */
+  downloadJournalFile?: string
 }
 
 /** Outcome of a navigation: the address actually reached, and its title. */
@@ -92,6 +126,15 @@ export interface SnapshotElement {
   state?: string
   /** Where the element is and how big it is, in viewport coordinates. */
   bounds: ElementBounds
+  /**
+   * Address of the frame the element lives in; **absent means the main frame**.
+   *
+   * A `ref` is not just an element: it is an element *in one document of one frame*, so
+   * which frame it came from is part of what the ref means. An element inside a frame
+   * has the same role/name/state/bounds fields as any other, and this one says where to
+   * go looking for it — two frames of the same page can hold identical controls (T9).
+   */
+  frame?: string
 }
 
 /**
@@ -195,12 +238,104 @@ export interface JsonResponseRecord {
   body: unknown
 }
 
+/**
+ * What handing a local file to a page's file input came out as.
+ *
+ * Every field is read back **from the page**: the file name and size are `FileList`
+ * entries of the input the page now holds, not a restatement of what was handed over.
+ * A tool that reported "the file was given to the input" without that read-back would be
+ * claiming something it did not check (T9).
+ */
+export interface UploadResult {
+  /** The ref the action named. */
+  ref: number
+  /** `tag#id "name"` — how the trigger is named in messages. */
+  element: string
+  /** Which route actually delivered the file. */
+  via: 'input' | 'filechooser'
+  /** The absolute path that was handed over. */
+  path: string
+  /** How many files the input now holds. */
+  count: number
+  /** The first file's name, as the page's own `FileList` reports it. */
+  name: string
+  /** The first file's size in bytes, as the page's own `FileList` reports it. */
+  size: number
+}
+
+/**
+ * A download that **started** while an action ran.
+ *
+ * It is deliberately not "a file": where the bytes ended up is the shell's answer
+ * (ADR-0011), and this record only says the page began one, which is what makes a click
+ * that triggers a download reportable as such instead of as "the page changed".
+ */
+export interface DownloadStart {
+  /** Address being downloaded. */
+  url: string
+  /** File name the browser proposes. */
+  filename: string
+  /** When the download began. */
+  at: number
+}
+
+/** One download the shell recorded, together with the bytes this side really read. */
+export interface DownloadReading {
+  /** The shell's record: the only source of the落盘 path. */
+  record: DownloadRecord
+  /** The preview, present only when the file was there and readable. */
+  preview?: DownloadPreview
+  /** Why there is no preview, when the record says the file should be there. */
+  unreadable?: string
+}
+
+/**
+ * What happened *besides* the action, during one action.
+ *
+ * Actions have effects the model did not ask for one at a time: a click can raise a
+ * `confirm`, and it can start a download. Both are things the model must be told about —
+ * "clicked" alone would let it believe the page changed when in fact a file was saved,
+ * or that nothing happened when in fact a dialog was answered (T9).
+ */
+export interface ActionActivity {
+  /** Dialogs that were raised and answered while the action ran. */
+  dialogs: DialogRecord[]
+  /** Downloads that began while the action ran. */
+  downloads: DownloadStart[]
+}
+
 /** The element a ref addresses, pinned, plus what one look at it answered. */
 interface RefTarget {
   /** The node the snapshot listed. */
-  handle: ElementHandle
-  /** What {@link inspectElement} answered about it just now. */
+  handle: ElementHandle<Element>
+  /** What {@link inspectElement} answered about it just now, in *view* coordinates. */
   facts: ElementFacts
+}
+
+/**
+ * Everything a `ref` has to remember besides the node itself (T9).
+ *
+ * A ref is an element **in one document of one frame**, so the pin is three things at
+ * once: the node, the frame it was read from, and that frame's document identity. The
+ * origin is what turns a frame-local rectangle into a rectangle of *this view* — the
+ * coordinates bounds, the overlay and the hit test all share (ADR-0007) — and the iframe
+ * element is what makes "a cover in the parent document" detectable from here.
+ */
+interface RefEntry {
+  /** The node the snapshot pinned. */
+  handle: ElementHandle<Element>
+  /** The frame whose document the node belongs to. */
+  frame: Frame
+  /** `performance.timeOrigin` of that document, as read when the snapshot was taken. */
+  token: string
+  /** Where that frame's viewport starts, in this view's viewport coordinates. */
+  origin: ViewPoint
+  /**
+   * The `<iframe>` this frame hangs in, in its parent's document; absent for the main
+   * frame. Kept because "is this element covered" has to ask the parent document too:
+   * an element inside a frame can be covered by something drawn over the iframe itself.
+   */
+  frameElement?: ElementHandle<Element>
 }
 
 /**
@@ -250,6 +385,22 @@ const MAX_CONSOLE_MESSAGES = 50
 
 /** How many failed requests are kept; past it the oldest is dropped. */
 const MAX_FAILED_REQUESTS = 50
+
+/** How many dialogs are kept; past it the oldest is dropped. */
+const MAX_DIALOG_RECORDS = 30
+
+/** How many download *starts* are kept; past it the oldest is dropped. */
+const MAX_DOWNLOAD_STARTS = 30
+
+/**
+ * How long a control is given to open a file chooser after it is clicked.
+ *
+ * Measured on this host: the `filechooser` event arrives about **one millisecond** after the
+ * click returns, so a control that has not opened one after five seconds is not going to.
+ * The budget exists so a control that simply does not open a chooser is reported as that,
+ * instead of tying up the full 30s action timeout on a click that already did its job.
+ */
+const FILE_CHOOSER_BUDGET_MS = 5_000
 
 /** How much of an error response body is quoted as the failure's summary. */
 const FAILURE_SUMMARY_CHARS = 200
@@ -304,6 +455,24 @@ export const SNAPSHOT_SELECTOR = [
   ...INTERACTIVE_ROLES.map((role) => `[role="${role}"]:visible`),
 ].join(', ')
 
+/**
+ * The second thing a snapshot may list: a visible `<label>` whose control the snapshot
+ * does not list itself (ADR-0012).
+ *
+ * The rule is deliberately about **reachability**, not about file inputs: a real page
+ * that hides the real control and styles a `<label>` is the standard way to build a file
+ * picker *and* a custom checkbox. In both cases the control is `display: none` (so the
+ * first selector cannot match it, by the inherited hidden-element rule) while the label
+ * is what a person sees and clicks — and without this the label is an element that is
+ * plainly clickable and that no `ref` can name.
+ *
+ * The decision is made in the page, in the same pass as everything else, because "is the
+ * control listed" is only answerable against *this* frame's match set — see
+ * {@link collectSnapshot}. Exported for the same reason as
+ * {@link SNAPSHOT_SELECTOR}: a test must read the real selector.
+ */
+export const CONTROL_LABEL_SELECTOR = 'label:visible'
+
 /** What the page computes for one matched element, before a `ref` is assigned. */
 interface CollectedElement {
   role: string
@@ -327,28 +496,65 @@ interface CollectedSnapshot {
   title: string
   /** Identity of the document this was read from. */
   token: string
-  /** One record per matched element, in document order. */
+  /** One record per kept element, in document order. */
   elements: CollectedElement[]
+  /**
+   * Which input each kept element came from: an index into `[...elements, ...labels]`.
+   *
+   * The page decides *what* is listed and in *what order* (that is where the DOM is),
+   * while the handles stay on this side; these indices are how the two halves are
+   * stitched back together without a second query that could disagree about positions
+   * (ADR-0008).
+   */
+  picks: number[]
+}
+
+/** What one in-page collection pass is handed: this frame's two match sets and the overlay's id. */
+interface SnapshotInput {
+  /** Matches of {@link SNAPSHOT_SELECTOR} in this frame, in document order. */
+  elements: Element[]
+  /** Matches of {@link CONTROL_LABEL_SELECTOR} in this frame, in document order. */
+  labels: Element[]
+  /** Id of the cursor overlay's container, whose nodes never enter a snapshot. */
+  overlayId: string
 }
 
 /**
- * Collect the document's title and identity plus one record per matched element.
+ * Collect the document's title and identity plus one record per element that belongs in
+ * a snapshot, in document order.
  *
- * Playwright serializes this function into the page and calls it **once** with the
- * whole match set, so the title, the document token, and every element's
- * role/name/state/geometry all come from one evaluation of one document — the parts of
- * a snapshot cannot disagree about which document or which element they describe, and a
- * snapshot costs one round-trip rather than one per element (see ADR-0007 for why this
- * beats `DOMSnapshot.captureSnapshot`).
+ * Playwright serializes this function into the page and calls it **once per frame** with
+ * the whole match set of that frame, so the title, the document token, and every
+ * element's role/name/state/geometry all come from one evaluation of one document — the
+ * parts of a snapshot cannot disagree about which document or which element they
+ * describe, and a snapshot costs one round-trip per frame rather than one per element
+ * (see ADR-0007 for why this beats `DOMSnapshot.captureSnapshot`).
+ *
+ * Three rules live here and nowhere else, because all three are questions only the DOM
+ * can answer:
+ *
+ *  - **the overlay's own nodes are never listed.** The overlay is the agent's furniture,
+ *    not the page: a mark must never be something the agent can then act on. Its markup
+ *    matches neither selector today (T8), and this exclusion is the second, stronger
+ *    half — it holds even if the overlay one day grows a node that does match, which is
+ *    exactly what the guard test injects to prove the exclusion is load-bearing.
+ *  - **a label is listed only when its control is not.** "Is the control listed" is
+ *    answerable against this frame's match set and nothing else, so the base handles
+ *    come in as an argument and are compared by identity (ADR-0012).
+ *  - **document order**, over the union of both match sets. The engine returns each
+ *    selector's matches in document order, so ordering the union is a merge by
+ *    `compareDocumentPosition` — kept here rather than concatenating the two lists,
+ *    because "the snapshot is in document order" is what lets a reader talk about
+ *    "before" and "after" at all.
  *
  * Everything it needs is declared inside it on purpose: only this function's *source*
  * crosses into the page, so a helper defined beside it in this module would be a
  * `ReferenceError` there rather than a call.
  *
- * @param elements - the elements the snapshot selector matched, in document order.
- * @returns the document facts plus one metadata record per element, in that order.
+ * @param input - this frame's two match sets and the overlay container's id.
+ * @returns the document facts plus one metadata record per kept element, in that order.
  */
-function collectSnapshot(elements: Element[]): CollectedSnapshot {
+function collectSnapshot(input: SnapshotInput): CollectedSnapshot {
   /** Roles derived from the element itself when it declares none. */
   const rolesByTag: Record<string, string> = { a: 'link', button: 'button', select: 'combobox', textarea: 'textbox' }
 
@@ -382,8 +588,10 @@ function collectSnapshot(elements: Element[]): CollectedSnapshot {
       }
     }
     if (name === '') {
-      const labels = (element as HTMLInputElement).labels
-      if (labels !== undefined && labels !== null && labels.length > 0) name = (labels[0].textContent ?? '').trim()
+      const elementLabels = (element as HTMLInputElement).labels
+      if (elementLabels !== undefined && elementLabels !== null && elementLabels.length > 0) {
+        name = (elementLabels[0].textContent ?? '').trim()
+      }
     }
     if (name === '') name = element.getAttribute('placeholder') ?? ''
     if (name === '') name = element.getAttribute('value') ?? ''
@@ -413,10 +621,41 @@ function collectSnapshot(elements: Element[]): CollectedSnapshot {
     return collected
   }
 
+  const overlay = document.getElementById(input.overlayId)
+  const fromOverlay = (node: Element): boolean =>
+    overlay !== null && (node === overlay || overlay.contains(node))
+
+  const nodes: Element[] = []
+  const picked: number[] = []
+  input.elements.forEach((element, index) => {
+    if (fromOverlay(element)) return
+    nodes.push(element)
+    picked.push(index)
+  })
+  const listed = new Set(input.elements)
+  input.labels.forEach((label, index) => {
+    if (fromOverlay(label)) return
+    const control = (label as HTMLLabelElement).control
+    // A label for nothing labelled, or for a control the snapshot already lists, adds
+    // nothing: the control is the thing an action wants, and it is already reachable.
+    if (control === null || control === undefined) return
+    if (listed.has(control)) return
+    nodes.push(label)
+    picked.push(input.elements.length + index)
+  })
+
+  const order = nodes.map((_, index) => index).sort((left, right) => {
+    const position = nodes[left].compareDocumentPosition(nodes[right])
+    if ((position & Node.DOCUMENT_POSITION_FOLLOWING) !== 0) return -1
+    if ((position & Node.DOCUMENT_POSITION_PRECEDING) !== 0) return 1
+    return left - right
+  })
+
   return {
     title: document.title,
     token: String(performance.timeOrigin),
-    elements: elements.map(describe),
+    elements: order.map((index) => describe(nodes[index])),
+    picks: order.map((index) => picked[index]),
   }
 }
 
@@ -440,6 +679,15 @@ export type ActionFailureReason =
   | 'not-found'
   /** The ref was read from a document the view no longer shows. */
   | 'stale-ref'
+  /**
+   * The page's own guard stopped it: a `beforeunload` handler refused to leave, so the
+   * navigation never happened and the view is still where it was.
+   *
+   * It is its own reason because its remedy is its own: no amount of retrying or
+   * re-snapshotting moves a page that has unsaved changes — that has to be dealt with
+   * on the page first (T9).
+   */
+  | 'page-guard'
   /** Anything else the engine reported; the message carries its own words. */
   | 'failed'
 
@@ -548,9 +796,74 @@ function inspectElement(element: Element): ElementFacts {
   }
 }
 
+/** Where the top document says a point lands, and how it names what it found. */
+interface TopHit {
+  /** Whether any part of the rectangle is inside *this view's* viewport. */
+  inViewport: boolean
+  /** The probed point in view coordinates, or null when there was nothing to probe. */
+  point: ViewPoint | null
+  /** Whether what is on top there is the frame (or something inside it). */
+  same: boolean
+  /** How the topmost element is named in a failure message. */
+  description: string
+}
+
+/**
+ * Ask the **top document** what a point in view coordinates lands on.
+ *
+ * This is the half of the hit test that a frame's own document cannot answer: an element
+ * inside an iframe can be perfectly uncovered *within its frame* while the iframe itself
+ * is covered by something the parent drew over it. Probing the point in the top document
+ * is what makes "the click would land on that cover, not on the element" answerable
+ * across the frame boundary; the answer is compared against the iframe element, because
+ * the top document's `elementFromPoint` answers the `<iframe>` for any point inside it.
+ *
+ * The point is clamped to the viewport the same way {@link inspectElement} clamps it, so
+ * the two probes agree about what "the element's visible centre" is.
+ *
+ * Self-contained on purpose: only this function's source crosses into the page.
+ *
+ * One parameter, not two: `evaluate` hands the page function exactly one argument, so the
+ * iframe and the rectangle travel as a tuple.
+ *
+ * @param input - the `<iframe>` the element's document hangs in, and the element's
+ *   rectangle already translated into view coordinates.
+ * @returns what the top document answered.
+ */
+function inspectInTopDocument(input: [Element, ElementBounds]): TopHit {
+  const frameElement = input[0]
+  const rect = input[1]
+  const describe = (node: Element): string => {
+    const tag = node.tagName.toLowerCase()
+    const id = node.getAttribute('id') ?? ''
+    const label = node.getAttribute('aria-label') ?? ''
+    const text = (node.textContent ?? '').trim().slice(0, 40)
+    let out = tag
+    if (id !== '') out += `#${id}`
+    if (label !== '') out += ` "${label}"`
+    else if (text !== '') out += ` "${text}"`
+    return out
+  }
+
+  const left = Math.max(rect.x, 0)
+  const top = Math.max(rect.y, 0)
+  const right = Math.min(rect.x + rect.width, window.innerWidth)
+  const bottom = Math.min(rect.y + rect.height, window.innerHeight)
+  if (!(right > left && bottom > top)) {
+    return { inViewport: false, point: null, same: false, description: 'nothing (no part of it is in the view)' }
+  }
+  const point = { x: (left + right) / 2, y: (top + bottom) / 2 }
+  const landed = document.elementFromPoint(point.x, point.y)
+  return {
+    inViewport: true,
+    point,
+    same: landed === frameElement || (landed !== null && frameElement.contains(landed)),
+    description: landed === null ? 'nothing (no element is at that point)' : describe(landed),
+  }
+}
+
 /** Release handles, ignoring failures: disposal is housekeeping, never a result. */
-async function disposeHandles(handles: Iterable<ElementHandle>): Promise<void> {
-  await Promise.all([...handles].map((handle) => handle.dispose().catch(() => undefined)))
+async function disposeHandles(handles: Iterable<ElementHandle<Element>>): Promise<void> {  await Promise.all([...handles].map((handle) => handle.dispose().catch(() => undefined)))
 }
 
 /** The first line of an engine message, without the call log and the stack. */
@@ -766,14 +1079,34 @@ export class AdoptedViewSession {
    * and an action would silently act on it. Pinning costs one query per snapshot and
    * makes the opposite failure — acting on the wrong element — impossible, while the
    * right failure — the element is gone — becomes reportable (ADR-0008).
+   *
+   * Since T9 an entry pins the *frame* as well as the node, because "which element" is
+   * not a complete answer inside a page that has frames: the same control exists in the
+   * top document and in every frame that embeds the same markup, and a ref that did not
+   * know its frame could land in the wrong one.
    */
-  private refs = new Map<number, ElementHandle>()
+  private refs = new Map<number, RefEntry>()
 
   /**
-   * Identity of the document the ref table was read from, or undefined when no
-   * snapshot has been taken. Checked before every ref-based action.
+   * The agent's answer policy for dialogs that appear later, and the dialogs seen so far.
+   *
+   * Both are per session and both are *answers*, never waits: the policy is read when a
+   * dialog opens, answered immediately, and recorded — so a page that raises a dialog in
+   * the middle of an action never blocks, and the action can still say what was asked
+   * (see {@link AdoptedViewSession.answerDialog}).
    */
-  private documentToken: string | undefined
+  private dialogPolicy: DialogPolicy = { ...DEFAULT_DIALOG_POLICY }
+  private dialogRecords: DialogRecord[] = []
+
+  /**
+   * Downloads that *began* while this session was watching.
+   *
+   * The event is Playwright's, and it is reliable here (measured); what it does **not**
+   * carry is where the bytes went — on this host `download.path()` answers a path in
+   * `playwright-artifacts-*` where no file exists (ADR-0011). So these records say
+   * "a download started", and the shell's journal says what became of it.
+   */
+  private downloadStarts: DownloadStart[] = []
 
   /**
    * What the current document said about itself while the session watched: the JSON it
@@ -823,6 +1156,11 @@ export class AdoptedViewSession {
      * text (T5), so one cap governs every read that can be long.
      */
     readonly maxChars: number,
+    /**
+     * Where the shell publishes its downloads, when there is a shell that does. Absent
+     * means `downloads()` has to say "there is nothing to ask" rather than "none" (T9).
+     */
+    private readonly downloadJournalFile: string | undefined,
   ) {
     // A `ref` is an index into *this* document. When the view navigates on its own —
     // a link, a form submit, a redirect — the next element at that index is a
@@ -835,8 +1173,7 @@ export class AdoptedViewSession {
     // it belongs to an execution context, so the token check stays the thing that
     // answers with the reason, and this listener only releases what it can (ADR-0008).
     page.on('load', () => {
-      void disposeHandles(this.refs.values())
-      this.refs = new Map()
+      void this.forgetRefs()
     })
     // The observations above belong to one document, so they start again with the next
     // one. The event is the main frame's navigation *commit* rather than its load, because
@@ -884,6 +1221,25 @@ export class AdoptedViewSession {
         summary: request.failure()?.errorText ?? 'the request failed with no reason reported',
       })
     })
+    // Dialogs (T9). The handler is `async` **on purpose**: measured against this engine,
+    // a handler that returns nothing counts as "nobody is handling this dialog" and
+    // Playwright closes it itself, while a handler that returns a promise takes
+    // responsibility — and a promise that never settles blocks the page for as long as it
+    // hangs. This one always settles, immediately, from the policy.
+    page.on('dialog', async (dialog) => {
+      await this.answerDialog(dialog)
+    })
+    // Downloads (T9). Only the *beginning* is observable from here; where the bytes go is
+    // the shell's answer, because on this host Playwright's own `download.path()` points
+    // at a file that does not exist (ADR-0011). Recording the start is what lets a click
+    // that saved a file say so instead of reporting a page that never changed.
+    page.on('download', (download) => {
+      this.pushDownloadStart({
+        url: download.url(),
+        filename: download.suggestedFilename(),
+        at: Date.now(),
+      })
+    })
     // The overlay (T8): the document the session adopted right now gets one, and every
     // later document gets one from the init script registered here. Both are fire and
     // forget — a hint that cannot be drawn is not a reason for adopting a view to fail.
@@ -923,6 +1279,7 @@ export class AdoptedViewSession {
         timeoutMs,
         maxElements,
         maxChars,
+        options.downloadJournalFile,
       )
     } catch (error) {
       // A failed adoption must not leave a dangling connection behind.
@@ -938,10 +1295,30 @@ export class AdoptedViewSession {
     // definitely invalidates every ref, and it is about to happen, not merely possible.
     // The handles are released here rather than merely dropped, so a page that is
     // navigated over and over does not leave the previous document's nodes pinned.
-    void disposeHandles(this.refs.values())
-    this.refs = new Map()
-    await this.page.goto(url, { waitUntil: 'load', timeout: this.timeoutMs })
+    void this.forgetRefs()
+    const mark = this.activityMark()
+    try {
+      await this.page.goto(url, { waitUntil: 'load', timeout: this.timeoutMs })
+    } catch (error) {
+      // A page with a `beforeunload` guard cannot be navigated away from, and the engine
+      // reports that as a bare `net::ERR_ABORTED` — which reads like a network problem
+      // and is not one. The dialog that was answered on the way is the evidence that says
+      // what really happened, so it is what the failure is built from (T9).
+      const guarded = this.activitySince(mark).dialogs.find((record) => record.type === 'beforeunload')
+      if (guarded !== undefined) throw new ViewActionError('page-guard', this.pageGuardMessage(url))
+      throw error
+    }
     return { title: await this.page.title(), url: this.page.url() }
+  }
+
+  /** Why a navigation did not happen: the page's own guard refused to leave. */
+  private pageGuardMessage(url: string): string {
+    return (
+      `browser-view: the page refused to leave, so the view is still at ${this.page.url()} — it has a ` +
+      `beforeunload guard (unsaved changes) and the navigation to ${url} was cancelled. Answering that ` +
+      'dialog with "accept" does not help: measured on this host it neither lets the navigation through nor ' +
+      'returns promptly. Deal with the page first (save, or drop the guard with browser_evaluate), then navigate.'
+    )
   }
 
   /**
@@ -973,38 +1350,160 @@ export class AdoptedViewSession {
    *
    * Split out so the public entry point can wrap exactly one thing — the read — in the
    * visible hint, instead of the hint being threaded through the collection.
+   *
+   * **One pass per frame** (T9). The frames are visited in a stable order — the main
+   * frame first, then the child frames in the order the engine reports them (document
+   * order of their `<iframe>` elements) — and each frame's own match set is read from that
+   * frame's own document. So an element inside an iframe is a snapshot element like any
+   * other, while the *frame* it came from is what {@link RefEntry} pins along with the
+   * node: two frames of one page can hold identical controls, and a ref that did not know
+   * its frame could land in the wrong one.
+   *
+   * The frame's origin is measured from the parent document (`frame.frameElement()`), not
+   * from inside the frame: `window.frameElement` is null for a cross-origin frame, while
+   * the *parent* can always measure the box it laid out. That is what lets a frame
+   * element's bounds be published in this view's own viewport coordinates, which is the
+   * only coordinate space bounds, the overlay and the hit test share (ADR-0007).
    */
   private async collectSnapshot(): Promise<PageSnapshot> {
-    const locator = this.page.locator(SNAPSHOT_SELECTOR)
-    const handles = await locator.elementHandles()
-    // The handles go in as the page function's argument, and Playwright resolves them to
-    // the nodes they reference, so the metadata is read from exactly the elements that
-    // were pinned. Reaching `evaluate` through a bound, explicitly typed reference is
-    // what keeps that call expressible: the public typings model the handle→node
-    // translation with a recursive conditional type that the compiler refuses to
-    // instantiate for an array of elements.
-    const evaluate = this.page.evaluate.bind(this.page) as unknown as (
-      pageFunction: (elements: Element[]) => CollectedSnapshot,
-      arg: readonly ElementHandle[],
-    ) => Promise<CollectedSnapshot>
-    const collected = await evaluate(collectSnapshot, handles)
-    const url = this.page.url()
-    const truncated = collected.elements.length > this.maxElements
-    const kept = truncated ? collected.elements.slice(0, this.maxElements) : collected.elements
-    const elements: SnapshotElement[] = []
-    const refs = new Map<number, ElementHandle>()
-    for (let index = 0; index < kept.length; index++) {
-      const ref = index + 1
-      elements.push({ ref, ...kept[index] })
-      refs.set(ref, handles[index])
+    const mainFrame = this.page.mainFrame()
+    const frames = [mainFrame, ...this.page.frames().filter((frame) => frame !== mainFrame)]
+    interface FrameCollection {
+      frame: Frame
+      /** Every handle this frame contributed, in the order the page function indexes them. */
+      pool: ElementHandle<Element>[]
+      collected: CollectedSnapshot
+      origin: ViewPoint
+      frameElement?: ElementHandle<Element>
     }
+    const collections: FrameCollection[] = []
+    for (const frame of frames) {
+      const handles = (await frame.locator(SNAPSHOT_SELECTOR).elementHandles()) as ElementHandle<Element>[]
+      const labels = (await frame.locator(CONTROL_LABEL_SELECTOR).elementHandles()) as ElementHandle<Element>[]
+      // The handles go in as the page function's argument, and Playwright resolves them to
+      // the nodes they reference, so the metadata is read from exactly the elements that
+      // were pinned. Reaching `evaluate` through a bound, explicitly typed reference is
+      // what keeps that call expressible: the public typings model the handle→node
+      // translation with a recursive conditional type that the compiler refuses to
+      // instantiate for an array of elements.
+      const evaluate = frame.evaluate.bind(frame) as unknown as (
+        pageFunction: (input: SnapshotInput) => CollectedSnapshot,
+        arg: { elements: readonly ElementHandle[]; labels: readonly ElementHandle[]; overlayId: string },
+      ) => Promise<CollectedSnapshot>
+      const collected = await evaluate(collectSnapshot, {
+        elements: handles,
+        labels,
+        overlayId: this.overlay.id,
+      })
+      const frameElement = frame === mainFrame ? undefined : ((await frame.frameElement()) as ElementHandle<Element>)
+      collections.push({
+        frame,
+        pool: [...handles, ...labels],
+        collected,
+        origin: await this.frameOrigin(frame),
+        ...(frameElement !== null && frameElement !== undefined ? { frameElement } : {}),
+      })
+    }
+
+    const elements: SnapshotElement[] = []
+    const refs = new Map<number, RefEntry>()
+    const consumed = new Set<ElementHandle>()
+    let truncated = false
+    for (const collection of collections) {
+      for (let index = 0; index < collection.collected.elements.length; index++) {
+        if (refs.size >= this.maxElements) {
+          truncated = true
+          break
+        }
+        const handle = collection.pool[collection.collected.picks[index]]
+        const record = collection.collected.elements[index]
+        const ref = refs.size + 1
+        consumed.add(handle)
+        elements.push({
+          ref,
+          ...record,
+          // 框架里的元素，bounds 要**搬进这一块视图的视口坐标**：快照的 bounds 与覆盖层、
+          // 命中测试共用一套坐标（ADR-0007），而框架内那个矩形是相对框架自己视口的。
+          // 主框架的 origin 是 (0,0)，所以主框架元素这一行等于没动。
+          bounds: {
+            x: record.bounds.x + collection.origin.x,
+            y: record.bounds.y + collection.origin.y,
+            width: record.bounds.width,
+            height: record.bounds.height,
+          },
+          ...(collection.frame === mainFrame ? {} : { frame: collection.frame.url() }),
+        })
+        refs.set(ref, {
+          handle,
+          frame: collection.frame,
+          token: collection.collected.token,
+          origin: collection.origin,
+          ...(collection.frameElement !== undefined ? { frameElement: collection.frameElement } : {}),
+        })
+      }
+      if (truncated) break
+    }
+
     const previous = this.refs
     this.refs = refs
-    this.documentToken = collected.token
-    // The matches past the cap have no ref, so nothing can ever act on them.
-    void disposeHandles(handles.slice(refs.size))
-    void disposeHandles(previous.values())
-    return { title: collected.title, url, elements, ...(truncated ? { truncated: true } : {}) }
+    // Anything the snapshot did not list has no ref, so nothing can ever act on it: the
+    // matches past the cap, and every label the rule in the page decided against.
+    for (const collection of collections) {
+      void disposeHandles(collection.pool.filter((handle) => !consumed.has(handle)))
+    }
+    // 旧表的节点与它记下的 `<iframe>` 一起放掉：框架句柄是**每个 ref 都要用的**，所以它
+    // 只在整张表被换掉时才该释放（上一版把它当成"没被用上的匹配"当场释放了，于是同一个
+    // 框架里的第二个动作会因为句柄已经没了而失败）。
+    void disposeHandles([...previous.values()].map((entry) => entry.handle))
+    void disposeHandles(
+      [...previous.values()]
+        .map((entry) => entry.frameElement)
+        .filter((handle): handle is ElementHandle<Element> => handle !== undefined),
+    )
+    return {
+      title: collections[0].collected.title,
+      url: this.page.url(),
+      elements,
+      ...(truncated ? { truncated: true } : {}),
+    }
+  }
+
+  /**
+   * Where one frame's viewport starts, in this view's viewport coordinates.
+   *
+   * Walked upwards one `<iframe>` at a time, each measured **in its own parent document**
+   * (`getBoundingClientRect()` of the frame element, plus its border widths, because the
+   * child document's viewport starts inside the border, not at the border box). The main
+   * frame's origin is `(0, 0)` by definition, so a main-frame element's bounds are the
+   * ones `getBoundingClientRect()` reported and nothing is added.
+   *
+   * @param frame - the frame to locate.
+   * @returns the frame viewport's origin in view coordinates.
+   */
+  private async frameOrigin(frame: Frame): Promise<ViewPoint> {
+    let x = 0
+    let y = 0
+    let current = frame
+    const mainFrame = this.page.mainFrame()
+    while (current !== mainFrame) {
+      const parent = current.parentFrame()
+      if (parent === null) break
+      const raw = await current.frameElement()
+      if (raw === null) break
+      const element = raw as ElementHandle<Element>
+      const box = (await element.evaluate((node) => {
+        const rect = node.getBoundingClientRect()
+        const style = getComputedStyle(node)
+        return {
+          x: rect.left + (Number.parseFloat(style.borderLeftWidth) || 0),
+          y: rect.top + (Number.parseFloat(style.borderTopWidth) || 0),
+        }
+      })) as ViewPoint
+      x += box.x
+      y += box.y
+      current = parent
+    }
+    return { x, y }
   }
 
   /**
@@ -1225,8 +1724,11 @@ export class AdoptedViewSession {
       // caller can see it is now inside the viewport instead of taking this method's word
       // for it. The ripple's point comes out of the same single pass: aiming *before* the
       // scroll would be aiming at nothing, because the element this action exists for is
-      // typically the one that was outside the viewport (ADR-0007).
-      const after = (await target.handle.evaluate(inspectElement)) as ElementFacts
+      // typically the one that was outside the viewport (ADR-0007). A frame element goes
+      // through {@link viewFacts} again, so the rectangle that is returned is in view
+      // coordinates — the only space "is it in the viewport now" is a question in.
+      const entry = this.refs.get(ref) as RefEntry
+      const after = await this.viewFacts(entry, (await target.handle.evaluate(inspectElement)) as ElementFacts)
       overlay.landed(after.hit?.point)
       return after.rect
     })
@@ -1440,6 +1942,353 @@ export class AdoptedViewSession {
   }
 
   /**
+   * The dialogs this session has answered, oldest first.
+   *
+   * @returns a copy, so a caller cannot mutate what the session is still filling.
+   */
+  dialogRecordsSoFar(): DialogRecord[] {
+    this.assertOpen()
+    return [...this.dialogRecords]
+  }
+
+  /** The answer policy dialogs raised from now on will be given. */
+  currentDialogPolicy(): DialogPolicy {
+    return { ...this.dialogPolicy }
+  }
+
+  /**
+   * Set the answer this session gives to dialogs that appear later.
+   *
+   * It is a *policy*, not an answer to a dialog that is already on screen — because there
+   * never is one: dialogs are answered the moment they appear (see
+   * {@link AdoptedViewSession.answerDialog}), so the only way to answer one is to have
+   * said in advance what the answer should be. That is the whole design: a page can never
+   * be left waiting for a model that is itself waiting for the page.
+   *
+   * @param policy - the answer to give, and the text a `prompt` should be accepted with.
+   * @returns the policy in force after the change.
+   */
+  setDialogPolicy(policy: DialogPolicy): DialogPolicy {
+    this.assertOpen()
+    this.dialogPolicy = policy.promptText === undefined ? { answer: policy.answer } : { ...policy }
+    return this.currentDialogPolicy()
+  }
+
+  /**
+   * A reading of "what has happened so far", for attributing events to one action.
+   *
+   * Actions are not the only things that happen on a page: a click can raise a dialog and
+   * start a download. Both are recorded with a timestamp-free counter, so an action can
+   * ask "what was raised while I ran" without depending on wall-clock ordering.
+   *
+   * @returns an opaque mark to hand to {@link AdoptedViewSession.activitySince}.
+   */
+  activityMark(): { dialogs: number; downloads: number } {
+    return { dialogs: this.dialogRecords.length, downloads: this.downloadStarts.length }
+  }
+
+  /**
+   * Everything raised since a mark: the dialogs answered and the downloads started.
+   *
+   * @param mark - a mark from {@link AdoptedViewSession.activityMark}.
+   * @returns the activity, each list possibly empty.
+   */
+  activitySince(mark: { dialogs: number; downloads: number }): ActionActivity {
+    return {
+      dialogs: this.dialogRecords.slice(mark.dialogs),
+      downloads: this.downloadStarts.slice(mark.downloads),
+    }
+  }
+
+  /**
+   * Hand a local file to the page's file input.
+   *
+   * Two routes, and which one is used is decided by what the `ref` points at — never by
+   * what the page looks like from here:
+   *
+   *  - the ref **is** a file input: `setInputFiles` puts the file in it directly. This is
+   *    the only route that works on a `display: none` input, and it is why an input the
+   *    snapshot lists is used as-is instead of being clicked.
+   *  - the ref is the **visible trigger** of a hidden one (a `<label>` the snapshot lists
+   *    because its control is not listed, ADR-0012): the trigger is clicked and the file
+   *    chooser that click opens is what receives the file. Measured on this host: the
+   *    `filechooser` event arrives about a millisecond *after* the click returns, and
+   *    `setFiles` really does put the bytes into the page's own `FileList`.
+   *
+   * Every answer is read back from the page afterwards. "The file was given to the input"
+   * is not something this method is allowed to assert: the input's own `files` list is
+   * what says whether it landed, and its name and size are what the caller is told.
+   *
+   * @param ref - 1-based ref of the file input or of a control that opens one.
+   * @param path - absolute path of the local file to hand over.
+   * @returns what the page now holds, read from the page.
+   * @throws a named failure when the path is not a readable file, when the click opened no
+   *   file chooser within the action timeout, or when the chooser refused the files.
+   */
+  async uploadRef(ref: number, path: string): Promise<UploadResult> {
+    this.assertOpen()
+    const absolute = resolve(path)
+    const info = await stat(absolute).catch((error: unknown) => {
+      throw new ViewActionError(
+        'failed',
+        `browser-view: browser_upload could not read ${absolute} — ${error instanceof Error ? firstLine(error.message) : String(error)}. ` +
+          'The path must name a file that exists on the machine running this agent.',
+      )
+    })
+    if (!info.isFile()) {
+      throw new ViewActionError(
+        'failed',
+        `browser-view: browser_upload was given ${absolute}, which is not a file. Point it at one file.`,
+      )
+    }
+    return await this.action(async (overlay) => {
+      const target = await this.targetOf(ref, 'used to give a file to')
+      await overlay.aim(target.facts.hit?.point)
+      const isFileInput = (await target.handle.evaluate(
+        (element) => element.tagName.toLowerCase() === 'input' && (element as HTMLInputElement).type === 'file',
+      )) as boolean
+      if (isFileInput) {
+        await this.perform(`giving ${basename(absolute)} to ref ${ref} (${target.facts.description})`, () =>
+          target.handle.setInputFiles(absolute, { timeout: this.timeoutMs }),
+        )
+        return await this.readUpload(target.handle, ref, target.facts.description, 'input', absolute)
+      }
+      // Not an input: it opens one. The chooser is what the engine hands over, so the
+      // file is delivered through the route the page itself uses.
+      const chooser = await this.openFileChooser(target.handle, ref, target.facts.description)
+      try {
+        await chooser.setFiles(absolute)
+      } catch (error) {
+        throw new ViewActionError(
+          'failed',
+          `browser-view: the file chooser ref ${ref} (${target.facts.description}) opened refused ` +
+            `${basename(absolute)}: ${firstLine(error instanceof Error ? error.message : String(error))}`,
+        )
+      }
+      const element = await chooser.element()
+      return await this.readUpload(element, ref, target.facts.description, 'filechooser', absolute)
+    })
+  }
+
+  /**
+   * Click a control and hand back the file chooser it opened.
+   *
+   * @param handle - the control to click.
+   * @param ref - the ref it was addressed by, for the failure message.
+   * @param description - how the control is named in a failure message.
+   * @returns the chooser the engine reported.
+   * @throws when no chooser appeared within the action timeout — named as such, because
+   *   "this control does not open a file chooser" and "the file was refused" have
+   *   different remedies.
+   */
+  private async openFileChooser(handle: ElementHandle, ref: number, description: string): Promise<FileChooser> {
+    const budgetMs = Math.max(1_000, Math.min(this.timeoutMs, FILE_CHOOSER_BUDGET_MS))
+    const pending = this.page.waitForEvent('filechooser', { timeout: budgetMs })
+    // The rejection is handled where the chooser is awaited; this only stops an unhandled
+    // rejection if the click below fails first.
+    pending.catch(() => undefined)
+    try {
+      await handle.click({ timeout: this.timeoutMs })
+    } catch (error) {
+      throw classifyActionFailure(error, `clicking ref ${ref} (${description}) to open a file chooser`)
+    }
+    try {
+      return await pending
+    } catch (error) {
+      throw new ViewActionError(
+        'failed',
+        `browser-view: clicking ref ${ref} (${description}) opened no file chooser within ${budgetMs}ms — ` +
+          'the element is clickable but it is not a file input and it does not open one, so there is nothing to ' +
+          'give the file to. Use the ref of the file input itself, or of the control that really opens the picker ' +
+          `(the engine said: ${firstLine(error instanceof Error ? error.message : String(error))}).`,
+      )
+    }
+  }
+
+  /**
+   * Read back what the page's own `FileList` holds after a file was handed over.
+   *
+   * @param handle - the input the files went into.
+   * @param ref - the ref the action named.
+   * @param description - how the element is named in messages.
+   * @param via - which route delivered the file.
+   * @param path - the absolute path that was handed over.
+   * @returns the page's own answer.
+   */
+  private async readUpload(
+    handle: ElementHandle,
+    ref: number,
+    description: string,
+    via: 'input' | 'filechooser',
+    path: string,
+  ): Promise<UploadResult> {
+    const held = (await handle.evaluate((element) => {
+      const input = element as HTMLInputElement
+      const files = input.files
+      if (files === null || files.length === 0) return { count: 0, name: '', size: 0 }
+      return { count: files.length, name: files[0].name, size: files[0].size }
+    })) as { count: number; name: string; size: number }
+    if (held.count === 0) {
+      throw new ViewActionError(
+        'failed',
+        `browser-view: ${basename(path)} was handed to ref ${ref} (${description}) but the input still holds no ` +
+          'files, so the page never received it. Nothing was uploaded.',
+      )
+    }
+    return { ref, element: description, via, path, count: held.count, name: held.name, size: held.size }
+  }
+
+  /**
+   * What the shell recorded about downloads, newest last.
+   *
+   * The journal is the shell's own file in the space channel (ADR-0011), read on demand:
+   * a download that happened while nothing was watching is still there, and a download
+   * that is still running says so rather than being reported as a finished file.
+   *
+   * @returns the journal.
+   * @throws when there is no shell to ask, or when the shell's journal cannot be read.
+   */
+  async downloads(): Promise<DownloadJournal> {
+    this.assertOpen()
+    const raw = await this.readDownloadJournal()
+    return raw
+  }
+
+  /**
+   * One download's record plus a preview of the bytes really on disk.
+   *
+   * The preview is read here, by this process, **after** checking that the file the shell
+   * named exists and is as large as the shell said. A preview of a path that was not
+   * checked would be exactly the kind of claim this project refuses elsewhere: the answer
+   * to "where did my download go" has to be a file that was actually opened.
+   *
+   * @param id - the record's id, as listed by {@link AdoptedViewSession.downloads}.
+   * @param maxChars - cut the preview at this many characters; defaults to the session cap.
+   * @returns the record and, when it was readable, its preview.
+   * @throws when there is no such record, or when the journal cannot be read.
+   */
+  async readDownload(id: number, maxChars?: number): Promise<DownloadReading> {
+    this.assertOpen()
+    const journal = await this.readDownloadJournal()
+    const record = journal.downloads.find((candidate) => candidate.id === id)
+    if (record === undefined) {
+      const known = journal.downloads.map((candidate) => `#${String(candidate.id)} ${candidate.filename}`).join(', ')
+      throw new ViewActionError(
+        'not-found',
+        `browser-view: there is no download #${String(id)} in the shell's journal (it knows: ${known === '' ? 'none' : known}). ` +
+          'Call browser_download without an id to list them.',
+      )
+    }
+    if (record.state !== 'completed') {
+      return {
+        record,
+        unreadable:
+          record.state === 'started'
+            ? 'the shell says this download has not finished yet, so there are no bytes to read'
+            : `the shell says this download was ${record.state}, so there is no file to read`,
+      }
+    }
+    const bytes = await readFile(record.savePath).catch((error: unknown) => {
+      throw new ViewActionError(
+        'failed',
+        `browser-view: the shell recorded download #${String(id)} at ${record.savePath}, but that file could not be ` +
+          `read (${error instanceof Error ? firstLine(error.message) : String(error)}). The path the shell published ` +
+          'is the only one this plugin will report — nothing is guessed from the download event.',
+      )
+    })
+    if (bytes.byteLength !== record.bytes) {
+      return {
+        record,
+        unreadable:
+          `the file at ${record.savePath} is ${String(bytes.byteLength)} byte(s) while the shell recorded ` +
+          `${String(record.bytes)}, so it is not the file the shell finished writing`,
+      }
+    }
+    return { record, preview: previewDownload(bytes, maxChars ?? this.maxChars) }
+  }
+
+  /** Read and parse the shell's download journal, saying plainly when it cannot be read. */
+  private async readDownloadJournal(): Promise<DownloadJournal> {
+    if (this.downloadJournalFile === undefined) {
+      throw new ViewActionError(
+        'failed',
+        'browser-view: there is no shell to ask about downloads — this plugin was mounted without a task-space ' +
+          'channel, so nothing is publishing what was downloaded or where it was saved. The download event alone ' +
+          'cannot answer that on this host (its own path points at a file that does not exist).',
+      )
+    }
+    const raw = await readFile(this.downloadJournalFile, 'utf8').catch((error: unknown) => {
+      throw new ViewActionError(
+        'failed',
+        `browser-view: the shell has published no download journal at ${this.downloadJournalFile} ` +
+          `(${error instanceof Error ? firstLine(error.message) : String(error)}). No download has completed under ` +
+          'this browser profile yet.',
+      )
+    })
+    const journal = parseDownloadJournal(raw)
+    if (journal === undefined) {
+      throw new ViewActionError(
+        'failed',
+        `browser-view: the download journal at ${this.downloadJournalFile} could not be understood, so what was ` +
+          'downloaded and where it was saved cannot be answered from here. It may be mid-write; try again.',
+      )
+    }
+    return journal
+  }
+
+  /**
+   * Answer one dialog, right now, from the policy.
+   *
+   * The handler is asynchronous because the engine requires it to be — a handler that
+   * does not return a promise is not "handling" anything, it is just watching, and
+   * Playwright closes the dialog itself. But nothing here ever *waits*: the answer is
+   * computed from data and sent immediately, so the page is never left blocked on a model
+   * that is itself waiting for the page (see `src/dialogs.ts` for the measurements).
+   *
+   * @param dialog - the dialog the engine just reported.
+   */
+  private async answerDialog(dialog: Dialog): Promise<void> {
+    const plan = planDialogAnswer(dialog.type(), this.dialogPolicy, dialog.defaultValue())
+    const record: DialogRecord = {
+      type: dialog.type(),
+      message: dialog.message(),
+      defaultPrompt: dialog.defaultValue(),
+      accept: plan.answer.accept,
+      ...(plan.answer.promptText !== undefined ? { promptText: plan.answer.promptText } : {}),
+      decidedBy: plan.decidedBy,
+      at: Date.now(),
+    }
+    this.dialogRecords.push(record)
+    if (this.dialogRecords.length > MAX_DIALOG_RECORDS) this.dialogRecords.shift()
+    try {
+      if (plan.answer.accept) await dialog.accept(plan.answer.promptText)
+      else await dialog.dismiss()
+    } catch (error) {
+      // A dialog that is already gone is not a failure of the action that raised it, but
+      // it *is* a fact about this record: the answer did not take effect.
+      record.answerError = firstLine(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  /** Keep one download start, dropping the oldest past the bound. */
+  private pushDownloadStart(start: DownloadStart): void {
+    this.downloadStarts.push(start)
+    if (this.downloadStarts.length > MAX_DOWNLOAD_STARTS) this.downloadStarts.shift()
+  }
+
+  /** The dialogs-and-downloads note for one action, as lines a caller can append. */
+  describeActivity(activity: ActionActivity): string[] {
+    const lines = describeDialogActivity(activity.dialogs)
+    for (const start of activity.downloads) {
+      lines.push(
+        `a download started while this action ran: ${start.filename} from ${start.url} — where it was saved is the ` +
+          'shell\'s answer; ask browser_download',
+      )
+    }
+    return lines
+  }
+
+  /**
    * Decide whether one response is data to keep, a failure to report, or neither.
    *
    * The split is by status: a payload that came back `ok` is data the page loaded, while
@@ -1530,22 +2379,84 @@ export class AdoptedViewSession {
    * @returns the pinned element and what was learned about it.
    */
   private async targetOf(ref: number, action: string, scrollIntoView = false): Promise<RefTarget> {
-    const handle = this.refs.get(ref)
-    if (handle === undefined) throw new ViewActionError('not-found', this.unknownRefMessage(ref))
-    if (!(await this.isSnapshotDocument())) throw new ViewActionError('stale-ref', this.staleDocumentMessage(ref))
-    let facts = (await handle.evaluate(inspectElement)) as ElementFacts
+    const entry = this.refs.get(ref)
+    if (entry === undefined) throw new ViewActionError('not-found', this.unknownRefMessage(ref))
+    if (!(await this.isEntryDocument(entry))) {
+      throw new ViewActionError('stale-ref', this.staleDocumentMessage(ref))
+    }
+    let facts = (await entry.handle.evaluate(inspectElement)) as ElementFacts
     if (!facts.connected) throw new ViewActionError('not-found', this.missingElementMessage(ref, facts))
     // The engine's own predicate, not a second definition of "visible": this is the
     // same function behind the `:visible` in the snapshot's selector, so what the
     // snapshot listed is what can be acted on (ADR-0005, ADR-0007).
-    if (!(await handle.isVisible())) throw new ViewActionError('not-visible', this.notVisibleMessage(ref, facts, action))
-    if (scrollIntoView && !facts.inViewport) {
+    if (!(await entry.handle.isVisible())) {
+      throw new ViewActionError('not-visible', this.notVisibleMessage(ref, facts, action))
+    }
+    let view = await this.viewFacts(entry, facts)
+    if (scrollIntoView && !view.inViewport) {
       // The engine scrolls before a pointer action anyway; doing it here means the hit
       // test below is taken at the point the action will really use.
-      await handle.scrollIntoViewIfNeeded({ timeout: this.timeoutMs })
-      facts = (await handle.evaluate(inspectElement)) as ElementFacts
+      await entry.handle.scrollIntoViewIfNeeded({ timeout: this.timeoutMs })
+      facts = (await entry.handle.evaluate(inspectElement)) as ElementFacts
+      view = await this.viewFacts(entry, facts)
     }
-    return { handle, facts }
+    return { handle: entry.handle, facts: view }
+  }
+
+  /**
+   * Translate one frame-local look at an element into this view's coordinates.
+   *
+   * For a main-frame element this is the identity — its own `getBoundingClientRect()` *is*
+   * a view-coordinate rectangle — so nothing extra is asked of the page.
+   *
+   * For an element inside a frame, two things change and both are about the frame
+   * boundary:
+   *
+   *  - **the rectangle moves** by the frame's origin, because bounds mean "where this is
+   *    in the view", and the overlay (which only ever exists in the top document) draws in
+   *    that space. The raw numbers are still the page's own, unrounded; this adds one
+   *    translation and nothing else.
+   *  - **"is it in the viewport" and "is it covered" become questions for two documents.**
+   *    A frame-local probe cannot see something the *parent* drew over the iframe, so the
+   *    point is probed in the top document as well and has to land on the frame. A frame
+   *    element off the edge of the view is reported as out of the viewport even when it
+   *    sits comfortably inside its own frame's viewport.
+   *
+   * @param entry - the pinned element's frame bookkeeping.
+   * @param facts - what the element's own document answered.
+   * @returns facts with `rect`, `inViewport` and `hit` expressed in view coordinates.
+   */
+  private async viewFacts(entry: RefEntry, facts: ElementFacts): Promise<ElementFacts> {
+    if (entry.frameElement === undefined) return facts
+    const viewRect: ElementBounds = {
+      x: facts.rect.x + entry.origin.x,
+      y: facts.rect.y + entry.origin.y,
+      width: facts.rect.width,
+      height: facts.rect.height,
+    }
+    const evaluate = this.page.evaluate.bind(this.page) as unknown as (
+      pageFunction: (input: [Element, ElementBounds]) => TopHit,
+      arg: [ElementHandle<Element>, ElementBounds],
+    ) => Promise<TopHit>
+    const top = await evaluate(inspectInTopDocument, [entry.frameElement, viewRect])
+    // A cover inside the frame is named by the frame's own answer (it knows the node); a
+    // cover in the parent is named by the top document's. Which one is reported matters:
+    // the remedy is on whichever side of the boundary the covering element lives.
+    if (facts.hit !== null && !facts.hit.same) {
+      return { ...facts, rect: viewRect, inViewport: top.inViewport, hit: { ...facts.hit, point: top.point ?? facts.hit.point } }
+    }
+    if (!top.inViewport || top.point === null) {
+      return { ...facts, rect: viewRect, inViewport: false, hit: null }
+    }
+    if (!top.same) {
+      return {
+        ...facts,
+        rect: viewRect,
+        inViewport: true,
+        hit: { point: top.point, same: false, description: top.description },
+      }
+    }
+    return { ...facts, rect: viewRect, inViewport: true, hit: { point: top.point, same: true, description: facts.hit?.description ?? facts.description } }
   }
 
   /**
@@ -1740,7 +2651,7 @@ export class AdoptedViewSession {
   }
 
   /**
-   * Whether the view still shows the document the most recent snapshot was read from.
+   * Whether the frame a ref came from still shows the document that ref was read from.
    *
    * This is the check that makes "a ref belongs to one document" enforceable rather
    * than merely intended: an event listener that clears the table can only run after
@@ -1751,17 +2662,36 @@ export class AdoptedViewSession {
    * only that it is disconnected, which would be indistinguishable from a node the
    * page removed (ADR-0008).
    *
-   * @returns true only when a snapshot exists and its document is still the current one.
+   * Since T9 the question is asked of **the ref's own frame**: a ref into an iframe is
+   * invalidated by that frame navigating, and *not* by the main document navigating —
+   * except that a main-document navigation takes the whole frame tree with it, which the
+   * frame's own disappearance (a rejected evaluation) reports as the same "no".
+   *
+   * @param entry - the pinned element's frame bookkeeping.
+   * @returns true only when that frame's current document is the one the ref came from.
    */
-  private async isSnapshotDocument(): Promise<boolean> {
-    if (this.documentToken === undefined) return false
+  private async isEntryDocument(entry: RefEntry): Promise<boolean> {
     try {
-      return (await this.page.evaluate(() => String(performance.timeOrigin))) === this.documentToken
+      return (await entry.frame.evaluate(() => String(performance.timeOrigin))) === entry.token
     } catch {
-      // A destroyed execution context means the document is gone — exactly the case
-      // this check exists to catch, so it is a "no", not a failure to report.
+      // A destroyed execution context — or a frame that is gone — means the document is
+      // gone, which is exactly the case this check exists to catch, so it is a "no", not
+      // a failure to report.
       return false
     }
+  }
+
+  /** Drop the ref table, releasing every node it pinned. */
+  private async forgetRefs(): Promise<void> {
+    const previous = this.refs
+    this.refs = new Map()
+    const entries = [...previous.values()]
+    await disposeHandles(entries.map((entry) => entry.handle))
+    await disposeHandles(
+      entries
+        .map((entry) => entry.frameElement)
+        .filter((handle): handle is ElementHandle<Element> => handle !== undefined),
+    )
   }
 
   /** Why a ref number is not one the most recent snapshot handed out. */
@@ -1856,8 +2786,7 @@ export class AdoptedViewSession {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
-    void disposeHandles(this.refs.values())
-    this.refs = new Map()
+    void this.forgetRefs()
     await this.browser.close()
   }
 

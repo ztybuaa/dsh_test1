@@ -96,11 +96,24 @@ export interface ViewHandshake {
     requestFile: string
     /** The shell writes what is really true here. */
     stateFile: string
+    /**
+     * 外壳写、插件读：它真正下载了什么、落在哪（ADR-0011）。
+     *
+     * 与 `stateFile` **同方向、同目录**：这是既有通道上的一个新文件，不是一条新通道。
+     */
+    downloadJournalFile: string
     /** Partitions whose directories are to be removed at the next startup. */
     pendingDeletionFile: string
     /** Protocol version, so a stale pair can be told apart. */
     protocol: number
   }
+  /**
+   * 下载落在哪（ADR-0011）：`<userDataDir>/downloads`。
+   *
+   * 它是外壳**说过的一句话**，所以测试可以直接拿它来断言"文件的落盘位置在外壳说的那个
+   * 目录里"，而不是从别处推断。
+   */
+  downloadsDir: string
   /** Which space fills the panel rectangle at startup. */
   activeSpace: string
   /** Every task space that exists at startup, each value read back from Electron. */
