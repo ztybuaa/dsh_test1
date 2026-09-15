@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { AdoptedViewSession } from './session.ts'
+import { AdoptedViewSession, DEFAULT_MAX_ELEMENTS } from './session.ts'
 import { desktopViewTools } from './tools.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -17,6 +17,8 @@ export interface Config {
   targetId?: string
   /** Connection and per-action timeout in milliseconds. */
   timeoutMs: number
+  /** Cap on the elements one snapshot lists; beyond it the snapshot is truncated. */
+  maxElements: number
 }
 
 /** Schemastery schema validating {@link Config}. */
@@ -24,6 +26,7 @@ export const Config: z<Config> = z.object({
   cdpUrl: z.string(),
   targetId: z.string(),
   timeoutMs: z.number().default(30000),
+  maxElements: z.number().default(DEFAULT_MAX_ELEMENTS),
 })
 
 /**
@@ -50,6 +53,7 @@ export function apply(ctx: Context, config: Config): void {
     pending = AdoptedViewSession.adopt({
       cdpUrl,
       timeoutMs: config.timeoutMs,
+      maxElements: config.maxElements,
       ...(targetId !== undefined && targetId !== '' ? { targetId } : {}),
       ...(url !== undefined && url !== '' ? { url } : {}),
     }).catch((error: unknown) => {
