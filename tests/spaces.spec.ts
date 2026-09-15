@@ -911,16 +911,23 @@ describe('T7 — 验收 2/3/4：继承、同站互不影响、工具只作用于
  * `awaitCreatedTargets`），这两条都变红 —— 原始输出在同一份文档里。
  */
 describe('T7 — 端点那一刻读不回来：发布的表不许比它知道的更少（故障注入，确定性）', () => {
-  let shell: ShellProcess | undefined
-  let manager: SpaceManager | undefined
+  /**
+   * 这个组里**每一块**起过的外壳。
+   *
+   * 一条用例一块（两条用例的注入次数不同），而 `shell` 只有一个变量：第二条一赋值，
+   * 第一条那块外壳就没人停了 —— 配置文件留在 %TEMP% 里（实测：每跑一次套件漏一个 156 个文件的
+   * 档案目录，而且漏得**不声不响**，因为没人调用清理）。所以这里收的是**列表**。
+   */
+  const started: ShellProcess[] = []
 
   afterAll(async () => {
-    if (shell !== undefined) await shell.stop()
+    for (const each of started) await each.stop()
   })
 
   it('故障只发生一次：外壳等到目标可解析才发布，新空间拿到的是真的、能被领养的 id', async () => {
-    shell = await startShell(['--fault-cdp-list', '1'])
-    manager = new SpaceManager({
+    const shell = await startShell(['--fault-cdp-list', '1'])
+    started.push(shell)
+    const manager = new SpaceManager({
       dir: shell.handshake.spaceChannel.dir,
       timeoutMs: 30_000,
       maxElements: 200,
@@ -944,8 +951,9 @@ describe('T7 — 端点那一刻读不回来：发布的表不许比它知道的
   }, 120_000)
 
   it('故障一直发生：已知的 id 不许被抹掉，确实没有的要显式说明，插件点名那个空间报错', async () => {
-    shell = await startShell(['--fault-cdp-list', '1000'])
-    manager = new SpaceManager({
+    const shell = await startShell(['--fault-cdp-list', '1000'])
+    started.push(shell)
+    const manager = new SpaceManager({
       dir: shell.handshake.spaceChannel.dir,
       timeoutMs: 30_000,
       maxElements: 200,
