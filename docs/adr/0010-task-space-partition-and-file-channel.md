@@ -59,6 +59,20 @@ ADR-0003 明令外壳**不开任何监听端口**，而 `--placement-file` 已�
 驱动视图留在插件侧（ADR-0002/0003）"，而且它只在 `--rect-channel` 打开时注入。
 命令以**文件**形式过境，页面那半边永远只搬矩形。
 
+### 2.1 发布那张表时，`targetId` 是三态的（T7 之后补记）
+
+上面第 3 条要求表里的值都从 Electron 读回。补一条**同等硬**的：
+**发布的表永远不比它知道的更少** —— 因为 `targetId` 是这张表里唯一会**暂时**读不回来的值，
+而它又是插件领养会话的唯一把手。`/json/list` 是一个回环 HTTP 请求，一次瞬时失败**不许**把已经知道的
+id 抹掉（一块活着的视图，它的 target id 不会变）；确实没有的必须在记录里**显式写明**，
+不许静默省略字段。因此每条记录带 `targetIdSource`：`resolved` / `remembered` / `unavailable`
+（后两者附 `targetIdReason`），而插件侧把 `unavailable` 当成"这个空间还没准备好"，
+报一个**点名那个空间**的错误，**不去领养一个没有目标的会话**。
+
+字段是**加**上去的，所以 `SPACE_PROTOCOL` 仍然是 `1`：旧读者忽略新字段，新读者见到旧外壳缺这个字段
+时按"外壳没说"处理（不假装 `resolved`）。成因、确定性复现（外壳上的测试缝 `--fault-cdp-list`）
+与原始输出：`docs/research/space-table-target-id-gap.md`。
+
 ### 3. 继承登录态：cookie 全量复制，localStorage 只覆盖"新空间真的访问到的 origin"
 
 | 形态 | 能不能继承 | 代价 |

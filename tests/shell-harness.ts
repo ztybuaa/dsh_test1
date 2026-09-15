@@ -124,6 +124,13 @@ export interface ViewSpaceRecord {
   persistent?: boolean
   /** CDP target id of this space's view. */
   targetId?: string
+  /**
+   * 外壳对这个 `targetId` 怎么来的说的话（`resolved` / `remembered` / `unavailable`）。
+   * 缺省 = 旧外壳没说，**不**当成"解析到了"。
+   */
+  targetIdSource?: 'resolved' | 'remembered' | 'unavailable'
+  /** 外壳给的原因（`remembered` / `unavailable` 时都有）：读不到目标时它是唯一说得清的那句话。 */
+  targetIdReason?: string
   /** The address the space's view currently has. */
   url?: string
   /** `view.getVisible()`, as Electron answers it. */
@@ -262,9 +269,16 @@ function sleepSync(ms: number): void {
  * Cleanup is housekeeping, never a result: it is retried briefly, and a directory that is
  * still held is reported on stderr rather than allowed to fail an unrelated suite.
  *
+ * **Exported, and the only removal path the suite uses.** The trap was entered twice: this
+ * retry existed for T5, but it was private to this file, so T7's new spec wrote a bare
+ * `rmSync` in its own `afterAll` and reproduced the identical failure —
+ * `Test Files 1 failed | 7 passed` with `Tests 77 passed (77)`, `EPERM` at
+ * `tests/spaces.spec.ts:467` (raw output in docs/research/suite-flake-two-signatures.md).
+ * A cleanup path that is copied instead of shared is how a fixed bug comes back.
+ *
  * @param dir - the directory to remove.
  */
-function removeWhenFree(dir: string): void {
+export function removeWhenFree(dir: string): void {
   for (let attempt = 1; attempt <= REMOVE_ATTEMPTS; attempt++) {
     try {
       rmSync(dir, { recursive: true, force: true })

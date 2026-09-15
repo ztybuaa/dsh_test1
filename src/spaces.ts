@@ -43,6 +43,18 @@ export interface SpaceRecord {
   persistent: boolean
   /** 这块视图的 CDP target id；插件就是靠它领养这个空间。 */
   targetId?: string
+  /**
+   * 这个 `targetId` 是怎么来的 —— 外壳**显式**说的，不是这里猜的：
+   *
+   *  - `resolved`：这一次从 CDP 端点读回来的；
+   *  - `remembered`：这一次读不回来，沿用了这块视图上一次已知的（活着的视图 target id 不会变）；
+   *  - `unavailable`：确实没有，原因逐字在 {@link SpaceRecord.targetIdReason} 里。
+   *
+   * 旧外壳不发布这个字段，那时它是 `undefined` —— "外壳没说"，**不**当成 `resolved`。
+   */
+  targetIdSource?: 'resolved' | 'remembered' | 'unavailable'
+  /** 外壳给的原因（`remembered` / `unavailable` 时都有），逐字保留，用来点名说清哪个空间没准备好。 */
+  targetIdReason?: string
   /** 它当前显示的地址。 */
   url: string
   /** `view.getVisible()` 的读回值——不是外壳"打算"显示谁。 */
@@ -178,6 +190,15 @@ export function parseSpaceState(raw: string): SpaceState | undefined {
       storagePath: space.storagePath,
       persistent: space.persistent === true,
       ...(typeof space.targetId === 'string' && space.targetId !== '' ? { targetId: space.targetId } : {}),
+      // 外壳对"这个 targetId 怎么来的"说的话要原样带过来：把它丢掉，下面的 adopt() 就只能说
+      // "外壳没有发布 target id"，而真正的原因（端点那一刻读不回来 / 这块视图还没有目标）
+      // 正好是模型需要看见的那一句。
+      ...(space.targetIdSource === 'resolved' || space.targetIdSource === 'remembered' || space.targetIdSource === 'unavailable'
+        ? { targetIdSource: space.targetIdSource }
+        : {}),
+      ...(typeof space.targetIdReason === 'string' && space.targetIdReason !== ''
+        ? { targetIdReason: space.targetIdReason }
+        : {}),
       url: space.url,
       visible: space.visible === true,
       webContentsId: typeof space.webContentsId === 'number' ? space.webContentsId : -1,
@@ -289,7 +310,11 @@ export function describeSpaceTable(state: SpaceState): string {
       .join(', ')
     lines.push(
       `  ${space.name}${marks === '' ? '' : ` (${marks})`} — ${space.url === '' ? '(no page)' : space.url}` +
-        ` partition=${space.partition} storage=${space.storagePath}`,
+        ` partition=${space.partition} storage=${space.storagePath}` +
+        // 没有 target 这件事**不静默省略**：模型看到的每一行都要能解释"为什么这个空间动不了"。
+        (space.targetId === undefined
+          ? ` — no CDP target yet: ${space.targetIdReason ?? 'the shell did not say why'}`
+          : ''),
     )
   }
   if (state.error !== null) lines.push(`Last request was refused: ${state.error}`)
@@ -362,9 +387,14 @@ export class SpaceManager {
       )
     }
     if (record.targetId === undefined) {
+      // 不"领养一个没有目标的会话"：那会把"这块视图还没准备好"变成一会儿连到别的页面、
+      // 一会儿报一个跟真实原因无关的错。这里点名是哪个空间、并把外壳给的原因一并说出来。
       throw new Error(
-        `the desktop shell published no CDP target id for the active space "${record.name}"; ` +
-          'without it there is no page to adopt',
+        `the desktop shell has no usable CDP target for the active space "${record.name}" yet: ` +
+          `${record.targetIdReason ?? 'it published no target id and no reason for that'}. ` +
+          'The space is not ready to be driven — its view exists, but nothing can be adopted through it ' +
+          'until the shell can name its target; retry in a moment, or call browser_space with action ' +
+          '"list" to see what the shell says about it.',
       )
     }
     const cached = this.sessions.get(record.name)

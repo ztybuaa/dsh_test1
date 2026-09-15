@@ -185,6 +185,52 @@ function parseRequest(raw) {
 }
 
 /**
+ * 把"上一版为这块视图发布过的 target id"与"这一次列举的答案"合成发布记录里的那几个字段。
+ *
+ * 存在的理由是**发布的表不许比它知道的更少**。一块活着的视图，它的 CDP target id
+ * **不会变**（换页、reload、切前后台都不变；实测见 docs/research/space-table-target-id-gap.md），
+ * 所以"这一次没读到"和"没有"是两件不同的事，必须给出不同的答案：
+ *
+ *  1. 这一次读到了 → `resolved`（以这一次为准）；
+ *  2. 这一次没读到，但以前读到过 → `remembered`（沿用已知的，并说明为什么这一次没读到）；
+ *  3. 从来就没读到过 → `unavailable`（**显式**说明，绝不静默省略字段）。
+ *
+ * 为什么这不是"把陈旧数据当新鲜数据"：唯一会让 id 真的失效的事情是**这块视图被销毁**
+ * （`closeSpace` 时 `webContents.close()`；那时空间名也从表里消失了），而调用方
+ * （`shell/main.js` 的 `describeSpaces`）对销毁的视图走的是另一条分支。
+ *
+ * 纯逻辑：不 require electron、不碰文件系统，所以每一条判断都能不起外壳被单独读回
+ * （`tests/spaces.spec.ts`）。
+ *
+ * @param {string | undefined} previous - 上一版为**同一块视图**发布过的 target id。
+ * @param {{ok: true, targetId?: string, listedPages?: number, webContentsId?: number} | {ok: false, error: string}} listing -
+ *   这一次的答案：`ok:false` 表示**列举本身**失败了（回环端点读不回来），`ok:true` 而 `targetId` 为空
+ *   表示列举成功但里面没有这块视图的目标。
+ * @returns {{targetId?: string, targetIdSource: 'resolved' | 'remembered' | 'unavailable', targetIdReason?: string}} 要发布的那几个字段。
+ */
+function mergeTargetIds(previous, listing) {
+  const known = typeof previous === 'string' && previous !== '' ? previous : undefined
+  const listed = listing.ok === true && typeof listing.targetId === 'string' && listing.targetId !== '' ? listing.targetId : undefined
+  if (listed !== undefined) return { targetId: listed, targetIdSource: 'resolved' }
+  const why =
+    listing.ok === true
+      ? `the CDP endpoint listed no target for this view (webContents ${listing.webContentsId ?? '<unknown>'}); ` +
+        `it listed ${listing.listedPages ?? 0} page target(s)`
+      : `the CDP endpoint could not be listed (${listing.error})`
+  if (known !== undefined) {
+    return {
+      targetId: known,
+      targetIdSource: 'remembered',
+      targetIdReason: `${why}; keeping the id this view already had, because a live view's target id does not change`,
+    }
+  }
+  return {
+    targetIdSource: 'unavailable',
+    targetIdReason: `${why}, and no target id was ever read for this view, so there is nothing to remember`,
+  }
+}
+
+/**
  * 把"现在有哪些空间"与"请求要哪些空间"差成要做的三步。
  *
  * 做成一个纯函数而不是散在 `main.js` 的循环里，是因为这里最容易出错的地方不是
@@ -216,6 +262,7 @@ module.exports = {
   SPACES_DIR_NAME,
   STATE_FILE_NAME,
   isValidSpaceName,
+  mergeTargetIds,
   parseRequest,
   partitionDirectoryName,
   partitionForSpace,

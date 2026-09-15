@@ -140,6 +140,10 @@ const spaceSchema = {
           partition: { type: 'string', required: true },
           storagePath: { type: 'string', required: true },
           targetId: { type: 'string' },
+          // 外壳对"这个 targetId 怎么来的"说的话（`resolved` / `remembered` / `unavailable` + 原因）：
+          // 不放进这里就等于把它丢掉，而"这个空间为什么动不了"正是它要回答的。
+          targetIdSource: { type: 'string' },
+          targetIdReason: { type: 'string' },
           url: { type: 'string', required: true },
           visible: { type: 'boolean', required: true },
           active: { type: 'boolean', required: true },
@@ -170,7 +174,11 @@ function renderSpace(_args: unknown, value: SpaceCommandValue): { type: 'text'; 
       .join(', ')
     lines.push(
       `  ${space.name}${marks === '' ? '' : ` (${marks})`} — ${space.url === '' ? '(no page)' : space.url}` +
-        ` partition=${space.partition} storage=${space.storagePath} cookies=${space.cookieCount}`,
+        ` partition=${space.partition} storage=${space.storagePath} cookies=${space.cookieCount}` +
+        // 没有 target 这件事不许静默省略：这一行就是"这个空间为什么动不了"的答案。
+        (space.targetId === undefined
+          ? ` — no CDP target yet: ${space.targetIdReason ?? 'the shell did not say why'}`
+          : ''),
     )
   }
   return [{ type: 'text', text: lines.join('\n') }]
@@ -186,6 +194,8 @@ interface SpaceCommandValue {
     partition: string
     storagePath: string
     targetId?: string
+    targetIdSource?: string
+    targetIdReason?: string
     url: string
     visible: boolean
     active: boolean
@@ -844,6 +854,8 @@ export function desktopViewTools(
             partition: space.partition,
             storagePath: space.storagePath,
             ...(space.targetId !== undefined ? { targetId: space.targetId } : {}),
+            ...(space.targetIdSource !== undefined ? { targetIdSource: space.targetIdSource } : {}),
+            ...(space.targetIdReason !== undefined ? { targetIdReason: space.targetIdReason } : {}),
             url: space.url,
             visible: space.visible,
             active: space.active,

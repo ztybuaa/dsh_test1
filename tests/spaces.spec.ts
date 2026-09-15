@@ -1,13 +1,26 @@
 import { createServer } from 'node:http'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Page } from 'playwright'
-import { SpaceManager, parseSpaceState, planRequest, spaceChannelFrom, type SpaceState } from '../src/spaces.ts'
+import {
+  SpaceManager,
+  describeSpaceTable,
+  parseSpaceState,
+  planRequest,
+  spaceChannelFrom,
+  type SpaceState,
+} from '../src/spaces.ts'
 import { desktopViewTools } from '../src/tools.ts'
-import { pageForTarget, shellRecord, startShell, type ShellProcess } from './shell-harness.ts'
+import {
+  pageForTarget,
+  removeWhenFree,
+  shellRecord,
+  startShell,
+  type ShellProcess,
+} from './shell-harness.ts'
 
 /**
  * T7 (票 #8) — 任务空间隔离。四条验收各自有一处**独立读回**，而且读回的东西不是实现自己的中间量：
@@ -37,6 +50,10 @@ const shellSpaces = require('../shell/spaces.js') as {
   DEFAULT_SPACE: string
   SPACE_PROTOCOL: number
   isValidSpaceName: (name: unknown) => boolean
+  mergeTargetIds: (
+    previous: string | undefined,
+    listing: { ok: true; targetId?: string; listedPages?: number; webContentsId?: number } | { ok: false; error: string },
+  ) => { targetId?: string; targetIdSource: 'resolved' | 'remembered' | 'unavailable'; targetIdReason?: string }
   parseRequest: (raw: unknown) => { ok: true; request: { id: number; active: string; spaces: string[] } } | { ok: false; error: string }
   partitionDirectoryName: (partition: string) => string
   partitionForSpace: (name: string) => string
@@ -66,6 +83,10 @@ interface RawSpaceRecord {
   storagePath: string
   persistent: boolean
   targetId?: string
+  /** 外壳对这个 targetId 怎么来的说的话（`resolved` / `remembered` / `unavailable`）。 */
+  targetIdSource?: 'resolved' | 'remembered' | 'unavailable'
+  /** 外壳给的原因：读不到目标时它是唯一说得清的那句话。 */
+  targetIdReason?: string
   url: string
   visible: boolean
   webContentsId: number
@@ -211,8 +232,30 @@ async function waitUntil(predicate: () => boolean, what: string, timeoutMs = 30_
  * @returns `action` 的返回值。
  */
 async function withSpacePage<T>(shell: ShellProcess, name: string, action: (page: Page) => Promise<T>): Promise<T> {
-  const record = spaceOf(readState(shell), name)
-  if (record?.targetId === undefined) throw new Error(`the shell published no target id for the space "${name}"`)
+  const state = readState(shell)
+  const record = spaceOf(state, name)
+  if (record?.targetId === undefined) {
+    // 这条消息是**给下一次偶发红用的**：T7 之后它只说了"没有 target id"，于是那一次红
+    // 完全没法判读。现在它把外壳给的**原因**和整张表一起打出来（见 docs/research/…）。
+    throw new Error(
+      `the shell published no target id for the space "${name}"` +
+        (record === undefined
+          ? ` — it does not describe that space at all (it describes: ${state.spaces.map((space) => space.name).join(', ') || 'nothing'})`
+          : ` — targetIdSource=${JSON.stringify(record.targetIdSource)}, targetIdReason=${JSON.stringify(record.targetIdReason)}`) +
+        `\n--- the table the shell published ---\n` +
+        JSON.stringify(
+          state.spaces.map((space) => ({
+            name: space.name,
+            targetId: space.targetId,
+            targetIdSource: space.targetIdSource,
+            url: space.url,
+            visible: space.visible,
+          })),
+          null,
+          2,
+        ),
+    )
+  }
   const opened = await pageForTarget(shell.handshake.cdpUrl, record.targetId)
   try {
     return await action(opened.page)
@@ -387,6 +430,67 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     expect(parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[]}')?.active).toBe('default')
   })
 
+  it('发布的表不许比它知道的更少：解析到的 > 记住的 > 显式说没有（纯逻辑）', () => {
+    const cases = {
+      // 这一次读到了：以这一次为准。
+      resolved: shellSpaces.mergeTargetIds('OLD', { ok: true, targetId: 'NEW', listedPages: 2, webContentsId: 3 }),
+      // 列举本身失败（回环端点那一刻读不回来）：**不许**把已知的抹掉。
+      listingFailed: shellSpaces.mergeTargetIds('OLD', { ok: false, error: 'socket hang up' }),
+      // 列举成功但里面没有这块视图：同样不许把已知的抹掉（视图的 target id 不会变）。
+      notListed: shellSpaces.mergeTargetIds('OLD', { ok: true, listedPages: 2, webContentsId: 3 }),
+      // 从来没读到过：显式说明，而不是少一个字段。
+      neverKnown: shellSpaces.mergeTargetIds(undefined, { ok: false, error: 'socket hang up' }),
+      // 空串不是 id：它和"没有"是同一件事，不许被当成一个可用的目标。
+      emptyIsNotAnId: shellSpaces.mergeTargetIds('', { ok: true, targetId: '', listedPages: 0 }),
+      // 新空间（entry 上还没有 id）+ 这一次读到了：照常解析。
+      fresh: shellSpaces.mergeTargetIds(undefined, { ok: true, targetId: 'FIRST', listedPages: 2 }),
+    }
+    console.log('RAW mergeTargetIds: ' + JSON.stringify(cases))
+    expect(cases.resolved).toEqual({ targetId: 'NEW', targetIdSource: 'resolved' })
+    expect(cases.fresh).toEqual({ targetId: 'FIRST', targetIdSource: 'resolved' })
+    expect(cases.listingFailed.targetId).toBe('OLD')
+    expect(cases.listingFailed.targetIdSource).toBe('remembered')
+    expect(cases.listingFailed.targetIdReason).toContain('socket hang up')
+    expect(cases.notListed.targetId).toBe('OLD')
+    expect(cases.notListed.targetIdSource).toBe('remembered')
+    expect(cases.neverKnown.targetId).toBeUndefined()
+    expect(cases.neverKnown.targetIdSource).toBe('unavailable')
+    expect(cases.neverKnown.targetIdReason).toContain('socket hang up')
+    expect(cases.emptyIsNotAnId.targetIdSource).toBe('unavailable')
+  })
+
+  it('插件侧：外壳说了"这个空间还没有 target"，解析不许把它丢掉', () => {
+    const raw = JSON.stringify({
+      protocol: 1,
+      requestId: 4,
+      error: null,
+      active: 'task-1',
+      userDataDir: 'C:\\p',
+      spaces: [
+        {
+          name: 'task-1',
+          partition: 'persist:dsh-view-space-task-1',
+          storagePath: 'C:\\p\\Partitions\\dsh-view-space-task-1',
+          persistent: true,
+          targetIdSource: 'unavailable',
+          targetIdReason: 'the CDP endpoint could not be listed (boom)',
+          url: '',
+          visible: false,
+          webContentsId: 2,
+          active: true,
+          isDefault: false,
+          cookieCount: 0,
+        },
+      ],
+    })
+    const parsed = parseSpaceState(raw)
+    console.log('RAW parsed unavailable record: ' + JSON.stringify(parsed?.spaces[0]))
+    expect(parsed?.spaces[0]?.targetIdSource).toBe('unavailable')
+    expect(parsed?.spaces[0]?.targetIdReason).toBe('the CDP endpoint could not be listed (boom)')
+    // ……而且列出来的时候也不许静默省略：那一行要说清它为什么动不了。
+    expect(describeSpaceTable(parsed as SpaceState)).toContain('could not be listed')
+  })
+
   it('外壳不在时，工具拿到的是一个说得清的超时错误，而不是模糊的"等不到"', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-noshell-'))
     try {
@@ -435,7 +539,7 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
       })
       await expect(nowhere.command('list')).rejects.toThrow(/no task-space state/)
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeWhenFree(dir)
     }
   })
 })
@@ -464,7 +568,9 @@ describe('T7 — 验收 1：能创建/使用/关闭；关闭后页面真的没�
   afterAll(async () => {
     if (shell !== undefined) await shell.stop()
     if (site !== undefined) await site.close()
-    if (profile !== undefined) rmSync(profile, { recursive: true, force: true })
+    // 不裸 rmSync：刚被停掉的外壳，它的档案句柄可能还没放手，一次 EPERM 就会让
+    // "15 个用例全过、整个文件报红"重演（tests/shell-harness.ts 的 removeWhenFree）。
+    if (profile !== undefined) removeWhenFree(profile)
   })
 
   it('创建：真的多出一块视图，它有自己的 partition、自己的目标，而且能被单独领养', async () => {
@@ -781,4 +887,107 @@ describe('T7 — 验收 2/3/4：继承、同站互不影响、工具只作用于
     expect(published?.active).toBe('iso-b')
     expect(table?.spaces.map((entry) => entry.name).sort()).toEqual(published?.spaces.map((entry) => entry.name).sort())
   })
+})
+
+/**
+ * T7 之后的第二种偶发红是"外壳发布的表里目标不见了"。这一组**确定性地**把那件事造出来。
+ *
+ * `--fault-cdp-list` 是外壳上的一条**测试缝**：它让处理空间请求期间的前 n 次 `GET /json/list`
+ * 失败，也就是回环端点那一刻读不回来的样子。为什么要注入：这条路径原来写着
+ * `cdp.listTargets(...).catch(() => [])` —— 一次瞬时失败被变成了"这张表里的目标全没了"，
+ * 于是外壳发布一张缺 `targetId` 的表：读它的人会炸（`withSpacePage` 抛"没有 target id"），
+ * 插件侧则去领养一个没有目标的会话。成因、探针与原始输出见
+ * `docs/research/space-table-target-id-gap.md`。
+ *
+ * 两条用例各钉住修复的一半，而且都先断言**故障真的发生过**（外壳每注入一次就打一行
+ * `DSH_SHELL CDP_LIST_FAULT`）——否则"绿"可能只是这条用例什么也没验到：
+ *
+ *  1. 故障只发生一次 → 外壳**等到**目标可解析才发布：新空间拿到的是真的、能被领养的 id；
+ *  2. 故障一直发生 → 已经知道的 id **不许被抹掉**（`targetIdSource: 'remembered'`，而且那个 id
+ *     仍然真的指向那块视图）；确实没有的那个**显式写明**（`unavailable` + 原因），插件据此
+ *     点名那个空间说"还没准备好"，而不是去领养一个没有目标的会话。
+ *
+ * 反证：把修复回退掉（`describeSpaces` 直接发布 `targetIdForWebContents` 的结果、去掉
+ * `awaitCreatedTargets`），这两条都变红 —— 原始输出在同一份文档里。
+ */
+describe('T7 — 端点那一刻读不回来：发布的表不许比它知道的更少（故障注入，确定性）', () => {
+  let shell: ShellProcess | undefined
+  let manager: SpaceManager | undefined
+
+  afterAll(async () => {
+    if (shell !== undefined) await shell.stop()
+  })
+
+  it('故障只发生一次：外壳等到目标可解析才发布，新空间拿到的是真的、能被领养的 id', async () => {
+    shell = await startShell(['--fault-cdp-list', '1'])
+    manager = new SpaceManager({
+      dir: shell.handshake.spaceChannel.dir,
+      timeoutMs: 30_000,
+      maxElements: 200,
+      maxChars: 20_000,
+    })
+    const created = await manager.command('create', 'flaky-once')
+    const record = spaceOf(readState(shell), 'flaky-once')
+    console.log('RAW record after the injected fault: ' + JSON.stringify({ record, wait: shellRecord(shell.stdout(), 'SPACE_TARGET_WAIT') }))
+    // 故障**真的发生了**：否则这条用例什么也没验到。
+    expect(shellRecord<{ injected: boolean }>(shell.stdout(), 'CDP_LIST_FAULT')?.injected).toBe(true)
+    // 新空间的那次列举是"等它可解析再发布"救回来的，而不是运气。
+    expect(shellRecord<{ resolved: string[] }>(shell.stdout(), 'SPACE_TARGET_WAIT')?.resolved).toContain('flaky-once')
+    // 发布出去的是**真的** id：端点上有这个目标，而且真能按它领养到那块视图。
+    expect(record?.targetIdSource).toBe('resolved')
+    expect(record?.targetId).toBeDefined()
+    const targets = await pageTargets(shell.handshake.cdpUrl)
+    expect(targets.some((target) => target.id === record?.targetId)).toBe(true)
+    expect(await withSpacePage(shell, 'flaky-once', (page) => page.title())).toBe('view-page')
+    // 插件读到的也是同一个 id（解析没有把它丢掉）。
+    expect(created.space?.targetId).toBe(record?.targetId)
+  }, 120_000)
+
+  it('故障一直发生：已知的 id 不许被抹掉，确实没有的要显式说明，插件点名那个空间报错', async () => {
+    shell = await startShell(['--fault-cdp-list', '1000'])
+    manager = new SpaceManager({
+      dir: shell.handshake.spaceChannel.dir,
+      timeoutMs: 30_000,
+      maxElements: 200,
+      maxChars: 20_000,
+    })
+    // 开局那张表是**真的**：故障只在处理空间请求期间生效（否则外壳压根起不来）。
+    const atStartup = shell.handshake.spaces.find((space) => space.name === 'default')
+    console.log('RAW the default space at startup: ' + JSON.stringify(atStartup))
+    expect(atStartup?.targetId).toBeDefined()
+    expect(atStartup?.targetIdSource).toBe('resolved')
+
+    await manager.command('create', 'flaky-always')
+
+    const state = readState(shell)
+    const fallback = spaceOf(state, 'default')
+    const fresh = spaceOf(state, 'flaky-always')
+    console.log(
+      'RAW the table published while the endpoint could not be listed: ' +
+        JSON.stringify({ default: fallback, 'flaky-always': fresh, faults: shell.stdout().split('\n').filter((line) => line.includes('CDP_LIST_FAULT')).length }),
+    )
+    // 1) 它**知道的**没被抹掉：默认空间还是开局那个 id……
+    expect(fallback?.targetId).toBe(atStartup?.targetId)
+    expect(fallback?.targetIdSource).toBe('remembered')
+    expect(fallback?.targetIdReason).toContain('could not be listed')
+    // ……而且那个 id 现在**真的**还指向那块视图（记住不等于编一个出来）。
+    const opened = await pageForTarget(shell.handshake.cdpUrl, fallback?.targetId ?? '')
+    try {
+      expect(await opened.page.title()).toBe('view-page')
+    } finally {
+      await opened.browser.close()
+    }
+    // 2) 确实没有的那个**显式写明**，不是静默省略字段。
+    expect(fresh?.targetId).toBeUndefined()
+    expect(fresh?.targetIdSource).toBe('unavailable')
+    expect(fresh?.targetIdReason).toContain('could not be listed')
+    // 3) 插件侧不再"去领养一个没有目标的会话"：报错点名那个空间，并带上外壳给的原因。
+    const refusal = await manager.adopt(shell.handshake.cdpUrl).then(
+      () => 'resolved',
+      (error: Error) => error.message,
+    )
+    console.log('RAW the plugin refused to adopt: ' + JSON.stringify(refusal))
+    expect(refusal).toContain('flaky-always')
+    expect(refusal).toContain('could not be listed')
+  }, 120_000)
 })

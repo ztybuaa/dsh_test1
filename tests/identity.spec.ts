@@ -1,11 +1,18 @@
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Page } from 'playwright'
-import { pageForTarget, shellRecord, startShell, type ProxyRecord, type ShellProcess } from './shell-harness.ts'
+import {
+  pageForTarget,
+  removeWhenFree,
+  shellRecord,
+  startShell,
+  type ProxyRecord,
+  type ShellProcess,
+} from './shell-harness.ts'
 
 /**
  * T6 — 那一格的浏览器身份与登录态。
@@ -264,7 +271,8 @@ describe('T6 — 关掉外壳再打开，登录态还在（同一个档案目录
 
   afterAll(async () => {
     if (site !== undefined) await site.close()
-    if (profile !== undefined) rmSync(profile, { recursive: true, force: true })
+    // 一次 EPERM 就够让整个 spec 文件在**所有用例都过**的情况下报红，见 removeWhenFree 的注释。
+    if (profile !== undefined) removeWhenFree(profile)
   })
 
   it('持久 cookie 与 localStorage 活过重启，会话 cookie 与 sessionStorage 不活', async () => {

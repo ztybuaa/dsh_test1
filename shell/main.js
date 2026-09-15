@@ -41,6 +41,19 @@ const ENV_SPACES = 'DSH_DESKTOP_VIEW_SPACES'
 /** How often the shell looks for a new space request. */
 const SPACE_POLL_MS = 150
 
+/**
+ * 新建空间之后，最多等多久它的视图在端点上**可解析**（发布那张表之前）。
+ *
+ * "刚建好、还没登记成 CDP 目标"是构造上的一个窗口。实测它通常极小（一个刚 `addChildView`
+ * 的 `WebContentsView` 立刻就在 `/json/list` 里，见 docs/research/space-table-target-id-gap.md），
+ * 但"通常极小"不是"不存在"，而这个等待把那个窗口关掉。它**有界**：等不到就照常发布，
+ * 由记录里的 `targetIdSource: 'unavailable'` 把话说清楚，绝不让发布悄悄变成"少了一个字段"。
+ */
+const SPACE_TARGET_WAIT_MS = 5000
+
+/** 上面那个等待的轮询间隔。 */
+const SPACE_TARGET_POLL_MS = 100
+
 /** How many times a pending-deletion directory removal is retried before it is reported. */
 const SPACE_REMOVE_ATTEMPTS = 5
 
@@ -111,6 +124,15 @@ const state = {
   lastSpaceRequest: undefined,
   /** True while a request is being handled, so the poll never starts a second one. */
   spaceBusy: false,
+  /**
+   * `--fault-cdp-list` 还剩几次注入。这是一条**测试缝**（默认 0 = 永不注入）：它让处理空间请求
+   * 期间的前 n 次 `GET /json/list` 失败，用来确定性地复现"回环端点那一刻读不回来" ——
+   * 也就是 T7 之后那第二种偶发红的成因（见 docs/research/space-table-target-id-gap.md）。
+   * 它只在 {@link state.spaceRequestRunning} 为真时生效，启动那一次列举永远是真的。
+   */
+  faultCdpList: 0,
+  /** 现在是不是正在处理一条空间请求（也就是测试缝的作用范围）。 */
+  spaceRequestRunning: false,
   /** The request-polling timer. */
   spaceTimer: undefined,
   cdpPort: 0,
@@ -485,7 +507,10 @@ function createSpace(name) {
   // Hidden until it is the active space: adding it as a child view made it a painting surface in
   // the same rectangle as the current one, and two visible views in one rectangle is a race.
   view.setVisible(false)
-  const entry = { name, partition, session: viewSession, view, inherited: undefined }
+  // 记住这块视图的 target id：它是"发布出去的表永远不会比它知道的更少"里那个"知道的"。
+  // 一块活着的视图，它的 target id 不会变；所以一次读不回来的列举只能让表**暂时**变成
+  // `targetIdSource: 'remembered'`，不能让它变成"没有"。
+  const entry = { name, partition, session: viewSession, view, inherited: undefined, targetId: undefined }
   state.spaces.set(name, entry)
   return entry
 }
@@ -608,6 +633,75 @@ async function closeSpace(name) {
   if (state.activeSpace === name) state.activeSpace = spaces.DEFAULT_SPACE
 }
 
+/** @param {number} ms - 毫秒。 @returns {Promise<void>} 到点就 resolve。 */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * 读一次 CDP 端点上的目标表 —— **不抛**，把"读没读回来"本身当成结果的一部分。
+ *
+ * 这是发布空间表时唯一一个会**瞬时失败**的输入：`/json/list` 是一个回环 HTTP 请求（5s 超时）。
+ * 原来那一行 `.catch(() => [])` 把一次瞬时失败变成了"这张表里的目标全没了"，于是外壳会发布一张
+ * `targetId` 缺失的表 —— 读它的人会炸，而插件会去领养一个没有目标的会话。确定性复现与原始输出见
+ * `docs/research/space-table-target-id-gap.md`。
+ *
+ * 这里也是 `--fault-cdp-list` 那条测试缝的落点：它只在外壳处理空间请求期间生效，而且**每次注入
+ * 都会打印一行**，所以一次注入不可能悄悄发生。
+ *
+ * @returns {Promise<{ok: true, targets: Array<object>} | {ok: false, error: string}>} 列举结果。
+ */
+async function listTargetsForPublish() {
+  if (state.spaceRequestRunning && state.faultCdpList > 0) {
+    state.faultCdpList -= 1
+    emit(`DSH_SHELL CDP_LIST_FAULT ${JSON.stringify({ injected: true, remaining: state.faultCdpList })}`)
+    return { ok: false, error: 'injected fault (--fault-cdp-list): this GET /json/list was made to fail' }
+  }
+  try {
+    return { ok: true, targets: await cdp.listTargets(state.cdpPort) }
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) }
+  }
+}
+
+/**
+ * 新建的视图：在发布之前**有界地**等它的目标可解析。
+ *
+ * 它回答的是"这块视图现在有没有一个 CDP 目标"，等待期间把答案记进 `entry.targetId` ——
+ * 发布那张表用的正是这个记住的值（见 {@link describeSpaces}）。等不到不是错误：发布照常发生，
+ * 记录里会写明 `targetIdSource: 'unavailable'` 与原因。
+ *
+ * @param {string[]} names - 刚创建的空间名。
+ * @returns {Promise<{waitedMs: number, resolved: string[], unresolved: string[]}>} 诊断用的事实。
+ */
+async function awaitCreatedTargets(names) {
+  const pending = new Set(names.filter((name) => state.spaces.has(name)))
+  const started = Date.now()
+  const resolved = []
+  while (pending.size > 0 && Date.now() - started < SPACE_TARGET_WAIT_MS) {
+    const listing = await listTargetsForPublish()
+    if (listing.ok) {
+      const pageTargets = listing.targets.filter((target) => target.type === 'page')
+      for (const name of [...pending]) {
+        const entry = state.spaces.get(name)
+        const contents = entry?.view.webContents
+        if (contents === undefined || contents.isDestroyed()) continue
+        const found = cdp.targetIdForWebContents({ webContents, targets: pageTargets, webContentsId: contents.id })
+        if (found !== undefined) {
+          entry.targetId = found
+          pending.delete(name)
+          resolved.push(name)
+        }
+      }
+    }
+    if (pending.size === 0) break
+    await delay(SPACE_TARGET_POLL_MS)
+  }
+  const report = { waitedMs: Date.now() - started, resolved, unresolved: [...pending] }
+  emit(`DSH_SHELL SPACE_TARGET_WAIT ${JSON.stringify(report)}`)
+  return report
+}
+
 /**
  * Describe every space as it really is, every value read back from Electron.
  *
@@ -616,11 +710,18 @@ async function closeSpace(name) {
  * compare that with the directory the requested partition implies. `partition` is therefore the
  * *request*; `storagePath` and `persistent` are the read-back that can contradict it.
  *
+ * `targetId` 是这份表里唯一**可能暂时读不回来**的值，而它恰恰是插件领养会话的唯一把手，所以它有
+ * 两条规矩（合并规则本身是纯逻辑：{@link spaces.mergeTargetIds}）：
+ *   1. 一次**读不回来的列举**不许把已经知道的 id 抹掉 —— 一块活着的视图，它的 target id 不会变，
+ *      所以"这次没读到"不等于"没有"；
+ *   2. 真的从没拿到过就**显式写明**（`targetIdSource: 'unavailable'` + `targetIdReason`），
+ *      绝不静默省略：读表的人要能看见"这个空间还没准备好"，而不是去领养一个没有目标的会话。
+ *
  * @returns {Promise<Array<object>>} one record per space, default first, then by name.
  */
 async function describeSpaces() {
-  const targets = await cdp.listTargets(state.cdpPort).catch(() => [])
-  const pageTargets = targets.filter((target) => target.type === 'page')
+  const listing = await listTargetsForPublish()
+  const pageTargets = listing.ok ? listing.targets.filter((target) => target.type === 'page') : []
   const names = [...state.spaces.keys()].sort((left, right) =>
     left === spaces.DEFAULT_SPACE ? -1 : right === spaces.DEFAULT_SPACE ? 1 : left.localeCompare(right),
   )
@@ -633,15 +734,29 @@ async function describeSpaces() {
     // silently come out undefined.
     const contents = entry.view.webContents
     if (contents.isDestroyed()) {
-      records.push({ name, partition: entry.partition, destroyed: true })
+      records.push({
+        name,
+        partition: entry.partition,
+        destroyed: true,
+        targetIdSource: 'unavailable',
+        targetIdReason: "this space's view has been destroyed, so it has no target any more",
+      })
       continue
     }
+    // 这一次的答案，与这块视图**已知**的 id 合并：解析到的优先，其次沿用已知的，真没有就显式说没有。
+    const identity = spaces.mergeTargetIds(
+      entry.targetId,
+      listing.ok
+        ? { ok: true, targetId: cdp.targetIdForWebContents({ webContents, targets: pageTargets, webContentsId: contents.id }), listedPages: pageTargets.length, webContentsId: contents.id }
+        : { ok: false, error: listing.error },
+    )
+    if (identity.targetIdSource === 'resolved') entry.targetId = identity.targetId
     records.push({
       name,
       partition: entry.partition,
       storagePath: entry.session.getStoragePath(),
       persistent: entry.session.isPersistent(),
-      targetId: cdp.targetIdForWebContents({ webContents, targets: pageTargets, webContentsId: contents.id }),
+      ...identity,
       url: contents.getURL(),
       visible: entry.view.getVisible(),
       webContentsId: contents.id,
@@ -698,27 +813,36 @@ async function applySpaceRequest(raw) {
   state.spaceError = null
   const plan = { create: [], close: [], activate: state.activeSpace }
   const parsed = spaces.parseRequest(raw)
-  if (!parsed.ok) {
-    state.spaceError = parsed.error
-  } else {
-    try {
-      const diff = spaces.reconcile({ current: [...state.spaces.keys()], request: parsed.request })
-      plan.create = diff.create
-      plan.close = diff.close
-      plan.activate = diff.activate
-      for (const name of diff.create) {
-        const entry = createSpace(name)
-        entry.inherited = await inheritLogin(state.spaces.get(spaces.DEFAULT_SPACE), entry)
+  // 测试缝的作用范围：只覆盖"处理一条空间请求"（含它最后一次发布），启动那次列举永远是读真的。
+  state.spaceRequestRunning = true
+  try {
+    if (!parsed.ok) {
+      state.spaceError = parsed.error
+    } else {
+      try {
+        const diff = spaces.reconcile({ current: [...state.spaces.keys()], request: parsed.request })
+        plan.create = diff.create
+        plan.close = diff.close
+        plan.activate = diff.activate
+        for (const name of diff.create) {
+          const entry = createSpace(name)
+          entry.inherited = await inheritLogin(state.spaces.get(spaces.DEFAULT_SPACE), entry)
+        }
+        // 刚创建的视图：先**有界地**等它的目标可解析，再往下走。这样"刚建好、还没登记成目标"
+        // 那个窗口在发布之前就被关掉了（等不到也不报错：记录里会显式写明它还没有目标）。
+        if (diff.create.length > 0) await awaitCreatedTargets(diff.create)
+        for (const name of diff.close) await closeSpace(name)
+        activateSpace(diff.activate)
+      } catch (error) {
+        state.spaceError = error?.message ?? String(error)
       }
-      for (const name of diff.close) await closeSpace(name)
-      activateSpace(diff.activate)
-    } catch (error) {
-      state.spaceError = error?.message ?? String(error)
     }
+    state.spaceRequestId = raw.id
+    state.lastSpaceRequest = { id: raw.id, ...plan, error: state.spaceError }
+    await publishSpaces('request')
+  } finally {
+    state.spaceRequestRunning = false
   }
-  state.spaceRequestId = raw.id
-  state.lastSpaceRequest = { id: raw.id, ...plan, error: state.spaceError }
-  await publishSpaces('request')
 }
 
 /**
@@ -770,6 +894,8 @@ async function publishProxyReadings(target) {
  */
 async function main() {
   state.placementFile = options.placementFile
+  // 测试缝：默认 0，也就是一个都不注入。
+  state.faultCdpList = options.faultCdpList
   state.fixture = await startFixtureServer()
   const fixture = state.fixture
 

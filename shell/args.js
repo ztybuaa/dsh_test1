@@ -61,6 +61,7 @@ function parseArgv(argv) {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     rectChannel: true,
     placementFile: undefined,
+    faultCdpList: 0,
     help: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
@@ -113,6 +114,14 @@ function parseArgv(argv) {
       case '--placement-file':
         options.placementFile = value()
         break
+      case '--fault-cdp-list':
+        // 测试缝（见 usage 与 docs/research/space-table-target-id-gap.md）：让处理空间请求期间的
+        // 前 n 次 `GET /json/list` 失败，用来确定性复现"回环端点那一刻读不回来"。
+        options.faultCdpList = Number(value())
+        if (!Number.isInteger(options.faultCdpList) || options.faultCdpList < 0) {
+          throw new Error(`--fault-cdp-list expects a non-negative integer, got: ${argv[index]}`)
+        }
+        break
       case '--no-rect-channel':
         options.rectChannel = false
         break
@@ -156,6 +165,11 @@ function usage() {
     '                           127.0.0.1 / localhost / [::1] out of any proxy it is given',
     '  --timeout-ms <n>         Startup timeout (default: 30000)',
     '  --placement-file <file>  Mirror the latest view placement into this JSON file',
+    '  --fault-cdp-list <n>     TEST SEAM: make the next n `GET /json/list` calls fail *while a space',
+    '                           request is being handled*, so the suite can reproduce the moment the',
+    '                           loopback endpoint cannot be listed (default: 0 = never). Every injected',
+    '                           failure prints DSH_SHELL CDP_LIST_FAULT, so it can never be silent.',
+    '                           The startup listing is never faulted: the shell could not start at all.',
     '  --no-rect-channel        Do not inject the panel rectangle channel into the window',
     '  --no-show                Create the window hidden',
     '  -h, --help               Print this text',
@@ -183,6 +197,9 @@ function usage() {
     'state file the plugin reads:',
     '  DSH_SHELL SPACES {"protocol":1,"requestId":1,"error":null,"active":"default",',
     '                    "spaces":[{"name":"default","storagePath":"...","targetId":"...", ...}]}',
+    "                           `targetId` carries `targetIdSource` (resolved | remembered |",
+    '                           unavailable) and, when it is not resolved, a `targetIdReason`: a',
+    "                           listing that could not be read never erases an id the shell knows.",
     '                           `requestId` is how far this shell has processed the plugin\'s',
     '                           requests, which is what makes a tool call deterministic.',
     '',

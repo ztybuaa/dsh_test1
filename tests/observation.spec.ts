@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { inflateSync } from 'node:zlib'
@@ -15,7 +15,7 @@ import {
   type PageSnapshot,
 } from '../src/session.ts'
 import { desktopViewTools, type ToolDependencies } from '../src/tools.ts'
-import { pageForTarget, startShell, type ShellProcess } from './shell-harness.ts'
+import { pageForTarget, removeWhenFree, startShell, type ShellProcess } from './shell-harness.ts'
 
 /**
  * T5 seam test: "the agent can read the page, and can find out why it is empty".
@@ -236,7 +236,8 @@ describe('T5 — the agent reads the page, and finds out why it is empty', () =>
     if (probe !== undefined) await probe.browser.close().catch(() => undefined)
     if (session !== undefined) await session.close().catch(() => undefined)
     if (shell !== undefined) await shell.stop()
-    if (screenshotDir !== undefined) rmSync(screenshotDir, { recursive: true, force: true })
+    // 清理绝不决定结果：一次 EPERM 会让"用例全过"的 spec 文件报红，见 removeWhenFree 的注释。
+    if (screenshotDir !== undefined) removeWhenFree(screenshotDir)
   })
 
   /** Navigate the view to the observation page, which reloads its own side effects. */

@@ -180,6 +180,13 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 所以从工具视角它是同步的,外壳不在时是一个说得清的超时错误。原始测量(含 `newContext` 的逐条 CDP
 回答、cookie/localStorage 的能力边界、EPERM 的逐项清单)在 `docs/research/task-space-isolation.md`。
 
+表里的 `targetId` 是**三态**的,因为它是唯一可能暂时读不回来的值,而它又是插件领养会话的唯一把手:
+`targetIdSource` 取 `resolved`(这一次读回来的)/ `remembered`(这次读不回来,沿用这块视图已知的 ——
+活着的视图 target id 不会变)/ `unavailable`(确实没有,原因逐字在 `targetIdReason` 里)。
+**发布的表永远不比它知道的更少**:一次读不回来的列举不许把已知的 id 抹掉,真的没有就显式写明,
+插件据此报一个点名那个空间的错误,而不是去领养一个没有目标的会话(成因与原始输出见
+`docs/research/space-table-target-id-gap.md`)。
+
 ### 让 Agent 操作那一格(T4 交互面)
 
 `browser_snapshot` 给出带 `ref` 的可交互元素;下面这些工具**只按 `ref` 定位元素**,不让模型手写选择器:
