@@ -19,12 +19,13 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawn, spawnSync } = require('node:child_process')
-const { app, BrowserWindow, WebContentsView, ipcMain, webContents } = require('electron')
+const { app, BrowserWindow, WebContentsView, ipcMain, session, webContents } = require('electron')
 
 const { parseArgv, usage } = require('./args.js')
 const { startFixtureServer } = require('./fixture.js')
 const cdp = require('./cdp.js')
 const geometry = require('./geometry.js')
+const identity = require('./identity.js')
 
 /** stdout prefix carrying the view identity to whoever launched the shell. */
 const HANDSHAKE_PREFIX = 'DSH_DESKTOP_VIEW_HANDSHAKE '
@@ -69,6 +70,10 @@ try {
 // <userDataDir>/DevToolsActivePort, which is how this process learns it.
 app.commandLine.appendSwitch('remote-debugging-port', String(options.cdpPort))
 app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
+// 上面那个调试端口是整条领养路径的地基（ADR-0002），但它单独就会让每个页面里的
+// `navigator.webdriver` 变成 true，而那是登录站点最先看的一眼自动化信号。这里把它关回去。
+// Blink 特性标志是进程级的，Electron 没有 per-webContents 的等价开关：取舍与备选见 ADR-0009。
+app.commandLine.appendSwitch('disable-blink-features', identity.AUTOMATION_BLINK_FEATURE)
 
 /** Live resources, all released by {@link shutdown}. */
 const state = {
@@ -94,6 +99,8 @@ const state = {
   placement: undefined,
   /** Latest placement as a value other modules can read (the test seam). */
   placementFile: undefined,
+  /** What the view's session resolved for those probe URLs, as published. */
+  proxy: undefined,
   /** Pending "re-place after navigation" timer. */
   settleTimer: undefined,
 }
@@ -310,6 +317,25 @@ function shutdown() {
 }
 
 /**
+ * Publish what the view's session resolves for a foreign site and for loopback.
+ *
+ * 票面第 3 条验收的读回：这里发布的不是"我们打算怎么走代理"，而是 Electron 对那几个地址的回答。
+ * 外网那一条取到的就是系统设置的结果（默认模式是 system）；三条回环预期一律 `DIRECT`。
+ *
+ * @param {object} target - 视图所在的 session。
+ * @returns {Promise<object>} 发布出去的记录。
+ */
+async function publishProxyReadings(target) {
+  const readings = {}
+  for (const [label, url] of Object.entries(identity.PROXY_PROBE_URLS)) {
+    readings[label] = { url, result: await target.resolveProxy(url) }
+  }
+  const record = { partition: identity.VIEW_PARTITION, readings }
+  emit(`DSH_SHELL PROXY ${JSON.stringify(record)}`)
+  return record
+}
+
+/**
  * Build the window, the view, and the handshake.
  * @returns {Promise<void>} resolves once the view identity has been published.
  */
@@ -366,7 +392,25 @@ async function main() {
   })
   await state.window.loadURL(windowUrl)
 
-  state.view = new WebContentsView()
+  // 这一格有自己的持久档案（ADR-0009）：登录态属于它自己、跨外壳重启保留，
+  // 与外壳界面那一路（`session.defaultSession`，档案就是 userDataDir 本身）不是同一个罐子。
+  const viewSession = session.fromPartition(identity.VIEW_PARTITION)
+  // 代理：默认**什么都不设**。Chromium 的默认模式就是 system，所以外网站点自动继承系统代理；
+  // 而它对回环地址本来就有隐含 bypass，`127.0.0.1` / `localhost` / `[::1]` 都不会被推进代理
+  // （两条都实测过，见 docs/research/browser-identity-and-profile.md 第 6 节）。只有调用方
+  // 显式给了 `--proxy` 才覆盖它。这里刻意**不设** `proxyBypassRules`：写 `<-loopback>` 会把
+  // 隐含 bypass 反过来，连回环也一起走代理。
+  if (options.proxy !== undefined) {
+    await viewSession.setProxy({ proxyRules: options.proxy })
+  }
+
+  state.view = new WebContentsView({ webPreferences: { partition: identity.VIEW_PARTITION } })
+  // 身份：只把 Electron 追加的产品标记从 UA 里去掉，且只动这一格的 webContents——
+  // 不动 `app.userAgentFallback`，那是全应用的，外壳界面的 UA 会跟着一起变。
+  state.view.webContents.setUserAgent(
+    identity.browserUserAgent(app.userAgentFallback, app.getName(), app.getVersion()),
+  )
+  state.proxy = await publishProxyReadings(viewSession)
   // Placement only: real-time sidebar tracking belongs to a later ticket.
   state.window.contentView.addChildView(state.view)
   state.view.setBounds(options.bounds)
@@ -407,6 +451,16 @@ async function main() {
     pageTargetCount: pageTargets.length,
     userDataDir,
     fixtureOrigin: fixture.origin,
+    // 这一格的浏览器身份：档案落在哪、真正会发出去的 UA、自动化开关在不在——每个值都是
+    // **从 Electron 读回**的实际值，而不是我们的意图。把"身份"交给插件是视图契约的一半，
+    // 票面第 1/2/4 条验收也都要能从这里独立读回。
+    browserIdentity: {
+      partition: identity.VIEW_PARTITION,
+      storagePath: state.view.webContents.session.getStoragePath(),
+      userAgent: state.view.webContents.getUserAgent(),
+      enableAutomationSwitch: app.commandLine.hasSwitch('enable-automation'),
+      disableBlinkFeatures: app.commandLine.getSwitchValue('disable-blink-features'),
+    },
   }
   // stdout is the seam for a caller that launched the shell itself; the env vars
   // on the child process are the seam for a child the shell launches.

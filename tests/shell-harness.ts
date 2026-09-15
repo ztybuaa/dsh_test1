@@ -67,6 +67,23 @@ export interface ViewHandshake {
   userDataDir: string
   /** Origin of the built-in fixture site. */
   fixtureOrigin: string
+  /**
+   * The view's own browser identity, read back from Electron rather than restated from
+   * the shell's intentions: where its storage really is, what it really sends, and
+   * whether the automation switch is really on.
+   */
+  browserIdentity: {
+    /** Partition the view runs in. A `persist:` partition is written to disk. */
+    partition: string
+    /** Directory that partition's storage lives in, as `session.getStoragePath()` answers. */
+    storagePath: string
+    /** The user agent the view really sends, as `webContents.getUserAgent()` answers. */
+    userAgent: string
+    /** Whether Chromium's automation switch is on; `navigator.webdriver` follows it. */
+    enableAutomationSwitch: boolean
+    /** Blink features this shell disables, as Electron's own command line reports them. */
+    disableBlinkFeatures: string
+  }
 }
 
 /** One view placement the shell applied, as published on stdout. */
@@ -152,8 +169,11 @@ export interface ShellProcess {
   ) => Promise<ViewPlacement>
   /** The latest placement published so far, or undefined when none has been. */
   latestPlacement: () => ViewPlacement | undefined
-  /** Terminate the shell and its descendants, and drop the temporary profile. */
-  stop: () => Promise<void>
+  /**
+   * Terminate the shell, optionally the way a user would.
+   * @param options - `{graceful: true}` closes the window and waits instead of killing.
+   */
+  stop: (options?: StopOptions) => Promise<void>
 }
 
 /** Default time to wait for the shell to publish its handshake. */
@@ -206,6 +226,29 @@ export interface StartShellOptions {
   timeoutMs?: number
   /** Window size, e.g. `{width: 900, height: 600}`. Defaults to the shell's own. */
   windowSize?: { width: number; height: number }
+  /**
+   * Profile directory to use instead of the per-run temporary one.
+   *
+   * The caller owns it: it is **not** removed by {@link ShellProcess.stop}. That is what
+   * makes "the login survives a restart" observable at all — the second run has to be
+   * handed the same profile as the first, and the profile has to outlive the first shell.
+   */
+  userDataDir?: string
+}
+
+/** Options accepted by {@link ShellProcess.stop}. */
+export interface StopOptions {
+  /**
+   * Close the shell's own window through CDP and wait for the process to exit, instead of
+   * killing the process tree.
+   *
+   * This is the path a user actually takes (close the window ⇒ `window-all-closed` ⇒
+   * `app.quit()`), and it is the only path on which Chromium flushes cookies and
+   * localStorage into the profile: measured, a force-kill issued right after a write lost
+   * both, so a "does it persist" test that force-kills would be measuring flush timing
+   * rather than persistence. Falls back to the force path if the window does not close.
+   */
+  graceful?: boolean
 }
 
 /**
@@ -224,8 +267,10 @@ export async function startShell(
       ? []
       : // `--window-size` reuses the rectangle parser; only width and height are read.
         ['--window-size', `0,0,${options.windowSize.width},${options.windowSize.height}`]
-  // A per-run profile keeps concurrent runs (and the developer's own profile) untouched.
-  const userDataDir = mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-test-'))
+  // A per-run profile keeps concurrent runs (and the developer's own profile) untouched —
+  // unless the caller needs the same profile twice, in which case it owns the directory.
+  const ownedProfile = options.userDataDir === undefined
+  const userDataDir = options.userDataDir ?? mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-test-'))
   const child = spawn(
     electronExecutable(),
     [SHELL_MAIN, '--user-data-dir', userDataDir, ...sizeArgs, ...args],
@@ -275,7 +320,43 @@ export async function startShell(
 
   const alive = (): boolean => child.exitCode === null && child.signalCode === null
 
-  const stop = async (): Promise<void> => {
+  /**
+   * Close the shell's own window through CDP, the way a user closes it.
+   * @returns whether the window was reached and asked to close.
+   */
+  const closeWindow = async (): Promise<boolean> => {
+    if (handshake.windowTargetId === undefined) return false
+    try {
+      const opened = await pageForTarget(handshake.cdpUrl, handshake.windowTargetId)
+      try {
+        await opened.page.evaluate(() => window.close())
+      } finally {
+        await opened.browser.close()
+      }
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const stop = async (options: StopOptions = {}): Promise<void> => {
+    if (alive() && options.graceful === true) {
+      await closeWindow()
+      const exited = await new Promise<boolean>((settle) => {
+        if (!alive()) {
+          settle(true)
+          return
+        }
+        const timer = setTimeout(() => settle(false), 15_000)
+        child.once('exit', () => {
+          clearTimeout(timer)
+          settle(true)
+        })
+      })
+      // A window that refused to close is not a result: the profile still has to be
+      // released, so the force path below finishes the job.
+      if (!exited) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+    }
     if (alive()) {
       if (process.platform === 'win32' && child.pid !== undefined) {
         // `shell/main.js` may itself own children; kill the whole tree.
@@ -298,7 +379,7 @@ export async function startShell(
         })
       })
     }
-    removeWhenFree(userDataDir)
+    if (ownedProfile) removeWhenFree(userDataDir)
   }
 
   const waitFor = async (
@@ -347,6 +428,53 @@ export async function startShell(
     waitForPlacement,
     latestPlacement,
     stop,
+  }
+}
+
+/**
+ * The last record the shell published under one of its `DSH_SHELL <NAME> {...}` prefixes.
+ *
+ * The shell states its own half of a fact on stdout (placements, the proxy its view session
+ * resolves, …); reading it back here is how a test sees what the shell really resolved rather
+ * than what the test expected it to resolve.
+ *
+ * @param stdout - the shell's accumulated stdout.
+ * @param name - the record name, e.g. `PROXY`.
+ * @returns the parsed record, or undefined when the shell has not published one.
+ */
+export function shellRecord<T>(stdout: string, name: string): T | undefined {
+  const prefix = `DSH_SHELL ${name} `
+  let latest: T | undefined
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith(prefix)) continue
+    try {
+      latest = JSON.parse(trimmed.slice(prefix.length)) as T
+    } catch {
+      /* ignore a partially flushed line */
+    }
+  }
+  return latest
+}
+
+/** One proxy reading the shell published for the view's session. */
+export interface ProxyReading {
+  /** The URL the reading was taken on. */
+  url: string
+  /** Electron's answer: `DIRECT`, or `PROXY host:port`. */
+  result: string
+}
+
+/** What the shell published about the view session's proxy resolution. */
+export interface ProxyRecord {
+  /** Partition the readings came from. */
+  partition: string
+  /** One reading per probe URL. */
+  readings: {
+    external: ProxyReading
+    loopback127: ProxyReading
+    loopbackLocalhost: ProxyReading
+    loopbackV6: ProxyReading
   }
 }
 

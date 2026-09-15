@@ -66,8 +66,14 @@ npx electron shell/main.js --dsh
 启动成功后,外壳在 stdout 上打印一行握手:
 
 ```
-DSH_DESKTOP_VIEW_HANDSHAKE {"cdpUrl":"http://127.0.0.1:63668","targetId":"FB9F…","identification":"webContents.fromDevToolsTargetId","targetType":"page","targetUrl":"…/view","viewUrl":"…/view","viewWebContentsId":2,"windowWebContentsId":1,"windowTargetId":"70C5…","pageTargetCount":2,"userDataDir":"…","fixtureOrigin":"http://127.0.0.1:63669"}
+DSH_DESKTOP_VIEW_HANDSHAKE {"cdpUrl":"http://127.0.0.1:63668","targetId":"FB9F…","identification":"webContents.fromDevToolsTargetId","targetType":"page","targetUrl":"…/view","viewUrl":"…/view","viewWebContentsId":2,"windowWebContentsId":1,"windowTargetId":"70C5…","pageTargetCount":2,"userDataDir":"…","fixtureOrigin":"http://127.0.0.1:63669",
+   "browserIdentity":{"partition":"persist:dsh-view","storagePath":"…\\Partitions\\dsh-view",
+                      "userAgent":"… Chrome/152.0.7977.78 Safari/537.36",
+                      "enableAutomationSwitch":false,"disableBlinkFeatures":"AutomationControlled"}}
 ```
+
+`browserIdentity` 里的每个值都是**从 Electron 读回来的实际值**(`session.getStoragePath()`、
+`webContents.getUserAgent()`、`app.commandLine.hasSwitch/getSwitchValue`),不是外壳的意图。
 
 ### 在侧边栏里打开那一格(T2 验收)
 
@@ -102,6 +108,38 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 | `DSH_DESKTOP_VIEW_URL` | 视图当时的地址(仅兜底识别用) |
 
 `--help` 有全部开关。
+
+### 那一格的身份(T6):持久、专属、不被当成自动化
+
+那一格是**它自己的浏览器**,不是外壳界面的一部分:
+
+- **它有自己的持久档案**(`persist:dsh-view`,落在 `<userDataDir>\Partitions\dsh-view`)。
+  **手动登录一次,关掉外壳再打开仍然是登录状态**;外壳界面那一路是另一个罐子 ——
+  实测同源前提下,一边写的 cookie 与 localStorage 另一边**读不到**。
+  > 走"关窗口"才保得住:实测**写完立刻强杀**会连持久 cookie 与 localStorage 一起丢
+  > (Chromium 还没刷盘)。这是 Chromium 的行为,不是档案不持久。
+- **UA 里没有 Electron 的产品标记**:只对这一格的 `webContents` 删掉 `<应用名>/<版本>` 与
+  `Electron/<版本>` 两段,其余一字不改;外壳界面那个窗口的 UA **不动**。
+  客户端提示(UA-CH)**本来就不带 Electron 品牌**,实测确认。
+- **`navigator.webdriver` 为假**。注意它的根因是**我们自己**加的 `--remote-debugging-port`
+  (没有它就没有整条领养路径,ADR-0002),Blink 特性标志只能在**进程级**关掉,所以这条影响面
+  包括外壳界面那个窗口(两个页面都实测读回为 `false`)。取舍与备选方案见 `docs/adr/0009`。
+- **代理什么都不设**:Chromium 的默认模式就是 system,所以外网站点**自动继承系统代理**;
+  回环地址本来就有隐含 bypass,`127.0.0.1` / `localhost` / `[::1]` **都不会**被推进代理。
+  启动时把读回发布成一行:
+
+```
+DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
+  "external":{"url":"https://example.com/","result":"DIRECT"},
+  "loopback127":{"url":"http://127.0.0.1:9/","result":"DIRECT"},
+  "loopbackLocalhost":{"url":"http://localhost:9/","result":"DIRECT"},
+  "loopbackV6":{"url":"http://[::1]:9/","result":"DIRECT"}}}
+```
+
+`--proxy <rules>` 是"系统代理不是我要的那个"时的显式口子(直接交给 `session.setProxy({proxyRules})`)。
+**不要顺手加 `proxyBypassRules`**:实测 `<-loopback>` 会把隐含 bypass **反过来**,连回环都推进代理;
+只列 `localhost,127.0.0.1` 又会漏掉 `[::1]`。原始证据在
+`docs/research/browser-identity-and-profile.md` 第 6 节。
 
 ### 让 Agent 操作那一格(T4 交互面)
 
@@ -169,6 +207,7 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 | `shell/preload.js` | 矩形通道的页面半边:`contextBridge` 暴露 `window.__dshDesktopView`(只给窗口) |
 | `shell/fixture.js` | 内置离线夹具站点(回环、系统挑端口):`/shell`、`/view`、`/other`、`/panel`、`/snapshot`、`/snapshot-many`、`/slow`、`/interact`、`/observe` + `/api/observe`、`/api/missing` |
 | `shell/cdp.js` | 端点等待、`/json/list`、`webContents` ↔ `targetId` 身份映射 |
+| `shell/identity.js` | 那一格的浏览器身份(纯逻辑,不 require electron):专属档案 partition、去掉产品标记的 UA、自动化 Blink 特性名、代理读回用的探针地址 |
 | `src/client-body.js` | 客户端半边:右栏 tab 类型(含 guide 入口)+ body + 面板组件,由构建脚本拼进 `client.js` |
 | `src/session.ts` | 领养模式会话:导航 / 快照 / 按 `ref` 的动作与失败原因定性,以及 T5 的观测(读正文、求值、抓 JSON 响应、控制台与失败请求、截图) |
 | `src/tools.ts` | 工具面:`browser_navigate`、`browser_snapshot`,T4 的 `browser_click` / `_type` / `_type_keys` / `_press_key` / `_hover` / `_select` / `_drag` / `_scroll` / `_wait`,T5 的 `browser_extract` / `_evaluate` / `_json` / `_screenshot` / `_diagnostics` |
@@ -180,6 +219,7 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 | `tests/snapshot.spec.ts` | T3 接缝测试:ref 与 bounds,以及跨文档的 ref 失效语义 |
 | `tests/interaction.spec.ts` | T4 接缝测试:各类动作的外部效果,以及四类失败原因各自被区分开 |
 | `tests/observation.spec.ts` | T5 接缝测试:正文/表达式/接口数据/截图附件/控制台与失败请求,每条都有独立读回 |
+| `tests/identity.spec.ts` | T6 接缝测试:UA 与读回一致、两个页面的 `navigator.webdriver`、档案互不可见、优雅重启后登录态还在、代理两半(含真实日志代理) |
 | `tests/client-half.spec.ts` | 客户端半边:宿主加载契约、tab 类型 + guide 入口、body、生成物是否陈旧 |
 | `tests/shell-harness.ts` | 测试用外壳进程夹具 |
 | `tests/fixtures/fake-dsh-web.mjs` | 假的 DSH,用来验证环境变量与 argv 交接 |

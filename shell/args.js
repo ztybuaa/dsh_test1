@@ -54,6 +54,7 @@ function parseArgv(argv) {
     window: { ...DEFAULT_WINDOW },
     cdpPort: 0,
     userDataDir: undefined,
+    proxy: undefined,
     show: true,
     dshCommand: 'dsh',
     dshProfile: DEFAULT_DSH_PROFILE,
@@ -103,6 +104,9 @@ function parseArgv(argv) {
       case '--user-data-dir':
         options.userDataDir = value()
         break
+      case '--proxy':
+        options.proxy = value()
+        break
       case '--timeout-ms':
         options.timeoutMs = Number(value())
         break
@@ -146,6 +150,10 @@ function usage() {
     '                           (e.g. --window-size 0,0,1200,800)',
     '  --cdp-port <n>           Programmable endpoint port; 0 lets the OS choose (default: 0)',
     '  --user-data-dir <dir>    Chromium profile directory (default: <appData>/dsh-desktop-shell)',
+    '  --proxy <rules>          Proxy for the view only, e.g. 127.0.0.1:7897 (proxyRules syntax)',
+    '                           Default: nothing is set, so the view inherits the system proxy',
+    '                           Loopback is never bypassed explicitly: Chromium already leaves',
+    '                           127.0.0.1 / localhost / [::1] out of any proxy it is given',
     '  --timeout-ms <n>         Startup timeout (default: 30000)',
     '  --placement-file <file>  Mirror the latest view placement into this JSON file',
     '  --no-rect-channel        Do not inject the panel rectangle channel into the window',
@@ -154,6 +162,13 @@ function usage() {
     '',
     'On success the shell prints one line to stdout:',
     '  DSH_DESKTOP_VIEW_HANDSHAKE {"cdpUrl":"...","targetId":"...", ...}',
+    "                           `browserIdentity` is the view's own identity, read back from",
+    '                           Electron: its persistent partition, that partition directory,',
+    '                           the user agent it really sends, and whether the automation',
+    '                           switch is on.',
+    '',
+    'It also prints what the view session resolves for a foreign site and for loopback:',
+    '  DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{"external":{"url":...,"result":...}, ...}}',
     '',
     'Every placement change prints one line to stdout:',
     '  DSH_SHELL VIEW {"cause":"panel-report","visible":true,"bounds":{...},',
