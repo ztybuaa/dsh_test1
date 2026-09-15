@@ -1,0 +1,8 @@
+{
+  "name": "dsh-desktop-shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Thin Electron shell: hosts the DSH web UI in a BrowserWindow and parks one native WebContentsView next to it.",
+  "type": "commonjs",
+  "main": "main.js"
+}
