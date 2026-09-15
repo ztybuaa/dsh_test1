@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -385,6 +385,58 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     expect(parseSpaceState('{}')).toBeUndefined()
     expect(parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[{"name":1}]}')).toBeUndefined()
     expect(parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[]}')?.active).toBe('default')
+  })
+
+  it('外壳不在时，工具拿到的是一个说得清的超时错误，而不是模糊的"等不到"', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-noshell-'))
+    try {
+      // 手工造一份"外壳写过"的状态：这样失败点落在"这条请求没人处理"，而不是"压根没有状态"。
+      writeFileSync(
+        join(dir, 'state.json'),
+        JSON.stringify({
+          protocol: 1,
+          requestId: 4,
+          error: null,
+          active: 'default',
+          userDataDir: dir,
+          spaces: [
+            {
+              name: 'default',
+              partition: 'persist:dsh-view',
+              storagePath: join(dir, 'Partitions', 'dsh-view'),
+              url: '',
+              visible: true,
+              webContentsId: 1,
+              active: true,
+              isDefault: true,
+              cookieCount: 0,
+            },
+          ],
+        }),
+      )
+      const lonely = new SpaceManager({ dir, timeoutMs: 400, maxElements: 200, maxChars: 20_000 })
+      const started = Date.now()
+      const failure = await lonely.command('create', 'task-9').then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      )
+      console.log('RAW no-shell failure after ' + (Date.now() - started) + 'ms: ' + JSON.stringify(failure))
+      expect(failure).toMatch(/did not handle space request 5/)
+      // 请求**真的写出去了**（不是"什么都没发生"）：它就摆在那里，等一个不存在的外壳。
+      const request = JSON.parse(readFileSync(join(dir, 'request.json'), 'utf8'))
+      console.log('RAW the request left behind: ' + JSON.stringify(request))
+      expect(request).toEqual({ id: 5, active: 'task-9', spaces: ['default', 'task-9'] })
+      // ……而"没有状态文件"是**另一条**不同的错误：两者不该长得一样。
+      const nowhere = new SpaceManager({
+        dir: join(dir, 'empty'),
+        timeoutMs: 400,
+        maxElements: 200,
+        maxChars: 20_000,
+      })
+      await expect(nowhere.command('list')).rejects.toThrow(/no task-space state/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 
