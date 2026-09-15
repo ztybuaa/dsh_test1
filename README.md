@@ -44,6 +44,17 @@ T3 的 `ref` 与 bounds、T4 的各类动作**外部效果**(点击改 DOM、填
 `innerText` 逐字一致且按上限截断、表达式取到只有页面知道的值、接口数据与页面侧记录的实收载荷一致、
 截图像素由测试自己解析且作为附件交付、控制台错误与失败请求先由页面自证再被工具读到)。
 
+### 跑测试需要什么
+
+| 需要 | 为什么 | 缺了会怎样 |
+|---|---|---|
+| Node + 已 `npm install`(含 Electron) | 大多数用例真的要起真 Electron 外壳 | 起不来 |
+| **`dsh` 启动器在 PATH 上**(或用 `DSH_BIN` 指向 `@deepseek-ai/dsh/lib/bin.js`) | `tests/no-shell.spec.ts` 要起一个**真 `dsh` 宿主**来验"没有外壳时插件照常加载"(票 #11 的验收 1) | **明确失败,不会静默跳过** |
+| Windows | `tests/cleanup.spec.ts` 那条 EPERM 断言是 Windows 文件锁的事实 | 该用例失败 |
+
+那两条依赖是**故意**的:一个永远被跳过的检查,正是票 #11 要消灭的那种"静默失效"。
+找不到 `dsh` 时的报错会写明该装什么、或该把 `DSH_BIN` 指向哪里。
+
 ## 直接用外壳
 
 ```pwsh
@@ -109,6 +120,12 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 | `DSH_DESKTOP_VIEW_SPACES` | 任务空间控制通道的目录(默认空间所在档案下的 `spaces\`),见下文 T7 一节 |
 
 `--help` 有全部开关。
+
+**没有外壳时这一格会说明自己**:在拿不到矩形通道的页面里(普通浏览器标签页、或外壳里那页原生
+视图自身),那一格渲染的是**说明文字**——它说清这一格需要桌面外壳,并给出起外壳的那条命令
+(`npm run shell`)。空白的一格看起来和坏掉的插件没有区别,而这正是票 #11 要挡的东西;
+三条验收的现状、原始输出与反证见
+[`docs/research/without-the-desktop-shell.md`](docs/research/without-the-desktop-shell.md)。
 
 ### 那一格的身份(T6):持久、专属、不被当成自动化
 

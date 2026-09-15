@@ -216,16 +216,6 @@
   }
 
   /**
-   * The message a panel shows when the rectangle channel is absent.
-   *
-   * The panel is a browser slot; without the shell there is no browser to put in it.
-   * Saying so is the whole point: a silently empty pane looks like a broken plugin.
-   */
-  var NO_SHELL_MESSAGE =
-    'This pane needs the desktop shell to show the browser. ' +
-    'It is empty in a plain browser tab: run the shell, which hosts the native view.'
-
-  /**
    * Read the rectangle channel.
    *
    * An absent `api` option means "the page's own channel, if it has one". An explicit
@@ -268,8 +258,15 @@
 
   /**
    * Whether this page is running inside the desktop shell (that is, whether the
-   * rectangle channel exists). The panel uses it to choose between reporting and
-   * showing {@link NO_SHELL_MESSAGE}.
+   * rectangle channel exists).
+   *
+   * The panel is the only caller: without the channel there is no rectangle to report
+   * and no browser to put in the pane, so it says so instead. That copy lives with the
+   * panel (`src/client-body.js`, both languages) rather than here — this file answers
+   * "is the shell there", not "what does the pane say about it". It used to export a
+   * second, English-only sentence for the same case; nothing rendered it, its wording
+   * had already drifted from the panel's, and two answers to one question is how the
+   * wrong one gets edited.
    *
    * @param {{api?: object | null}} [options] - override for testing.
    * @returns {boolean} true when the shell exposed the channel.
@@ -281,7 +278,6 @@
 
   return {
     MIN_SIDE_PX: MIN_SIDE_PX,
-    NO_SHELL_MESSAGE: NO_SHELL_MESSAGE,
     channel: channel,
     deliver: deliver,
     hasShell: hasShell,

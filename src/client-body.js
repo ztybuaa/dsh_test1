@@ -43,16 +43,30 @@ var DICTIONARIES = {
   },
 }
 
-/** Panel copy, also in both languages. Not part of the locale namespace: the panel must render before it can translate. */
+/**
+ * Panel copy, also in both languages. Not part of the locale namespace: the panel must render before it can translate.
+ *
+ * `noShell` is the one message a person can only ever see *without* the shell — which is
+ * exactly why it has to be complete on its own. "This pane needs the desktop shell" names
+ * the problem; on its own it leaves the reader with nowhere to go, so the sentence
+ * continues with the way out (the command that starts the shell, which is the only
+ * thing that can put a browser in this pane). A notice that states a fact and no action
+ * is a slightly louder silent failure.
+ */
 var COPY = {
   zh: {
-    noShell: '这一格需要桌面外壳才能显示浏览器。在普通浏览器标签页里它是空的。',
+    noShell:
+      '这一格需要桌面外壳才能显示浏览器。外壳是本仓库自带的 Electron 应用：' +
+      '在仓库里运行 npm run shell 起它，这一格就会显示真正的浏览器视图；' +
+      '普通浏览器标签页里它没有东西可显示。',
     ready: '桌面外壳已就位：这一格交给原生浏览器视图。',
     missing: '这一格没有量到矩形（可能被折叠或切走了）。',
   },
   en: {
     noShell:
-      'This pane needs the desktop shell to show the browser. It is empty in a plain browser tab.',
+      'This pane needs the desktop shell to show the browser. The shell is the Electron app that ships ' +
+      'in this repository: run npm run shell there and this pane shows the real browser view. A plain ' +
+      'browser tab has nothing to put here.',
     ready: 'The desktop shell is here: the native browser view takes this pane.',
     missing: 'This pane reports no rectangle (collapsed or switched away).',
   },
