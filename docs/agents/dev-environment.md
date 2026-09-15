@@ -46,7 +46,22 @@ $env:ELECTRON_MIRROR = 'https://mirrors.huaweicloud.com/electron/'
 
 **已经校验过的现成产物**：`G:\electron-mirror\electron-v44.3.0-win32-x64.zip`，150.82 MB，SHA256 `26bf9a617d58d81772b3d68305d59ee48272969c15083c06db634a77358a8d9d`，与 `electron@44.3.0` 包内 `checksums.json` 一致。
 
-**为什么 `.npmrc` 里的 `electron_mirror=` 确实生效**（源码依据）：`@electron/get` 的 `dist/artifact-utils.js:20-34` 的 `mirrorVar()` **第一个**就读 `process.env.npm_config_electron_mirror`，而 npm 正是把 `.npmrc` 的 `electron_mirror` 转成这个环境变量。所以镜像键不必再另外设 `ELECTRON_MIRROR`。
+**为什么 `.npmrc` 里的 `electron_mirror=` 现在生效**（源码依据）：`@electron/get` 的 `dist/artifact-utils.js:20-34` 的 `mirrorVar()` **第一个**就读 `process.env.npm_config_electron_mirror`，而 npm 10 会把 `.npmrc` 的 `electron_mirror` 透传成这个环境变量。
+
+**⚠️ 这条有保质期，别只依赖它。** npm 会打印：
+
+```
+npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm.
+npm warn Unknown project config "playwright_skip_browser_download". ...
+```
+
+也就是**下一个 npm 大版本会停止透传未知配置** —— 那时 `.npmrc` 这条路会**静默失效**，安装又回去撞 GitHub。所以长期可靠的是环境变量，两个都设：
+
+```pwsh
+$env:ELECTRON_MIRROR = 'https://mirrors.huaweicloud.com/electron/'
+```
+
+**另外：electron 的 postinstall 在这台机器上实测要 ~9 分钟**（`npm install` 输出 `added 78 packages in 9m`），绝大部分时间就是拉那 150.82 MB 并解包。**这是正常耗时，不是卡死** —— 判断依据看缓存目录与 `node_modules/electron/dist` 是否出现，不要看耗时。
 
 **缓存已经命中**：`%LOCALAPPDATA%\electron\Cache` 里已经躺着 `electron-v44.3.0-win32-x64.zip`（150.82 MB）。因此后续的 `npm install` **通常不需要再下载**，直接从缓存解包。判断"下载是否真的在跑"要看这个缓存目录与 `node_modules/electron/dist` 是否出现，而不是看安装耗时。
 
