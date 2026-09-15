@@ -1,4 +1,4 @@
-import type { Browser, BrowserContext, ElementHandle, Page } from 'playwright'
+import type { Browser, BrowserContext, ElementHandle, Page, Response } from 'playwright'
 import { chromium } from 'playwright'
 
 /**
@@ -30,6 +30,12 @@ export interface AdoptOptions extends ViewHandle {
    * bound. Defaults to {@link DEFAULT_MAX_ELEMENTS}.
    */
   maxElements?: number
+  /**
+   * Cap on the characters a text read returns. Long page text is cut at this many
+   * characters and reported as truncated, rather than being handed over whole.
+   * Defaults to {@link DEFAULT_MAX_CHARS}.
+   */
+  maxChars?: number
 }
 
 /** Outcome of a navigation: the address actually reached, and its title. */
@@ -113,6 +119,71 @@ export interface WaitResult {
   elapsedMs: number
 }
 
+/**
+ * The page's own rendered text, plus what the cap did to it.
+ *
+ * `totalChars` is the length of the text *before* the cap, read in the page in the
+ * same pass that read the text, so "this is all of it" and "this was cut" are
+ * distinguishable from the outside instead of by comparing against a number the
+ * caller guessed (T5).
+ */
+export interface ExtractedText {
+  /** `document.body.innerText`, cut at the cap when it was longer. */
+  text: string
+  /** Whether the cap cut anything off. */
+  truncated: boolean
+  /** How many characters the page's rendered text really had. */
+  totalChars: number
+}
+
+/** One console message the page produced, as the page's console reported it. */
+export interface ConsoleMessageRecord {
+  /** Playwright's console type: `error`, `warning`, `log`, `info`, … or `pageerror`. */
+  type: string
+  /** The message text. */
+  text: string
+  /** Where it came from (`url:line:column`), or `<unknown>` when the page gave no location. */
+  location: string
+}
+
+/**
+ * One request the page made that did not succeed.
+ *
+ * `status` is `0` for a request that never reached a response at all (DNS, refused
+ * connection, aborted), which is the one case where a status code cannot exist and
+ * saying `0` beats pretending there was one.
+ */
+export interface FailedRequestRecord {
+  /** HTTP method. */
+  method: string
+  /** Absolute URL that was requested. */
+  url: string
+  /** HTTP status, or `0` when no response arrived. */
+  status: number
+  /** The response's own reason phrase, e.g. `Not Found`; `(no response)` when there was none. */
+  statusText: string
+  /** A short readable summary: the response body excerpt, or the network failure. */
+  summary: string
+}
+
+/** Everything the page reported going wrong, and what it said about itself. */
+export interface PageDiagnostics {
+  /** Console messages, oldest first, bounded to the most recent few. */
+  console: ConsoleMessageRecord[]
+  /** Requests that failed, oldest first, bounded to the most recent few. */
+  failedRequests: FailedRequestRecord[]
+}
+
+/** One JSON response the page received, kept so the data is readable without the render. */
+export interface JsonResponseRecord {
+  /** The requested URL. */
+  url: string
+  /** HTTP status the payload arrived with. */
+  status: number
+  /** The parsed JSON body. */
+  body: unknown
+}
+
 /** The element a ref addresses, pinned, plus what one look at it answered. */
 interface RefTarget {
   /** The node the snapshot listed. */
@@ -126,6 +197,44 @@ const DEFAULT_TIMEOUT_MS = 30_000
 
 /** How many elements one snapshot lists before it is truncated. */
 export const DEFAULT_MAX_ELEMENTS = 200
+
+/**
+ * How many characters one text read returns before it is cut.
+ *
+ * It exists because the alternative — handing the model a whole page's text — is what
+ * makes a session unusable: the cap is paired with ADR-0005's rule that body text is
+ * never carried in the snapshot, so the model asks for text only when it wants it and
+ * the answer is bounded when it does (T5).
+ */
+export const DEFAULT_MAX_CHARS = 20_000
+
+/** How many JSON responses are kept; past it the oldest is dropped. */
+const MAX_JSON_RESPONSES = 30
+
+/** How many console messages are kept; past it the oldest is dropped. */
+const MAX_CONSOLE_MESSAGES = 50
+
+/** How many failed requests are kept; past it the oldest is dropped. */
+const MAX_FAILED_REQUESTS = 50
+
+/** How much of an error response body is quoted as the failure's summary. */
+const FAILURE_SUMMARY_CHARS = 200
+
+/**
+ * How long one screenshot attempt is given before another is made.
+ *
+ * The engine's capture against this host does not answer reliably on its own: measured on
+ * Electron 44 over `connectOverCDP`, a lone `Page.captureScreenshot` waits indefinitely
+ * (30s and counting) while the *next* request completes both — two captures issued
+ * concurrently both return in about 0.6s. So a screenshot gets a bounded attempt budget
+ * and is repeated, instead of inheriting the 30s action timeout and hanging for it. A
+ * healthy capture answers in well under a second, so the cap costs nothing when the
+ * engine behaves.
+ */
+const SCREENSHOT_ATTEMPT_MS = 3_000
+
+/** How many capture attempts one screenshot makes before giving up with a timeout. */
+const SCREENSHOT_ATTEMPTS = 4
 
 /**
  * ARIA widget roles that count as interactive even on a plain `<div>`, so a page
@@ -412,6 +521,43 @@ function firstLine(message: string): string {
   return (line ?? message).trim()
 }
 
+/**
+ * Cut text to a character cap without splitting a surrogate pair.
+ *
+ * The cap is a count of characters the caller receives, so a cut that left half of an
+ * astral character behind would hand over something that is not the page's text any
+ * more; stepping back off a low surrogate keeps every returned prefix well-formed.
+ *
+ * Exported because a tool that cuts its own text (the captured JSON) must cut it the
+ * same way: one rule, two callers.
+ *
+ * @param text - the text to cut.
+ * @param maxChars - the most characters to return.
+ * @returns the text itself when it fits, otherwise its prefix.
+ */
+export function cutText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  let end = Math.max(0, maxChars)
+  while (end > 0 && (text.charCodeAt(end) & 0xfc00) === 0xdc00) end -= 1
+  return text.slice(0, end)
+}
+
+/** Parse a JSON body, stripping common anti-XSSI prefixes. Returns undefined when it is not JSON. */
+function parseJsonBody(raw: string): unknown {
+  let json = raw.trim().replace(/^\)\]\}'\s*/, '').replace(/^while\(1\);\s*/, '')
+  try {
+    return JSON.parse(json)
+  } catch {
+    const start = json.search(/[{[]/)
+    if (start > 0) json = json.slice(start)
+    try {
+      return JSON.parse(json)
+    } catch {
+      return undefined
+    }
+  }
+}
+
 /** The engine's own last word on why an action never landed, when it has one. */
 function engineNote(message: string): string {
   const line = message
@@ -419,6 +565,12 @@ function engineNote(message: string): string {
     .reverse()
     .find((candidate) => /intercepts pointer events|is not visible/.test(candidate))
   return line === undefined ? '' : line.replace(/^\s*-\s*/, '').trim()
+}
+
+/** Whether an engine failure is the "it never answered in time" kind. */
+function isTimeoutFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /\bTimeout \d+ms exceeded\b/.test(message)
 }
 
 /**
@@ -585,6 +737,23 @@ export class AdoptedViewSession {
    */
   private documentToken: string | undefined
 
+  /**
+   * What the current document said about itself while the session watched: the JSON it
+   * received, the console messages it produced, and the requests it made that failed.
+   *
+   * All three belong to the *document*, not to the session, so they are emptied when
+   * the view navigates: answering "why is this page empty" with an error the previous
+   * page produced is worse than answering nothing. Bounded, because a page that logs in
+   * a loop must not grow the session without limit.
+   *
+   * They are captured by listeners rather than polled, because the interesting facts —
+   * a console error, a 404 — happen once, while the page is loading, and a buffer read
+   * after the fact cannot recover what nobody was listening for (T5).
+   */
+  private jsonResponses: JsonResponseRecord[] = []
+  private consoleMessages: ConsoleMessageRecord[] = []
+  private failedRequests: FailedRequestRecord[] = []
+
   private constructor(
     private readonly browser: Browser,
     private readonly context: BrowserContext,
@@ -593,6 +762,11 @@ export class AdoptedViewSession {
     readonly targetId: string,
     private readonly timeoutMs: number,
     private readonly maxElements: number,
+    /**
+     * Cap on the characters a text read returns. Read by the tools that cut their own
+     * text (T5), so one cap governs every read that can be long.
+     */
+    readonly maxChars: number,
   ) {
     // A `ref` is an index into *this* document. When the view navigates on its own —
     // a link, a form submit, a redirect — the next element at that index is a
@@ -608,17 +782,54 @@ export class AdoptedViewSession {
       void disposeHandles(this.refs.values())
       this.refs = new Map()
     })
+    // The observations above belong to one document, so they start again with the next
+    // one. The event is the main frame's navigation *commit* rather than its load, because
+    // a document that is still loading already has its own console and its own requests,
+    // and clearing at load would throw away exactly the errors that explain a page that
+    // never finishes.
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) this.forgetPageObservations()
+    })
+    page.on('console', (message) => {
+      const location = message.location()
+      this.pushConsole({
+        type: message.type(),
+        text: message.text(),
+        location:
+          location.url === ''
+            ? '<unknown>'
+            : `${location.url}:${location.lineNumber}:${location.columnNumber}`,
+      })
+    })
+    // An uncaught exception is what most often leaves a page empty, and the console does
+    // not always carry it in a readable form, so it is recorded under its own type.
+    page.on('pageerror', (error) => {
+      this.pushConsole({ type: 'pageerror', text: firstLine(error.message), location: '<uncaught>' })
+    })
+    page.on('response', (response) => {
+      void this.captureResponse(response)
+    })
+    page.on('requestfailed', (request) => {
+      this.pushFailedRequest({
+        method: request.method(),
+        url: request.url(),
+        status: 0,
+        statusText: '(no response)',
+        summary: request.failure()?.errorText ?? 'the request failed with no reason reported',
+      })
+    })
   }
 
   /**
    * Connect to the shell and take over the view it published.
-   * @param options - endpoint, view identity, timeouts, and the snapshot cap.
+   * @param options - endpoint, view identity, timeouts, and the read caps.
    * @returns a session bound to the view.
    * @throws when no single page matches the published identity.
    */
   static async adopt(options: AdoptOptions): Promise<AdoptedViewSession> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     const maxElements = options.maxElements ?? DEFAULT_MAX_ELEMENTS
+    const maxChars = options.maxChars ?? DEFAULT_MAX_CHARS
     const browser = await chromium.connectOverCDP(options.cdpUrl, { timeout: timeoutMs })
     try {
       const match = await findView(browser, options)
@@ -629,7 +840,15 @@ export class AdoptedViewSession {
       if (probe.targetId === undefined) {
         throw new Error(`the adopted view's target id could not be read: ${probe.error}`)
       }
-      return new AdoptedViewSession(browser, match.context, match.page, probe.targetId, timeoutMs, maxElements)
+      return new AdoptedViewSession(
+        browser,
+        match.context,
+        match.page,
+        probe.targetId,
+        timeoutMs,
+        maxElements,
+        maxChars,
+      )
     } catch (error) {
       // A failed adoption must not leave a dangling connection behind.
       await browser.close().catch(() => undefined)
@@ -955,6 +1174,204 @@ export class AdoptedViewSession {
       throw this.timedOutWaiting(`text ${JSON.stringify(text)}`, timeoutMs, error)
     }
     return { waited: `text ${JSON.stringify(text)}`, elapsedMs: Date.now() - started }
+  }
+
+  /**
+   * Read the text the page renders, as the page's own `innerText` defines it.
+   *
+   * `innerText` and not `textContent`, and not a tree walk: it is what a person reading
+   * the page would see, so text that only exists inside `display: none` markup does not
+   * arrive pretending to be content. This is the capability ADR-0005 says the snapshot
+   * does *not* carry — the snapshot lists what can be acted on, and the text is fetched
+   * on demand, bounded by the cap.
+   *
+   * The cap is reported as data (`truncated`, `totalChars`) rather than only as a marker
+   * inside the string, so a caller can tell "this is the whole page" from "this was cut"
+   * without guessing at the length of what it did not receive.
+   *
+   * @param maxChars - cut the text at this many characters; defaults to the session's cap.
+   * @returns the rendered text, whether it was cut, and how long it really was.
+   */
+  async extractText(maxChars?: number): Promise<ExtractedText> {
+    this.assertOpen()
+    const cap = Math.max(0, maxChars ?? this.maxChars)
+    // Self-contained on purpose: only this function's source crosses into the page.
+    const read = await this.page.evaluate(() => {
+      const body = document.body
+      const text = body === null ? '' : body.innerText
+      return { text, totalChars: text.length }
+    })
+    const text = cutText(read.text, cap)
+    return { text, truncated: read.totalChars > text.length, totalChars: read.totalChars }
+  }
+
+  /**
+   * Evaluate one read-only expression in the page and hand back what it produced.
+   *
+   * It is an explicit capability for reading state that never reaches the DOM — a model
+   * object, a computed configuration, a counter the app keeps in JS — and it is *not* a
+   * second way to locate an element: acting on an element still goes through its `ref`
+   * (ADR-0001), because an expression that resolves an element gives the model something
+   * no later action can address.
+   *
+   * @param expression - a JavaScript expression, e.g. `document.title`, `JSON.stringify(window.__state)`.
+   * @returns whatever the expression produced, serialized by the engine.
+   * @throws a failure naming the engine's words when the expression cannot be evaluated.
+   */
+  async evaluate(expression: string): Promise<unknown> {
+    this.assertOpen()
+    try {
+      return await this.page.evaluate(expression)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new ViewActionError(
+        'failed',
+        `browser-view: the expression could not be evaluated in the page (${this.page.url()}): ${firstLine(message)}`,
+      )
+    }
+  }
+
+  /**
+   * Capture the view as a PNG and return its bytes.
+   *
+   * The capture is the viewport at the *device* pixel ratio, which is Playwright's default
+   * and the only scale this host produces a truthful size for. `scale: 'css'` was measured
+   * here and rejected: the image comes back one pixel per CSS pixel only while the page has
+   * no scrollbar, and 439x799 for a 440x800 viewport as soon as one appears (Playwright
+   * derives the size from layout metrics, which the scrollbar changes). At device scale the
+   * image is exactly `innerWidth × innerHeight × devicePixelRatio` — read from the page, that
+   * is how "the screenshot is this view, at this size" is verified — and the pixels are the
+   * display's own, with no resampling.
+   *
+   * The type is pinned to PNG rather than inferred from the file name, so the bytes and the
+   * declared media type cannot disagree.
+   *
+   * Writing the file and publishing the bytes as an attachment are separate steps for a
+   * reason: the file is for a human, and the attachment is what the model actually
+   * receives (T5).
+   *
+   * @param path - where to write the PNG.
+   * @returns the encoded PNG bytes.
+   * @throws a timeout naming how many attempts were made, when no image is produced.
+   */
+  async screenshot(path: string): Promise<Buffer> {
+    this.assertOpen()
+    const attemptMs = Math.max(1_000, Math.min(this.timeoutMs, SCREENSHOT_ATTEMPT_MS))
+    let lastError: unknown
+    for (let attempt = 1; attempt <= SCREENSHOT_ATTEMPTS; attempt++) {
+      try {
+        return await this.page.screenshot({ path, type: 'png', timeout: attemptMs })
+      } catch (error) {
+        // Only the stall is retried: a view that is gone, or a path that cannot be
+        // written, fails the same way every time and retrying it would only be slower.
+        if (!isTimeoutFailure(error)) throw error
+        lastError = error
+      }
+    }
+    throw new ViewActionError(
+      'timeout',
+      `browser-view: the view produced no screenshot in ${SCREENSHOT_ATTEMPTS} attempts of ${attemptMs}ms each ` +
+        `(the engine last said: ${firstLine(lastError instanceof Error ? lastError.message : String(lastError))}). ` +
+        'The page may still be busy, or the view may not be being painted.',
+    )
+  }
+
+  /**
+   * The JSON the current document received, oldest first.
+   *
+   * Bounded and reset with the document: a response from the page before this one could
+   * be mistaken for the data behind the page in front of the model, which is exactly the
+   * mistake this capability exists to prevent.
+   *
+   * @returns a copy, so a caller cannot mutate what the session is still filling.
+   */
+  getJsonResponses(): JsonResponseRecord[] {
+    this.assertOpen()
+    return [...this.jsonResponses]
+  }
+
+  /**
+   * What the current document said about itself: console messages and failed requests.
+   *
+   * It answers "why is this page empty" with the page's own words — a thrown error, a
+   * 404 — instead of leaving "nothing rendered" as the only observable fact.
+   *
+   * @returns a copy of both buffers.
+   */
+  diagnostics(): PageDiagnostics {
+    this.assertOpen()
+    return { console: [...this.consoleMessages], failedRequests: [...this.failedRequests] }
+  }
+
+  /**
+   * Decide whether one response is data to keep, a failure to report, or neither.
+   *
+   * The split is by status: a payload that came back `ok` is data the page loaded, while
+   * a 4xx/5xx is a failure whose *reason* is what the model needs. Keeping a 404 JSON
+   * body in the data list as well would let "the API answered" and "the API refused"
+   * look the same in `browser_json`.
+   *
+   * @param response - the response the page received.
+   */
+  private async captureResponse(response: Response): Promise<void> {
+    try {
+      const status = response.status()
+      if (status >= 400) {
+        let summary = ''
+        try {
+          summary = cutText((await response.text()).replace(/\s+/g, ' ').trim(), FAILURE_SUMMARY_CHARS)
+        } catch {
+          // A body that cannot be read leaves the status and the reason phrase, which is
+          // still a diagnosis; the failure is reported either way.
+          summary = ''
+        }
+        this.pushFailedRequest({
+          method: response.request().method(),
+          url: response.url(),
+          status,
+          statusText: response.statusText(),
+          summary: summary === '' ? '(the response body could not be read)' : summary,
+        })
+        return
+      }
+      const contentType = (response.headers()['content-type'] ?? '').toLowerCase()
+      if (!contentType.includes('json') && !contentType.includes('javascript')) return
+      const body = parseJsonBody(await response.text())
+      if (body === undefined) return
+      this.jsonResponses.push({ url: response.url(), status, body })
+      if (this.jsonResponses.length > MAX_JSON_RESPONSES) this.jsonResponses.shift()
+    } catch {
+      // Reading a response that the page itself cancelled is not a diagnosis; the
+      // request-failed listener reports that case with the engine's own reason.
+    }
+  }
+
+  /** Keep one console message, dropping the oldest past the bound. */
+  private pushConsole(message: ConsoleMessageRecord): void {
+    this.consoleMessages.push(message)
+    if (this.consoleMessages.length > MAX_CONSOLE_MESSAGES) this.consoleMessages.shift()
+  }
+
+  /** Keep one failed request, dropping the oldest past the bound, without duplicates. */
+  private pushFailedRequest(request: FailedRequestRecord): void {
+    const duplicate = this.failedRequests.some(
+      (seen) => seen.method === request.method && seen.url === request.url && seen.status === request.status,
+    )
+    if (duplicate) return
+    this.failedRequests.push(request)
+    if (this.failedRequests.length > MAX_FAILED_REQUESTS) this.failedRequests.shift()
+  }
+
+  /**
+   * Start the observation buffers over.
+   *
+   * Called when the main frame navigates: the console, the JSON and the failures that
+   * have been collected so far describe a document the view no longer shows.
+   */
+  private forgetPageObservations(): void {
+    this.jsonResponses = []
+    this.consoleMessages = []
+    this.failedRequests = []
   }
 
   /**

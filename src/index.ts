@@ -1,13 +1,21 @@
 import type { Context } from '@deepseek-ai/cordis'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import z from '@deepseek-ai/schemastery'
-import { AdoptedViewSession, DEFAULT_MAX_ELEMENTS } from './session.ts'
+import { AdoptedViewSession, DEFAULT_MAX_CHARS, DEFAULT_MAX_ELEMENTS } from './session.ts'
 import { desktopViewTools } from './tools.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'desktop-view'
 
-/** This plugin only contributes tools; the view itself is owned by the shell. */
-export const inject = ['tools']
+/**
+ * This plugin contributes tools and publishes screenshots into the durable image store.
+ *
+ * `attachments` is not decoration: `browser_screenshot` hands the picture to the model
+ * *through* that service, so a deployment without it would leave the tool able to write
+ * a file and unable to deliver an image. Declaring it in `inject` makes the loader wait
+ * for the service instead of letting the tool discover its absence at call time.
+ */
+export const inject = ['tools', 'attachments']
 
 /** Plugin configuration. */
 export interface Config {
@@ -19,6 +27,10 @@ export interface Config {
   timeoutMs: number
   /** Cap on the elements one snapshot lists; beyond it the snapshot is truncated. */
   maxElements: number
+  /** Cap on the characters a text read returns; beyond it the text is cut and says so. */
+  maxChars: number
+  /** Directory `browser_screenshot` writes to when the caller names no path. */
+  screenshotDir: string
 }
 
 /** Schemastery schema validating {@link Config}. */
@@ -27,6 +39,8 @@ export const Config: z<Config> = z.object({
   targetId: z.string(),
   timeoutMs: z.number().default(30000),
   maxElements: z.number().default(DEFAULT_MAX_ELEMENTS),
+  maxChars: z.number().default(DEFAULT_MAX_CHARS),
+  screenshotDir: z.string().default('.'),
 })
 
 /**
@@ -54,6 +68,7 @@ export function apply(ctx: Context, config: Config): void {
       cdpUrl,
       timeoutMs: config.timeoutMs,
       maxElements: config.maxElements,
+      maxChars: config.maxChars,
       ...(targetId !== undefined && targetId !== '' ? { targetId } : {}),
       ...(url !== undefined && url !== '' ? { url } : {}),
     }).catch((error: unknown) => {
@@ -74,7 +89,11 @@ export function apply(ctx: Context, config: Config): void {
     }
   })
 
-  for (const tool of desktopViewTools(adopt)) {
+  // The store the screenshot publishes into is the deployment's own attachment service,
+  // taken from the context rather than constructed here: the caller (the model session)
+  // has to be able to read the image back, so it must be the same store the session uses.
+  const attachments: AttachmentStore = ctx.attachments
+  for (const tool of desktopViewTools(adopt, { attachments, screenshotDir: config.screenshotDir })) {
     ctx.tools.register(tool)
   }
 }

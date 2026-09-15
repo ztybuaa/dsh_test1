@@ -159,6 +159,47 @@ export interface ShellProcess {
 /** Default time to wait for the shell to publish its handshake. */
 const START_TIMEOUT_MS = 90_000
 
+/** How many times a temporary directory removal is retried before it is only reported. */
+const REMOVE_ATTEMPTS = 10
+
+/** How long to wait between removal attempts, in milliseconds. */
+const REMOVE_RETRY_MS = 250
+
+/** Wait synchronously, so a retry loop can live inside a synchronous cleanup path. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * Remove a temporary directory, tolerating a file handle that is still closing.
+ *
+ * Measured on Windows: `rmSync` immediately after killing an Electron shell sometimes
+ * throws `EPERM` because the profile's handles have not been released yet — and that threw
+ * out of `afterAll`, failing the whole spec file *after* every assertion in it had passed
+ * (seen as `Test Files 1 failed | 5 passed` with `Tests 53 passed`, several times a day).
+ * Cleanup is housekeeping, never a result: it is retried briefly, and a directory that is
+ * still held is reported on stderr rather than allowed to fail an unrelated suite.
+ *
+ * @param dir - the directory to remove.
+ */
+function removeWhenFree(dir: string): void {
+  for (let attempt = 1; attempt <= REMOVE_ATTEMPTS; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (attempt === REMOVE_ATTEMPTS) {
+        process.stderr.write(
+          `warning: the temporary directory ${dir} could not be removed after ${REMOVE_ATTEMPTS} attempts ` +
+            `(a process may still hold it): ${error instanceof Error ? error.message : String(error)}\n`,
+        )
+        return
+      }
+      sleepSync(REMOVE_RETRY_MS)
+    }
+  }
+}
+
 /** Options accepted by {@link startShell}. */
 export interface StartShellOptions {
   /** How long to wait for the handshake. */
@@ -257,7 +298,7 @@ export async function startShell(
         })
       })
     }
-    rmSync(userDataDir, { recursive: true, force: true })
+    removeWhenFree(userDataDir)
   }
 
   const waitFor = async (

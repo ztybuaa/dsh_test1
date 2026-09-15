@@ -3,6 +3,7 @@
 const http = require('node:http')
 const fs = require('node:fs')
 const path = require('node:path')
+const { randomUUID } = require('node:crypto')
 
 /**
  * Built-in fixture site. It exists so the shell and the seam tests are
@@ -369,6 +370,88 @@ const MANY_PAGE = `<!doctype html>
 <body><div id="many">${Array.from({ length: 220 }, (_, index) => `<button id="snap-many-${index + 1}">many-${index + 1}</button>`).join('')}</div></body></html>`
 
 /**
+ * The observation page (T5).
+ *
+ * It exists so "the agent can read the page" is checkable from *both* sides. Every fact
+ * the reading tools are supposed to find is also recorded by the page itself, so a test
+ * can prove the fixture really produced it before asserting that the tool found it —
+ * otherwise a diagnostics test could pass on an empty buffer and prove nothing:
+ *
+ *  - `window.__observeSecret` is derived from this page's own DOM, so the value under
+ *    `browser_evaluate` cannot be a hardcoded answer;
+ *  - the page really `fetch`es `/api/observe` and stores what came back in
+ *    `window.__observePayload`, so `browser_json` can be compared against the payload
+ *    the page actually received rather than against "something came back";
+ *  - the page really `console.error`s and the error event really fires
+ *    (`window.__observeConsoleErrors` / `window.__observePageErrors` count them);
+ *  - the page really requests `/api/missing`, which really answers 404, and the page
+ *    records the status it saw (`window.__observeFailures`) and the body it read.
+ *
+ * `#obs-long` renders far more text than a small `maxChars`, so truncation can be
+ * observed with the page's own `innerText` as the yardstick.
+ */
+const OBSERVE_LONG_TEXT = Array.from(
+  { length: 40 },
+  (_, index) => `filler line ${index + 1} of the observe page, long enough to be worth cutting`,
+).join(' ')
+
+const OBSERVE_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>observe-page</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 13px system-ui; }
+  #obs-box { width: 120px; height: 60px; background: #2f6fb0; color: #fff; padding: 4px; box-sizing: border-box; }
+  #obs-long { font-size: 12px; color: #333; }
+  #obs-list { font-family: ui-monospace, monospace; }
+</style></head>
+<body>
+<h1 id="obs-heading">observe-page</h1>
+<div id="obs-box">pixel probe</div>
+<button id="obs-hit" onclick="document.getElementById('obs-effect').textContent='observe-clicked'">hit me</button>
+<ul id="obs-list"><li>row-one</li><li>row-two</li><li>row-three</li></ul>
+<output id="obs-effect">none</output>
+<p id="obs-long">${OBSERVE_LONG_TEXT}</p>
+<script>
+(function () {
+  var list = document.getElementById('obs-list')
+
+  // A value only this page can produce: derived from its own DOM, so a hardcoded
+  // answer on the reading side cannot match it.
+  window.__observeSecret = 't5-' + list.children.length + '-' + (list.children.length * 7)
+  window.__observeFetchCount = 0
+  window.__observePayload = null
+  window.__observeFailures = []
+  window.__observeFailureBody = ''
+  window.__observeConsoleErrors = 0
+  window.__observePageErrors = 0
+
+  // The payload the page really received, kept on the page so the tool's copy of it can
+  // be compared against this one, field by field.
+  fetch('/api/observe').then(function (response) { return response.json() }).then(function (data) {
+    window.__observeFetchCount += 1
+    window.__observePayload = data
+  })
+
+  // A request that really fails, with the status the page itself saw.
+  fetch('/api/missing').then(function (response) {
+    window.__observeFailures.push(response.status)
+    return response.text()
+  }).then(function (body) {
+    window.__observeFailureBody = body
+  })
+
+  window.__observeConsoleErrors += 1
+  console.error('t5-fixture-console-error ' + window.__observeSecret)
+
+  // An uncaught exception too: it is what most often leaves a page blank, and the page
+  // counts its own error events so the test can prove one really happened.
+  window.addEventListener('error', function () { window.__observePageErrors += 1 })
+  setTimeout(function () { throw new Error('t5-fixture-page-error ' + window.__observeSecret) }, 0)
+})()
+</script>
+</body></html>`
+
+/**
  * The slow page (T3): its first chunk is sent immediately and the rest only after a
  * pause, so the document is committed (and has its own identity and its own parsed
  * controls) while it is still loading. That is the window "a navigation has replaced
@@ -388,7 +471,12 @@ const SLOW_PAGE = {
 /** How long the slow page holds its response open after the first chunk. */
 const SLOW_PAGE_DELAY_MS = 2500
 
-/** Path -> {body, type}. Every interactive page exposes the same `#hit` / `#out` pair. */
+/**
+ * Path -> {body, type, status}. Every interactive page exposes the same `#hit` / `#out` pair.
+ *
+ * `status` is optional and defaults to 200; the T5 routes are the only ones that use it,
+ * because "the request failed with a status" needs a route that really fails.
+ */
 const ROUTES = {
   '/shell': () => ({ body: page('shell-page', '<p>Stand-in for the DSH web UI inside the BrowserWindow.</p>'), type: 'text/html; charset=utf-8' }),
   '/view': () => ({ body: page('view-page', `<p>Initial content of the native browser view.</p>${button('view')}`), type: 'text/html; charset=utf-8' }),
@@ -396,6 +484,19 @@ const ROUTES = {
   '/snapshot': () => ({ body: SNAPSHOT_PAGE, type: 'text/html; charset=utf-8' }),
   '/interact': () => ({ body: INTERACT_PAGE, type: 'text/html; charset=utf-8' }),
   '/snapshot-many': () => ({ body: MANY_PAGE, type: 'text/html; charset=utf-8' }),
+  '/observe': () => ({ body: OBSERVE_PAGE, type: 'text/html; charset=utf-8' }),
+  // The JSON the observation page loads: a fresh nonce per response, so the payload the
+  // page records and the payload a tool reports cannot both be a stale constant.
+  '/api/observe': () => ({
+    body: JSON.stringify({ source: 't5-fixture', nonce: randomUUID(), items: [1, 2, 3], ok: true }),
+    type: 'application/json; charset=utf-8',
+  }),
+  // A request that really fails, with a body a reader can summarise.
+  '/api/missing': () => ({
+    status: 404,
+    body: 't5-fixture-404-body: /api/missing was requested on purpose and does not exist',
+    type: 'text/plain; charset=utf-8',
+  }),
   '/slow': () => ({ slow: SLOW_PAGE, type: 'text/html; charset=utf-8' }),
   '/panel': () => ({ body: PANEL_PAGE, type: 'text/html; charset=utf-8' }),
   '/panel-rect.js': () => ({ body: PANEL_RECT_JS, type: 'text/javascript; charset=utf-8' }),
@@ -417,7 +518,7 @@ async function startFixtureServer(options = {}) {
       return
     }
     const resolved = route()
-    response.writeHead(200, { 'content-type': resolved.type })
+    response.writeHead(resolved.status ?? 200, { 'content-type': resolved.type })
     if (resolved.slow !== undefined) {
       // Two chunks with a pause between them: the browser commits the document on the
       // first, and only sees `load` after the second.

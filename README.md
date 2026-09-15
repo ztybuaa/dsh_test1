@@ -40,7 +40,9 @@ npm test
 `AdoptedViewSession` 领养那块视图,然后按票分层断言:T1 的身份与领养、T2 的面板矩形 → 视图摆放、
 T3 的 `ref` 与 bounds、T4 的各类动作**外部效果**(点击改 DOM、填表后 `value` 真是那个值、Enter 触发提交、
 悬停才出现的东西真的出现、下拉选中的值、拖拽后顺序与几何都变了、滚动到元素用页面自己的
-`getBoundingClientRect()` 验证)以及**四类失败原因各自被区分开**。
+`getBoundingClientRect()` 验证)以及**四类失败原因各自被区分开**、T5 的**读页面**(正文与页面自己的
+`innerText` 逐字一致且按上限截断、表达式取到只有页面知道的值、接口数据与页面侧记录的实收载荷一致、
+截图像素由测试自己解析且作为附件交付、控制台错误与失败请求先由页面自证再被工具读到)。
 
 ## 直接用外壳
 
@@ -128,6 +130,25 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 
 另有一类 `stale-ref`:`ref` 属于视图已经不再显示的那个文档(导航之后),错误会给出当前地址。
 
+### 让 Agent 看懂那一格(T5 观测面)
+
+快照仍然只列**能操作的元素**(ADR-0005,历史上把完整可访问性树塞进快照曾膨胀到约 10MB 把会话卡死),
+所以"页面说了什么"是**按需读**的:
+
+| 工具 | 作用 | 关键点 |
+|---|---|---|
+| `browser_extract` | 读页面渲染出来的正文(页面自己的 `innerText`) | 默认上限 20000 字符;超限就截断,并把 `truncated` 与 `totalChars` 作为数据一起返回,不用猜"是不是全的" |
+| `browser_evaluate` | 在页面里求值一条**只读**表达式并返回结果 | 用来读只活在 JS 里的状态;**不是**绕过 `ref` 的捷径 —— 要点击/输入/悬停仍用快照的 `ref`(ADR-0001) |
+| `browser_json` | 页面通过 `fetch`/XHR 加载到的 JSON(`[{url,status,body}]`) | 页面没渲染出来、数据只在响应里时用它;4xx/5xx **不算数据**,由 `browser_diagnostics` 带状态码报告 |
+| `browser_screenshot` | 截当前视图为 PNG,**把图片本身作为附件交付**(同时给出落盘路径) | 尺寸 = 视口 CSS 像素 × 显示器缩放(页面里的 `devicePixelRatio`);走 Playwright 截图 API,**没有** screencast |
+| `browser_diagnostics` | 页面自己报的**控制台消息**(含未捕获异常)与**失败请求**(方法、URL、状态码、响应摘要) | 页面空白/内容缺失/动作没反应时先看它 |
+
+`browser_navigate` 仍是注册表里的第 0 个工具;新增的观测工具只读,不改变元素定位方式。
+
+> 实测坑(记录在 `docs/research/cdp-screenshot-stall.md`):这块视图上**单发**一次截图常常**永远不返回**,
+> 而第二个请求会让两次都完成(并发发两个,两个都在 ~0.6s 内返回);`scale: 'css'` 在页面有滚动条时
+> 给出 439×799(视口是 440×800)。因此截图走**默认的 device 缩放**,并在超时时有界重试。
+
 ## 身份握手为什么这么做
 
 同一个 Electron 应用里,**窗口页面和视图都是 CDP 的 `type: "page"`**,所以类型和 URL 都不能用来
@@ -146,23 +167,23 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 | `shell/geometry.js` | 摆放决定:面板矩形 ↔ 窗口裁剪,以及"没有矩形"与"没有地方"的区别 |
 | `shell/panel-rect.js` | 面板测量的**唯一事实源**:`getBoundingClientRect()` → 上报,null = 没有矩形 |
 | `shell/preload.js` | 矩形通道的页面半边:`contextBridge` 暴露 `window.__dshDesktopView`(只给窗口) |
-| `shell/fixture.js` | 内置离线夹具站点(回环、系统挑端口):`/shell`、`/view`、`/other`、`/panel`、`/snapshot`、`/snapshot-many`、`/slow`、`/interact` |
+| `shell/fixture.js` | 内置离线夹具站点(回环、系统挑端口):`/shell`、`/view`、`/other`、`/panel`、`/snapshot`、`/snapshot-many`、`/slow`、`/interact`、`/observe` + `/api/observe`、`/api/missing` |
 | `shell/cdp.js` | 端点等待、`/json/list`、`webContents` ↔ `targetId` 身份映射 |
 | `src/client-body.js` | 客户端半边:右栏 tab 类型(含 guide 入口)+ body + 面板组件,由构建脚本拼进 `client.js` |
-| `src/session.ts` | 领养模式会话:导航 / 快照 / 按 `ref` 的动作(点击、输入、按键、悬停、下拉、拖拽、滚动、三种等待)与失败原因定性 |
-| `src/tools.ts` | 工具面:`browser_navigate`、`browser_snapshot`,以及 T4 的 `browser_click` / `_type` / `_type_keys` / `_press_key` / `_hover` / `_select` / `_drag` / `_scroll` / `_wait` |
-| `src/index.ts` | 插件入口:`name` / `inject` / `Config` / `apply` |
+| `src/session.ts` | 领养模式会话:导航 / 快照 / 按 `ref` 的动作与失败原因定性,以及 T5 的观测(读正文、求值、抓 JSON 响应、控制台与失败请求、截图) |
+| `src/tools.ts` | 工具面:`browser_navigate`、`browser_snapshot`,T4 的 `browser_click` / `_type` / `_type_keys` / `_press_key` / `_hover` / `_select` / `_drag` / `_scroll` / `_wait`,T5 的 `browser_extract` / `_evaluate` / `_json` / `_screenshot` / `_diagnostics` |
+| `src/index.ts` | 插件入口:`name` / `inject`(`tools` + `attachments`) / `Config` / `apply` |
 | `scripts/build-client.mjs` | 把 `shell/panel-rect.js` + `src/client-body.js` 拼成 `client.js`(带 `--check`) |
 | `client.js` | **生成文件**:宿主 `/plugins/…` 拉取的那一份,别手改 |
 | `tests/adopt-view.spec.ts` | T1 接缝测试 + `--dsh` 环境变量与 profile 交接测试 |
 | `tests/panel-placement.spec.ts` | T2 接缝测试:面板报矩形 → 外壳摆放视图 → 视图自己被读回 |
 | `tests/snapshot.spec.ts` | T3 接缝测试:ref 与 bounds,以及跨文档的 ref 失效语义 |
 | `tests/interaction.spec.ts` | T4 接缝测试:各类动作的外部效果,以及四类失败原因各自被区分开 |
+| `tests/observation.spec.ts` | T5 接缝测试:正文/表达式/接口数据/截图附件/控制台与失败请求,每条都有独立读回 |
 | `tests/client-half.spec.ts` | 客户端半边:宿主加载契约、tab 类型 + guide 入口、body、生成物是否陈旧 |
 | `tests/shell-harness.ts` | 测试用外壳进程夹具 |
 | `tests/fixtures/fake-dsh-web.mjs` | 假的 DSH,用来验证环境变量与 argv 交接 |
 
 ## 本仓库**不**包含
 
-screencast、MJPEG、`webServer`、mirror、`dsh-better-sidebar`、任务空间、观测工具(截图 / 读正文 /
-执行表达式 / 接口数据,T5)、光标覆盖层(T8)—— 都是被淘汰或属于后续票的东西。
+screencast、MJPEG、`webServer`、mirror、`dsh-better-sidebar`、任务空间、光标覆盖层(T8)—— 都是被淘汰或属于后续票的东西。
