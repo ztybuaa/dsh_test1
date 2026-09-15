@@ -84,12 +84,74 @@ export interface ViewHandshake {
     /** Blink features this shell disables, as Electron's own command line reports them. */
     disableBlinkFeatures: string
   }
+  /**
+   * Where the plugin and the shell exchange task-space requests and state (ADR-0010).
+   *
+   * The directory is derived from the profile the shell was given, never invented here.
+   */
+  spaceChannel: {
+    /** Channel directory under the shell's profile. */
+    dir: string
+    /** The plugin writes its desired state here. */
+    requestFile: string
+    /** The shell writes what is really true here. */
+    stateFile: string
+    /** Partitions whose directories are to be removed at the next startup. */
+    pendingDeletionFile: string
+    /** Protocol version, so a stale pair can be told apart. */
+    protocol: number
+  }
+  /** Which space fills the panel rectangle at startup. */
+  activeSpace: string
+  /** Every task space that exists at startup, each value read back from Electron. */
+  spaces: ViewSpaceRecord[]
+}
+
+/**
+ * One task space as the shell publishes it.
+ *
+ * `partition` is what the shell *asked* for; `storagePath` is the read-back that can contradict it —
+ * Electron's `Session` exposes no `getPartition()`, so where the storage really is is the answer.
+ */
+export interface ViewSpaceRecord {
+  /** Space name. */
+  name: string
+  /** The partition the shell put this space's view on. */
+  partition: string
+  /** `session.getStoragePath()` for that partition. */
+  storagePath: string
+  /** `session.isPersistent()`: whether that partition is written to disk. */
+  persistent?: boolean
+  /** CDP target id of this space's view. */
+  targetId?: string
+  /** The address the space's view currently has. */
+  url?: string
+  /** `view.getVisible()`, as Electron answers it. */
+  visible?: boolean
+  /** Electron webContents id of the space's view. */
+  webContentsId?: number
+  /** Whether this is the space filling the panel rectangle. */
+  active?: boolean
+  /** Whether this is the default space (the T6 pane, which cannot be closed). */
+  isDefault?: boolean
+  /** How many cookies that space's session really holds. */
+  cookieCount?: number
+  /** What the shell really copied in when it created the space, read back from Electron. */
+  inherited?: {
+    sourceUrl: string
+    cookiesOffered: number
+    cookiesInSpace: number
+    localStorageOrigin: string | null
+    localStorageKeys: number
+  }
 }
 
 /** One view placement the shell applied, as published on stdout. */
 export interface ViewPlacement {
   /** What asked for this placement (`initial-bounds`, `panel-report`, `panel-none`, `window-resize`, …). */
   cause: string
+  /** Which space's view this placement is about. */
+  space?: string
   /** What the shell *decided*: whether the view should be shown. */
   visible: boolean
   /** The rectangle the panel asked for, or null when it asked for none. */

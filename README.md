@@ -106,6 +106,7 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 | `DSH_DESKTOP_VIEW_CDP` | 外壳的可编程端点,例如 `http://127.0.0.1:63668` |
 | `DSH_DESKTOP_VIEW_TARGET` | 视图的 CDP `targetId`(身份,不是地址) |
 | `DSH_DESKTOP_VIEW_URL` | 视图当时的地址(仅兜底识别用) |
+| `DSH_DESKTOP_VIEW_SPACES` | 任务空间控制通道的目录(默认空间所在档案下的 `spaces\`),见下文 T7 一节 |
 
 `--help` 有全部开关。
 
@@ -140,6 +141,44 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 **不要顺手加 `proxyBypassRules`**:实测 `<-loopback>` 会把隐含 bypass **反过来**,连回环都推进代理;
 只列 `localhost,127.0.0.1` 又会漏掉 `[::1]`。原始证据在
 `docs/research/browser-identity-and-profile.md` 第 6 节。
+
+### 任务空间(T7):每个任务一个罐子,切换空间 = 换掉那一格里的视图
+
+一个**任务空间** = 一块自己的原生视图,跑在**自己的持久 partition** 上。所以两个空间可以在
+**同一个站点各自登录**,互相看不到对方的 cookie 与 localStorage;所有 `browser_*` 工具**只作用于
+当前空间**。用**一个**工具管它们:
+
+| 工具 | 作用 |
+|---|---|
+| `browser_space` | `action: "list"` 列出空间与当前空间;`"create"`(带 `name`)建一个新的、继承默认档案的登录态、并切过去;`"use"` 切到已有的;`"close"` 关掉一个(释放页面 + 抹掉存储数据) |
+
+默认空间就是 T6 那一格,**partition 原样是 `persist:dsh-view`**(改它等于把用户已经登录的档案弄丢);
+新空间用 `persist:dsh-view-space-<名字>`,与默认空间**同时存在**、各自持有自己的页面,
+**只有当前空间那块是显示的**(切换 = 换掉填那一格矩形的那块视图,不是做标签条)。
+
+几条**量出来的**边界,别当成坑踩:
+
+- **"独立浏览器上下文"在 Electron 上不存在**。实测 `Target.getBrowserContexts` 回
+  `{browserContextIds:[], defaultBrowserContextId:"…"}`、`Target.createBrowserContext` 报
+  `Failed to create browser context.`、`Target.createTarget` 报 `Not supported` ——
+  所有 partition 都挤在**同一个** CDP browser context 里,所以 `browser.newContext()` 用不了。
+  隔离强度是 **partition 级**(cookie / localStorage / sessionStorage / 缓存都隔离)。
+- **继承登录态: cookie 全量、localStorage 只覆盖新空间落脚的那个 origin**。
+  cookie 能枚举也能整批写(`cookies.set` **必须带 `url`**,只给 domain 会抛
+  `Missing required option 'url'`);localStorage **没有任何 API 能枚举"哪些 origin 有它"**,
+  而且给一个本 partition 没有 frame 的 origin 写会被 CDP 拒绝(`Frame not found for the given storage id`)。
+  所以默认档案里**其它 origin 的 localStorage 不会**跟过去 —— 事实与取舍见 `docs/adr/0010` 第 3 节。
+- **关闭空间: 页面立即释放、存储数据立即抹掉、磁盘目录下次启动才删**。实测关掉视图后目标立刻从
+  `/json/list` 消失、`clearStorageData()` 之后同 partition 的新页面读不到任何旧 cookie/localStorage;
+  但目录在**进程存活期间删不掉**(Windows 文件锁,15 个子项里 11 个 EPERM,`clearCache()` 也解不开),
+  只能记进 `spaces\pending-deletion.json`,由**下一次启动**在任何 `session.fromPartition` 之前删掉。
+  这三件事分开写、也分开测。
+
+**创建/关闭走一条外壳侧的文件通道**(ADR-0003 明令外壳不开端口):插件写
+`<档案目录>\spaces\request.json`(期望状态,带单调递增的 id),外壳轮询后 reconcile,把**读回来的**
+实际状态写进 `state.json` 并打印一行 `DSH_SHELL SPACES {...}`;工具**阻塞等 state 报告该 id 已处理**,
+所以从工具视角它是同步的,外壳不在时是一个说得清的超时错误。原始测量(含 `newContext` 的逐条 CDP
+回答、cookie/localStorage 的能力边界、EPERM 的逐项清单)在 `docs/research/task-space-isolation.md`。
 
 ### 让 Agent 操作那一格(T4 交互面)
 
@@ -208,10 +247,12 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 | `shell/fixture.js` | 内置离线夹具站点(回环、系统挑端口):`/shell`、`/view`、`/other`、`/panel`、`/snapshot`、`/snapshot-many`、`/slow`、`/interact`、`/observe` + `/api/observe`、`/api/missing` |
 | `shell/cdp.js` | 端点等待、`/json/list`、`webContents` ↔ `targetId` 身份映射 |
 | `shell/identity.js` | 那一格的浏览器身份(纯逻辑,不 require electron):专属档案 partition、去掉产品标记的 UA、自动化 Blink 特性名、代理读回用的探针地址 |
+| `shell/spaces.js` | 任务空间的命名与生命周期判断(纯逻辑,不 require electron):名字形状、partition ↔ 名字、控制通道三个文件的位置、请求归一化、reconcile 差量 |
+| `src/spaces.ts` | 插件侧的任务空间:期望状态怎么算(纯函数 `planRequest`)、原子写请求、等外壳处理完、按当前空间解析会话 |
 | `src/client-body.js` | 客户端半边:右栏 tab 类型(含 guide 入口)+ body + 面板组件,由构建脚本拼进 `client.js` |
 | `src/session.ts` | 领养模式会话:导航 / 快照 / 按 `ref` 的动作与失败原因定性,以及 T5 的观测(读正文、求值、抓 JSON 响应、控制台与失败请求、截图) |
-| `src/tools.ts` | 工具面:`browser_navigate`、`browser_snapshot`,T4 的 `browser_click` / `_type` / `_type_keys` / `_press_key` / `_hover` / `_select` / `_drag` / `_scroll` / `_wait`,T5 的 `browser_extract` / `_evaluate` / `_json` / `_screenshot` / `_diagnostics` |
-| `src/index.ts` | 插件入口:`name` / `inject`(`tools` + `attachments`) / `Config` / `apply` |
+| `src/tools.ts` | 工具面:`browser_navigate`、`browser_snapshot`,T4 的 `browser_click` / `_type` / `_type_keys` / `_press_key` / `_hover` / `_select` / `_drag` / `_scroll` / `_wait`,T5 的 `browser_extract` / `_evaluate` / `_json` / `_screenshot` / `_diagnostics`,T7 的 `browser_space` |
+| `src/index.ts` | 插件入口:`name` / `inject`(`tools` + `attachments`) / `Config` / `apply`;`adopt()` 是唯一的会话缝,按**当前空间**解析 |
 | `scripts/build-client.mjs` | 把 `shell/panel-rect.js` + `src/client-body.js` 拼成 `client.js`(带 `--check`) |
 | `client.js` | **生成文件**:宿主 `/plugins/…` 拉取的那一份,别手改 |
 | `tests/adopt-view.spec.ts` | T1 接缝测试 + `--dsh` 环境变量与 profile 交接测试 |
@@ -220,10 +261,11 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 | `tests/interaction.spec.ts` | T4 接缝测试:各类动作的外部效果,以及四类失败原因各自被区分开 |
 | `tests/observation.spec.ts` | T5 接缝测试:正文/表达式/接口数据/截图附件/控制台与失败请求,每条都有独立读回 |
 | `tests/identity.spec.ts` | T6 接缝测试:UA 与读回一致、两个页面的 `navigator.webdriver`、档案互不可见、优雅重启后登录态还在、代理两半(含真实日志代理) |
+| `tests/spaces.spec.ts` | T7 接缝测试:空间命名与请求的纯逻辑、创建/使用/关闭、页面与存储的释放(含重启后目录真的被删)、同站两空间互不影响、继承默认档案及其边界、工具只作用于当前空间 |
 | `tests/client-half.spec.ts` | 客户端半边:宿主加载契约、tab 类型 + guide 入口、body、生成物是否陈旧 |
 | `tests/shell-harness.ts` | 测试用外壳进程夹具 |
 | `tests/fixtures/fake-dsh-web.mjs` | 假的 DSH,用来验证环境变量与 argv 交接 |
 
 ## 本仓库**不**包含
 
-screencast、MJPEG、`webServer`、mirror、`dsh-better-sidebar`、任务空间、光标覆盖层(T8)—— 都是被淘汰或属于后续票的东西。
+screencast、MJPEG、`webServer`、mirror、`dsh-better-sidebar`、光标覆盖层(T8)—— 都是被淘汰或属于后续票的东西。

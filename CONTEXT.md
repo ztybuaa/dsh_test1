@@ -59,6 +59,7 @@ _Avoid_: 盒子模型、包围盒、坐标（太泛）
 **task space（任务空间）**:
 一次任务独占的浏览器状态（上下文 + cookie/存储），任务之间互不串扰；新空间可继承默认档案的登录态；关闭即释放。
 _Avoid_: 会话、沙箱、隔离区
+_注_: 宿主 Electron **没有**可创建的 CDP browser context（实测 `Target.createBrowserContext` 失败、所有 partition 同属一个默认 context），所以它的实体是**一个 partition + 一块自己的原生视图**（ADR-0010）。"关闭即释放"要拆成三件事说：**页面**立即释放、**存储数据**立即抹掉、**磁盘目录**在进程存活期间删不掉（Windows 文件锁），由下次启动清理。
 
 **persistent profile（持久登录档案）**:
 一个持久化的浏览器档案目录，登录态/cookie 存于此、跨外壳重启保留。

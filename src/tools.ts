@@ -10,6 +10,7 @@ import type {
   PageSnapshot,
 } from './session.ts'
 import { cutText } from './session.ts'
+import type { SpaceAction, SpaceCommandOutcome } from './spaces.ts'
 
 /** Canonical output of `browser_navigate`: where the view ended up. */
 const navigationSchema = {
@@ -113,6 +114,91 @@ function renderEvaluated(value: unknown): string {
 
 /** The schema of a tool whose whole value is one string. */
 const textSchema = { type: 'string' } as const
+
+/**
+ * Canonical output of `browser_space`.
+ *
+ * Every field is what the **shell** published after handling the request, read back from Electron —
+ * `storagePath` above all, because Electron's `Session` exposes no `getPartition()` and "where the
+ * storage really is" is the one answer that can contradict the partition the shell meant to use.
+ */
+const spaceSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    action: { type: 'string', required: true },
+    active: { type: 'string', required: true },
+    message: { type: 'string', required: true },
+    spaces: {
+      type: 'array',
+      required: true,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string', required: true },
+          partition: { type: 'string', required: true },
+          storagePath: { type: 'string', required: true },
+          targetId: { type: 'string' },
+          url: { type: 'string', required: true },
+          visible: { type: 'boolean', required: true },
+          active: { type: 'boolean', required: true },
+          isDefault: { type: 'boolean', required: true },
+          cookieCount: { type: 'number', required: true },
+          inherited: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              sourceUrl: { type: 'string', required: true },
+              cookiesInSpace: { type: 'number', required: true },
+              localStorageOrigin: { type: 'string' },
+              localStorageKeys: { type: 'number', required: true },
+            },
+          },
+        },
+      },
+    },
+  },
+} as const
+
+/** Render the space table as the lines the model reads. */
+function renderSpace(_args: unknown, value: SpaceCommandValue): { type: 'text'; text: string }[] {
+  const lines = [value.message, `Active space: ${value.active}`]
+  for (const space of value.spaces) {
+    const marks = [space.active ? 'active' : undefined, space.isDefault ? 'default' : undefined]
+      .filter((mark) => mark !== undefined)
+      .join(', ')
+    lines.push(
+      `  ${space.name}${marks === '' ? '' : ` (${marks})`} — ${space.url === '' ? '(no page)' : space.url}` +
+        ` partition=${space.partition} storage=${space.storagePath} cookies=${space.cookieCount}`,
+    )
+  }
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/** The schema-shaped value `browser_space` returns. */
+interface SpaceCommandValue {
+  action: string
+  active: string
+  message: string
+  spaces: Array<{
+    name: string
+    partition: string
+    storagePath: string
+    targetId?: string
+    url: string
+    visible: boolean
+    active: boolean
+    isDefault: boolean
+    cookieCount: number
+    inherited?: {
+      sourceUrl: string
+      cookiesInSpace: number
+      localStorageOrigin?: string
+      localStorageKeys: number
+    }
+  }>
+}
 
 /**
  * Canonical output of `browser_extract`.
@@ -307,6 +393,28 @@ export interface ToolDependencies {
   attachments?: ImageAttachmentSink
   /** Directory a screenshot lands in when the caller names no path. Defaults to the process cwd. */
   screenshotDir?: string
+  /**
+   * The task spaces the shell is hosting. Absent when the plugin runs somewhere with no shell to
+   * ask (a browser, a deployment with no space channel configured) — and then `browser_space`
+   * refuses with a message saying so rather than pretending there is one space.
+   */
+  spaces?: SpaceController
+}
+
+/**
+ * The slice of the task-space manager the space tool needs.
+ *
+ * Narrow on purpose, and structural: the tool needs "run this action and tell me what the shell
+ * answered", not the channel, the sessions, or the parsing in {@link SpaceManager}.
+ */
+export interface SpaceController {
+  /**
+   * Run one space action against the shell.
+   * @param action - `list`, `create`, `use`, or `close`.
+   * @param name - the space the action is about; unused by `list`.
+   * @returns what the shell published after handling it.
+   */
+  command(action: SpaceAction, name?: string): Promise<SpaceCommandOutcome>
 }
 
 
@@ -684,6 +792,77 @@ export function desktopViewTools(
       async execute(): Promise<PageDiagnostics> {
         const session = await adopt()
         return session.diagnostics()
+      },
+    }),
+    defineTool({
+      name: 'browser_space',
+      description:
+        'Manage the task spaces of the desktop browser. A task space is a browser state of its own — ' +
+        'its own cookies and storage — so two spaces can be logged in to the same site without seeing ' +
+        'each other. Every other browser_* tool acts on the **active** space only. Actions: "list" shows ' +
+        'the spaces and which one is active; "create" makes a new one (named by `name`), inherits the ' +
+        "default space's login state, and makes it active; \"use\" switches to an existing one; \"close\" " +
+        "releases a space's page and erases its storage (the default space cannot be closed).",
+      parameters: {
+        action: {
+          type: 'string',
+          required: true,
+          description: 'One of "list", "create", "use", "close"',
+        },
+        name: {
+          type: 'string',
+          description:
+            'The space to act on: 1-32 characters of lowercase letters, digits and dashes. Required ' +
+            'for create/use/close; not used by list.',
+        },
+      },
+      output: { schema: spaceSchema, render: renderSpace },
+      async execute(args): Promise<SpaceCommandValue> {
+        const controller = deps.spaces
+        if (controller === undefined) {
+          throw new Error(
+            'browser-view: browser_space has no shell to manage spaces in — this plugin was mounted ' +
+              'without a task-space channel (no desktop shell published one, and no `spacesDir` was ' +
+              'configured), so there is exactly one browser view and no way to create another. Only ' +
+              'the shell can create a view: Playwright cannot (ADR-0002).',
+          )
+        }
+        const action = args.action as SpaceAction
+        if (action !== 'list' && action !== 'create' && action !== 'use' && action !== 'close') {
+          throw new Error(
+            `browser-view: browser_space needs action to be "list", "create", "use" or "close" ` +
+              `(got ${JSON.stringify(args.action)})`,
+          )
+        }
+        const outcome = await controller.command(action, args.name)
+        return {
+          action: outcome.action,
+          active: outcome.state.active,
+          message: outcome.message,
+          spaces: outcome.state.spaces.map((space) => ({
+            name: space.name,
+            partition: space.partition,
+            storagePath: space.storagePath,
+            ...(space.targetId !== undefined ? { targetId: space.targetId } : {}),
+            url: space.url,
+            visible: space.visible,
+            active: space.active,
+            isDefault: space.isDefault,
+            cookieCount: space.cookieCount,
+            ...(space.inherited !== undefined
+              ? {
+                  inherited: {
+                    sourceUrl: space.inherited.sourceUrl,
+                    cookiesInSpace: space.inherited.cookiesInSpace,
+                    ...(space.inherited.localStorageOrigin !== null
+                      ? { localStorageOrigin: space.inherited.localStorageOrigin }
+                      : {}),
+                    localStorageKeys: space.inherited.localStorageKeys,
+                  },
+                }
+              : {}),
+          })),
+        }
       },
     }),
   ]

@@ -1,0 +1,732 @@
+import { createServer } from 'node:http'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import type { Page } from 'playwright'
+import { SpaceManager, parseSpaceState, planRequest, spaceChannelFrom, type SpaceState } from '../src/spaces.ts'
+import { desktopViewTools } from '../src/tools.ts'
+import { pageForTarget, shellRecord, startShell, type ShellProcess } from './shell-harness.ts'
+
+/**
+ * T7 (票 #8) — 任务空间隔离。四条验收各自有一处**独立读回**，而且读回的东西不是实现自己的中间量：
+ *
+ *  1. **能创建/使用/关闭；关闭后页面与存储被释放** —— 空间表来自外壳发布的 `DSH_SHELL SPACES`
+ *     与它写的 state 文件；"页面还在不在"用**直接问 CDP 端点 `/json/list`**回答（不是问插件），
+ *     并额外试一次"按 targetId 领养"（领不到就是真的没了）；"存储被释放"用**重建同名空间后
+ *     读页面自己渲染出来的登录状态**回答；"目录"这一半**如实**断言进程内删不掉、下次启动才删掉。
+ *  2. **两个空间在同一站点登录互不影响** —— 先断言两者的 `location.origin` **逐字相同**
+ *     （照 `tests/identity.spec.ts` 那条的写法），否则"看不见"能被 origin 不同解释；然后让两个
+ *     空间在同一站点各自登录，用**页面自己渲染出来的 `#who`** 读回。
+ *  3. **新空间继承默认档案的登录态** —— 先在默认空间登录（cookie 一处、localStorage 一处），
+ *     再创建新空间，读回它自己渲染的 `#who`。**边界单独一条**：默认档案里**另一个 origin** 的
+ *     localStorage **不会**被继承（这是实测出来的能力边界，见 ADR-0010 §3）。
+ *  4. **所有工具只作用于当前空间** —— 用**真的工具**（`desktopViewTools`）在一个空间里导航，
+ *     然后**绕开插件**、通过另一条 CDP 连接读另一个空间的页面，证明它一步没动。
+ *
+ * 纯逻辑那部分（空间命名、请求归一化、reconcile、"期望状态"怎么算）不起外壳也能读回，
+ * 所以它单独一组用例。
+ */
+
+const require = createRequire(import.meta.url)
+
+/** `shell/spaces.js`：空间命名与生命周期判断，纯逻辑，不 require('electron')。 */
+const shellSpaces = require('../shell/spaces.js') as {
+  DEFAULT_PARTITION: string
+  DEFAULT_SPACE: string
+  SPACE_PROTOCOL: number
+  isValidSpaceName: (name: unknown) => boolean
+  parseRequest: (raw: unknown) => { ok: true; request: { id: number; active: string; spaces: string[] } } | { ok: false; error: string }
+  partitionDirectoryName: (partition: string) => string
+  partitionForSpace: (name: string) => string
+  reconcile: (input: { current: string[]; request: { active: string; spaces: string[] } }) => {
+    create: string[]
+    close: string[]
+    activate: string
+  }
+  spaceChannel: (userDataDir: string) => {
+    dir: string
+    requestFile: string
+    stateFile: string
+    pendingDeletionFile: string
+    protocol: number
+  }
+  spaceForPartition: (partition: string) => string | undefined
+  spaceStoragePath: (userDataDir: string, name: string) => string
+}
+
+/** 工具的执行上下文这些工具用不到；给个占位。 */
+const IGNORED_EXEC = undefined as unknown as Parameters<ReturnType<typeof desktopViewTools>[number]['execute']>[1]
+
+/** 外壳写的 state 文件读回来的形状（这里**自己**解析，不用被测的解析器）。 */
+interface RawSpaceRecord {
+  name: string
+  partition: string
+  storagePath: string
+  persistent: boolean
+  targetId?: string
+  url: string
+  visible: boolean
+  webContentsId: number
+  active: boolean
+  isDefault: boolean
+  cookieCount: number
+  inherited?: {
+    sourceUrl: string
+    cookiesOffered: number
+    cookiesInSpace: number
+    localStorageOrigin: string | null
+    localStorageKeys: number
+  }
+}
+
+/** 外壳写的实际状态。 */
+interface RawSpaceState {
+  protocol: number
+  requestId: number
+  error: string | null
+  active: string
+  userDataDir: string
+  cause?: string
+  spaces: RawSpaceRecord[]
+  lastRequest?: { id: number; create: string[]; close: string[]; activate: string; error: string | null }
+}
+
+/**
+ * 一个把"登录态放在哪"分开的站点。
+ *
+ * 两个页面渲染**同一件事**（`#who` 里写着自己是谁），但一个从 cookie 读、一个从 localStorage 读。
+ * 页面自己算出来的这句话就是"登录态在不在"的独立证据：测试不告诉它答案，它从自己的存储里读。
+ *
+ * @param source - 从哪儿读 token。
+ * @returns 页面 HTML。
+ */
+function loginPage(source: 'cookie' | 'local'): string {
+  const read =
+    source === 'cookie'
+      ? "const match = /(?:^|; )token=([^;]*)/.exec(document.cookie); const token = match ? match[1] : null"
+      : "const token = localStorage.getItem('token')"
+  return (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>login-site</title></head><body>' +
+    `<h1 id="who"></h1><script>${read}; document.getElementById('who').textContent = token === null ? 'signed out' : 'signed in as ' + token</script>` +
+    '</body></html>'
+  )
+}
+
+/** 一个测试自己的站点；同一个处理器挂在**两个回环字面量**上，于是它有两个 origin。 */
+interface TestSite {
+  /** 第一个 origin（也是空间默认落脚的地方）。 */
+  origin: string
+  /**
+   * 第二个 origin，同一个站点、不同的 host。
+   *
+   * 必须是不同的 **host** 而不只是不同的端口：cookie 是按**域**存的、不认端口，所以
+   * `127.0.0.1:8001` 与 `127.0.0.1:8002` 共用同一个 cookie 罐，用它去证明"跨 origin 的 cookie 也继承"
+   * 会得出一个假的结论。而 `127.0.0.2` 与 `127.0.0.1` 既是两个 origin，又是两个域。
+   */
+  altOrigin: string
+  close: () => Promise<void>
+}
+
+/**
+ * 起一个站点：同一个处理器绑在 `127.0.0.1` 与 `127.0.0.2` 两个回环字面量上。
+ *
+ * 两个地址都是回环，不牵扯 DNS 也不对外暴露；但它们对浏览器是**两个 origin、两个 cookie 域**。
+ *
+ * @returns 两个 origin 与关闭函数。
+ */
+async function startSite(): Promise<TestSite> {
+  const handler = (request: import('node:http').IncomingMessage, response: import('node:http').ServerResponse) => {
+    const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    if (path === '/cookie-site') response.end(loginPage('cookie'))
+    else if (path === '/local-site') response.end(loginPage('local'))
+    else response.end('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>other</title></head><body><p>other</p></body></html>')
+  }
+  const listen = async (host: string): Promise<{ server: import('node:http').Server; origin: string }> => {
+    const server = createServer(handler)
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, host, resolve)
+    })
+    const address = server.address()
+    const port = typeof address === 'object' && address !== null ? address.port : 0
+    return { server, origin: `http://${host}:${port}` }
+  }
+  const primary = await listen('127.0.0.1')
+  const alternate = await listen('127.0.0.2')
+  return {
+    origin: primary.origin,
+    altOrigin: alternate.origin,
+    close: async () => {
+      await new Promise<void>((resolve) => primary.server.close(() => resolve()))
+      await new Promise<void>((resolve) => alternate.server.close(() => resolve()))
+    },
+  }
+}
+
+/**
+ * 直接读外壳写的 state 文件。
+ *
+ * 这里**不用** `src/spaces.ts` 的解析器：那是被测代码。读的是原始 JSON。
+ *
+ * @param shell - 正在跑的外壳。
+ * @returns 状态。
+ */
+function readState(shell: ShellProcess): RawSpaceState {
+  return JSON.parse(readFileSync(shell.handshake.spaceChannel.stateFile, 'utf8')) as RawSpaceState
+}
+
+/** 一个空间在外壳发布的状态里的记录。 */
+function spaceOf(state: RawSpaceState, name: string): RawSpaceRecord | undefined {
+  return state.spaces.find((space) => space.name === name)
+}
+
+/** 直接问外壳的 CDP 端点有哪些 page 目标。 */
+async function pageTargets(cdpUrl: string): Promise<Array<{ id: string; type: string; url: string; title: string }>> {
+  const response = await fetch(`${cdpUrl}/json/list`)
+  const list = (await response.json()) as Array<{ id: string; type: string; url: string; title: string }>
+  return list.filter((target) => target.type === 'page')
+}
+
+/** 等外壳发布的某个事实出现。 */
+async function waitUntil(predicate: () => boolean, what: string, timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((settle) => setTimeout(settle, 100))
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
+/**
+ * 通过**另一条** CDP 连接拿到某个空间的页面，做完事再断开。
+ *
+ * 这条路径完全绕开 `SpaceManager`：所以"另一个空间没被动过"是用插件看不见的一双眼睛读回来的。
+ *
+ * @param shell - 正在跑的外壳。
+ * @param name - 空间名。
+ * @param action - 拿到页面后要做的事。
+ * @returns `action` 的返回值。
+ */
+async function withSpacePage<T>(shell: ShellProcess, name: string, action: (page: Page) => Promise<T>): Promise<T> {
+  const record = spaceOf(readState(shell), name)
+  if (record?.targetId === undefined) throw new Error(`the shell published no target id for the space "${name}"`)
+  const opened = await pageForTarget(shell.handshake.cdpUrl, record.targetId)
+  try {
+    return await action(opened.page)
+  } finally {
+    await opened.browser.close()
+  }
+}
+
+/** 在一个空间的页面里用 cookie 登录，并读回页面自己渲染出来的那句话。 */
+async function signInWithCookie(page: Page, url: string, token: string): Promise<string | null> {
+  await page.goto(url)
+  await page.evaluate((value: string) => {
+    document.cookie = `token=${value}; max-age=3600; path=/`
+  }, token)
+  await page.reload()
+  return page.textContent('#who')
+}
+
+/** 在一个空间的页面里用 localStorage 登录，并读回页面自己渲染出来的那句话。 */
+async function signInWithLocalStorage(page: Page, url: string, token: string): Promise<string | null> {
+  await page.goto(url)
+  await page.evaluate((value: string) => {
+    localStorage.setItem('token', value)
+  }, token)
+  await page.reload()
+  return page.textContent('#who')
+}
+
+/** 只读一次"我现在是谁"。 */
+async function whoIs(page: Page, url: string): Promise<string | null> {
+  await page.goto(url)
+  return page.textContent('#who')
+}
+
+/**
+ * 从**浏览器侧**读一个空间在那个站点的 cookie。
+ *
+ * 走这个空间自己那块视图的 CDP 会话（`Network.getCookies`），所以读到的是那个 partition 的罐子，
+ * 而不是插件或外壳说的任何话。"这个空间真的有它自己的 cookie"因此是一件被独立读回来的事实。
+ *
+ * @param shell - 正在跑的外壳。
+ * @param name - 空间名。
+ * @param url - 要读 cookie 的地址。
+ * @returns cookie 的名字与值。
+ */
+async function cookiesInSpace(
+  shell: ShellProcess,
+  name: string,
+  url: string,
+): Promise<Array<{ name: string; value: string; domain: string }>> {
+  return withSpacePage(shell, name, async (page) => {
+    const session = await page.context().newCDPSession(page)
+    try {
+      const result = (await session.send('Network.getCookies', { urls: [url] })) as {
+        cookies: Array<{ name: string; value: string; domain: string }>
+      }
+      return result.cookies.map((cookie) => ({ name: cookie.name, value: cookie.value, domain: cookie.domain }))
+    } finally {
+      await session.detach()
+    }
+  })
+}
+
+/** 让面板报一个矩形，这样那一格里的视图是真的显示出来的（T2 的通道，这里只当它是输入）。 */
+async function reportPanelRect(shell: ShellProcess): Promise<void> {
+  if (shell.handshake.windowTargetId === undefined) throw new Error('the shell published no window target id')
+  const opened = await pageForTarget(shell.handshake.cdpUrl, shell.handshake.windowTargetId)
+  try {
+    await opened.page.evaluate(
+      `window.__dshDesktopView.setRect(${JSON.stringify({ x: 10, y: 20, width: 400, height: 600 })})`,
+    )
+  } finally {
+    await opened.browser.close()
+  }
+  await shell.waitForPlacement((placement) => placement.visible && placement.bounds !== null, 'a visible placement')
+}
+
+describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）', () => {
+  it('默认空间就是 T6 那一格：partition 一字不改，新空间从同一命名家族长出来', () => {
+    console.log('RAW partitions: ' + JSON.stringify({
+      default: shellSpaces.partitionForSpace('default'),
+      task1: shellSpaces.partitionForSpace('task-1'),
+      directoryName: shellSpaces.partitionDirectoryName('persist:dsh-view-space-task-1'),
+      storagePath: shellSpaces.spaceStoragePath('C:\\p', 'task-1'),
+      backAgain: shellSpaces.spaceForPartition('persist:dsh-view-space-task-1'),
+    }))
+    // T6 已经把那一格落在 `persist:dsh-view` 上，用户可能已经登录过了：改它就等于弄丢登录态。
+    expect(shellSpaces.partitionForSpace('default')).toBe('persist:dsh-view')
+    expect(shellSpaces.DEFAULT_PARTITION).toBe('persist:dsh-view')
+    expect(shellSpaces.partitionForSpace('task-1')).toBe('persist:dsh-view-space-task-1')
+    // partition ↔ 名字能来回；档案目录**从 userDataDir 推导**，不另立位置。
+    expect(shellSpaces.spaceForPartition('persist:dsh-view-space-task-1')).toBe('task-1')
+    expect(shellSpaces.spaceForPartition('persist:dsh-view')).toBe('default')
+    expect(shellSpaces.spaceForPartition('persist:something-else')).toBeUndefined()
+    expect(shellSpaces.spaceStoragePath('C:\\p', 'task-1')).toBe(join('C:\\p', 'Partitions', 'dsh-view-space-task-1'))
+  })
+
+  it('空间名同时是一个目录名，所以它的形状被钉死', () => {
+    const accepted = ['a', 'task-1', 't7', 'a2345678901234567890123456789012']
+    const rejected = ['', 'A', 'Task 1', 'task_1', 'task/1', 'task.1', '中文', '-lead', 'a'.repeat(33), '.', '..', 'task\\1']
+    console.log('RAW name check: ' + JSON.stringify({ accepted: accepted.map(shellSpaces.isValidSpaceName), rejected: rejected.map(shellSpaces.isValidSpaceName) }))
+    for (const name of accepted) expect(shellSpaces.isValidSpaceName(name), `${name} should be usable`).toBe(true)
+    for (const name of rejected) expect(shellSpaces.isValidSpaceName(name), `${name} should be refused`).toBe(false)
+  })
+
+  it('一条请求：先建、再关、默认空间永不关；丢掉默认空间的请求被拒绝', () => {
+    const diff = shellSpaces.reconcile({ current: ['default', 'old'], request: { active: 'fresh', spaces: ['default', 'fresh'] } })
+    console.log('RAW reconcile: ' + JSON.stringify(diff))
+    expect(diff.create).toEqual(['fresh'])
+    expect(diff.close).toEqual(['old'])
+    expect(diff.activate).toBe('fresh')
+
+    const refused = shellSpaces.parseRequest({ id: 3, active: 'task-1', spaces: ['task-1'] })
+    console.log('RAW refused request: ' + JSON.stringify(refused))
+    expect(refused.ok).toBe(false)
+    if (refused.ok) throw new Error('unreachable')
+    expect(refused.error).toContain('default')
+  })
+
+  it('请求归一化：非法名字与重复名字都有说得清的理由；合法请求原样通过', () => {
+    const cases = [
+      { id: 1, active: 'task-1', spaces: ['default', 'task-1'] },
+      { id: 0, active: 'default', spaces: ['default'] },
+      { id: 2, active: 'task-1', spaces: ['default', 'Task 1'] },
+      { id: 3, active: 'task-1', spaces: ['default', 'task-1', 'task-1'] },
+      { id: 4, active: 'ghost', spaces: ['default'] },
+      { id: 5, active: 'default', spaces: 'default' },
+    ]
+    const results = cases.map((entry) => shellSpaces.parseRequest(entry))
+    console.log('RAW parseRequest: ' + JSON.stringify(results))
+    expect(results[0]?.ok).toBe(true)
+    for (const result of results.slice(1)) expect(result.ok).toBe(false)
+  })
+
+  it('插件侧：create 顺手切过去、关掉当前空间时接班的是默认空间、名字不认识时说得清', () => {
+    const state = {
+      protocol: 1,
+      requestId: 7,
+      error: null,
+      active: 'default',
+      userDataDir: 'C:\\p',
+      spaces: [
+        { name: 'default' } as never,
+        { name: 'task-1' } as never,
+      ],
+    } satisfies SpaceState
+    const create = planRequest(state, { action: 'create', name: 'task-2' })
+    const use = planRequest(state, { action: 'use', name: 'task-1' })
+    const closeActiveSource = { ...state, active: 'task-1' }
+    const close = planRequest(closeActiveSource, { action: 'close', name: 'task-1' })
+    const unknown = planRequest(state, { action: 'use', name: 'nope' })
+    const closeDefault = planRequest(state, { action: 'close', name: 'default' })
+    console.log('RAW planRequest: ' + JSON.stringify({ create, use, close, unknown, closeDefault }))
+    expect(create).toEqual({ request: { id: 8, active: 'task-2', spaces: ['default', 'task-1', 'task-2'] } })
+    expect(use).toEqual({ request: { id: 8, active: 'task-1', spaces: ['default', 'task-1'] } })
+    // 关掉当前空间之后不能留下"当前空间指向一个不存在的空间"。
+    expect(close).toEqual({ request: { id: 8, active: 'default', spaces: ['default'] } })
+    expect('error' in unknown && unknown.error).toContain('no space named "nope"')
+    expect('error' in closeDefault && closeDefault.error).toContain('default')
+  })
+
+  it('读不动的 state 是"还没有状态"，不是"一个空间都没有"', () => {
+    const channel = spaceChannelFrom('C:\\p\\spaces')
+    console.log('RAW channel: ' + JSON.stringify(channel))
+    expect(channel?.stateFile).toBe(join('C:\\p\\spaces', 'state.json'))
+    expect(channel?.requestFile).toBe(join('C:\\p\\spaces', 'request.json'))
+    expect(spaceChannelFrom(undefined)).toBeUndefined()
+    expect(spaceChannelFrom('   ')).toBeUndefined()
+    expect(parseSpaceState('{ not json')).toBeUndefined()
+    expect(parseSpaceState('{}')).toBeUndefined()
+    expect(parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[{"name":1}]}')).toBeUndefined()
+    expect(parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[]}')?.active).toBe('default')
+  })
+})
+
+describe('T7 — 验收 1：能创建/使用/关闭；关闭后页面真的没了，存储被抹掉，目录下次启动才删', () => {
+  let shell: ShellProcess
+  let profile: string
+  let site: TestSite
+  let manager: SpaceManager
+  /** 被关掉的那个空间的 partition；"重启后目录真的不在了"要用它。 */
+  let closedPartition: string | undefined
+  let closedTargetId: string | undefined
+
+  beforeAll(async () => {
+    site = await startSite()
+    profile = mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-spaces-'))
+    shell = await startShell([], { userDataDir: profile })
+    manager = new SpaceManager({
+      dir: shell.handshake.spaceChannel.dir,
+      timeoutMs: 30_000,
+      maxElements: 200,
+      maxChars: 20_000,
+    })
+  }, 120_000)
+
+  afterAll(async () => {
+    if (shell !== undefined) await shell.stop()
+    if (site !== undefined) await site.close()
+    if (profile !== undefined) rmSync(profile, { recursive: true, force: true })
+  })
+
+  it('创建：真的多出一块视图，它有自己的 partition、自己的目标，而且能被单独领养', async () => {
+    const created = await manager.command('create', 'task-1')
+    const state = readState(shell)
+    const record = spaceOf(state, 'task-1')
+    console.log('RAW after create: ' + JSON.stringify({ record, state: { active: state.active, requestId: state.requestId } }))
+    expect(record).toBeDefined()
+    expect(state.active).toBe('task-1')
+    // partition 是外壳的意图，storagePath 是读回来的事实：两者必须对得上。
+    expect(record?.partition).toBe('persist:dsh-view-space-task-1')
+    expect(record?.storagePath).toBe(shellSpaces.spaceStoragePath(profile, 'task-1'))
+    expect(record?.persistent).toBe(true)
+    // 默认空间一个字没动：还是 T6 那个 partition、那个目录。
+    const fallback = spaceOf(state, 'default')
+    expect(fallback?.partition).toBe('persist:dsh-view')
+    expect(fallback?.storagePath).toBe(spaceOf(readState(shell), 'default')?.storagePath)
+    expect(fallback?.storagePath).not.toBe(record?.storagePath)
+
+    // 独立读回之一：直接问 CDP 端点，这个 targetId 是不是一个真的 page 目标。
+    const targets = await pageTargets(shell.handshake.cdpUrl)
+    console.log('RAW page targets after create: ' + JSON.stringify(targets))
+    expect(targets.some((target) => target.id === record?.targetId)).toBe(true)
+    // 独立读回之二：真按这个 targetId 领养一次，读它自己的标题。
+    const title = await withSpacePage(shell, 'task-1', (page) => page.title())
+    expect(title).toBe('view-page')
+    // 新空间**落在默认空间当前所在的地方**：那正是"继承登录态"有意义的那个页。
+    expect(record?.url).toBe(spaceOf(state, 'default')?.url)
+    expect(created.space?.targetId).toBe(record?.targetId)
+  })
+
+  it('使用：切换空间换掉的是填那一格矩形的那块视图，而且只有一个空间是当前的', async () => {
+    // 让面板真的报一个矩形：这样"哪一块视图显示着"才是能读回来的事实，而不是推断。
+    await reportPanelRect(shell)
+    const before = readState(shell)
+    console.log('RAW visible before switching back: ' + JSON.stringify(before.spaces.map((space) => [space.name, space.visible])))
+
+    await manager.command('use', 'default')
+    const after = readState(shell)
+    console.log('RAW after use default: ' + JSON.stringify(after.spaces.map((space) => [space.name, space.visible, space.active])))
+    expect(after.active).toBe('default')
+    // 只有当前空间那一块是显示的，另一块**保留**但隐藏——那正是"登录互不影响"能成立的原因。
+    expect(after.spaces.filter((space) => space.visible).map((space) => space.name)).toEqual(['default'])
+    expect(spaceOf(after, 'task-1')?.visible).toBe(false)
+    // 而且它的页面还在（隐藏不是释放）。
+    expect(spaceOf(after, 'task-1')?.url).not.toBe('')
+    const placement = shell.latestPlacement()
+    console.log('RAW placement after switching: ' + JSON.stringify(placement))
+    expect(placement?.space).toBe('default')
+
+    await manager.command('use', 'task-1')
+    const back = readState(shell)
+    expect(back.spaces.filter((space) => space.visible).map((space) => space.name)).toEqual(['task-1'])
+    expect(shell.latestPlacement()?.space).toBe('task-1')
+  })
+
+  it('关闭：页面从端点消失、按 targetId 再也领养不到、旧登录态被抹掉、目录仍在（如实）', async () => {
+    // 先在这个空间里留下一个只属于它的登录态。
+    const signedIn = await withSpacePage(shell, 'task-1', (page) => signInWithCookie(page, `${site.origin}/cookie-site`, 'secret'))
+    console.log('RAW signed in inside task-1: ' + JSON.stringify({ signedIn }))
+    expect(signedIn).toBe('signed in as secret')
+    // 独立读回：它的 cookie 罐里真的有这条 cookie（浏览器侧读的，不是插件说的）。
+    const cookies = await cookiesInSpace(shell, 'task-1', `${site.origin}/cookie-site`)
+    console.log('RAW cookies in task-1: ' + JSON.stringify(cookies))
+    expect(cookies.some((cookie) => cookie.name === 'token' && cookie.value === 'secret')).toBe(true)
+
+    const record = spaceOf(readState(shell), 'task-1')
+    closedTargetId = record?.targetId
+    closedPartition = record?.partition
+    console.log('RAW target about to be closed: ' + JSON.stringify({ targetId: closedTargetId, partition: closedPartition }))
+
+    await manager.command('close', 'task-1')
+    const after = readState(shell)
+    console.log('RAW after close: ' + JSON.stringify({ active: after.active, spaces: after.spaces.map((space) => space.name) }))
+    expect(spaceOf(after, 'task-1')).toBeUndefined()
+    // 当前空间不能指向一个已经不存在的空间。
+    expect(after.active).toBe('default')
+
+    // 独立读回：直接问 CDP 端点，那个目标还在不在。
+    const targets = await pageTargets(shell.handshake.cdpUrl)
+    console.log('RAW page targets after close: ' + JSON.stringify(targets))
+    expect(targets.some((target) => target.id === closedTargetId)).toBe(false)
+    // ……并且真的领养不到（不是因为"端点还没刷新"）。
+    await expect(pageForTarget(shell.handshake.cdpUrl, closedTargetId ?? '')).rejects.toThrow()
+
+    // 存储**数据**被抹掉：重建同名空间，它继承的是默认档案，而**不是**刚关掉的那个人的登录态。
+    const recreated = await manager.command('create', 'task-1')
+    const seen = await withSpacePage(shell, 'task-1', (page) => whoIs(page, `${site.origin}/cookie-site`))
+    console.log('RAW recreated task-1 sees: ' + JSON.stringify({ seen, inherited: recreated.space?.inherited }))
+    expect(seen).toBe('signed out')
+
+    // 目录这一半**如实**：进程活着时删不掉，所以它还在磁盘上，只是被记进了待删清单。
+    const dir = shellSpaces.spaceStoragePath(profile, 'task-1')
+    const pending = JSON.parse(readFileSync(shell.handshake.spaceChannel.pendingDeletionFile, 'utf8')) as string[]
+    console.log('RAW directory after close: ' + JSON.stringify({ dir, exists: existsSync(dir), pending }))
+    expect(existsSync(dir)).toBe(true)
+    expect(pending).toContain('persist:dsh-view-space-task-1')
+    // ……而默认空间的 partition 永不进待删清单。
+    expect(pending).not.toContain('persist:dsh-view')
+
+    // 收拾干净：把重建的这个也关掉，让"重启后目录不在了"这条只关于它。
+    await manager.command('close', 'task-1')
+  })
+
+  it('重启同一个档案目录：被记下的目录真的被删掉，默认空间的档案原封不动', async () => {
+    expect(closedPartition).toBe('persist:dsh-view-space-task-1')
+    // 路径按**空间名**算（`spaceStoragePath` 收的是名字，不是 partition 串）。
+    const dir = shellSpaces.spaceStoragePath(profile, 'task-1')
+    const defaultDir = shellSpaces.spaceStoragePath(profile, 'default')
+    expect(existsSync(dir)).toBe(true)
+    expect(existsSync(defaultDir)).toBe(true)
+
+    // 关窗口（用户真正走的那条路），再用**同一个档案目录**重启。
+    await shell.stop({ graceful: true })
+    expect(shell.alive()).toBe(false)
+
+    const restarted = await startShell([], { userDataDir: profile })
+    try {
+      const purges = restarted.stdout().split('\n').filter((line) => line.includes('SPACE_PURGE'))
+      console.log('RAW purge lines: ' + JSON.stringify(purges))
+      console.log('RAW after restart: ' + JSON.stringify({ dirExists: existsSync(dir), defaultExists: existsSync(defaultDir) }))
+      expect(existsSync(dir)).toBe(false)
+      // 默认空间（T6 那一格）的档案一个字节都不该被这次清理碰到。
+      expect(existsSync(defaultDir)).toBe(true)
+      expect(spaceOf(readState(restarted), 'default')?.partition).toBe('persist:dsh-view')
+      // 待删清单也被清空了：这件事只做一次。
+      const pending = JSON.parse(readFileSync(restarted.handshake.spaceChannel.pendingDeletionFile, 'utf8')) as string[]
+      expect(pending).toEqual([])
+    } finally {
+      await restarted.stop()
+    }
+  }, 120_000)
+})
+
+describe('T7 — 验收 2/3/4：继承、同站互不影响、工具只作用于当前空间', () => {
+  let shell: ShellProcess
+  let site: TestSite
+  let manager: SpaceManager
+
+  beforeAll(async () => {
+    site = await startSite()
+    shell = await startShell()
+    manager = new SpaceManager({
+      dir: shell.handshake.spaceChannel.dir,
+      timeoutMs: 30_000,
+      maxElements: 200,
+      maxChars: 20_000,
+    })
+  }, 120_000)
+
+  afterAll(async () => {
+    if (shell !== undefined) await shell.stop()
+    if (site !== undefined) await site.close()
+  })
+
+  it('验收 3：新空间继承默认档案的登录态（cookie 全量；localStorage 是它落脚的那个 origin）', async () => {
+    // 默认档案先登录：cookie 一处、localStorage 一处，然后停在 local-site 上。
+    const defaultWho = await withSpacePage(shell, 'default', async (page) => {
+      const cookie = await signInWithCookie(page, `${site.origin}/cookie-site`, 'default-user')
+      const local = await signInWithLocalStorage(page, `${site.origin}/local-site`, 'default-local')
+      return { cookie, local }
+    })
+    console.log('RAW default space after signing in: ' + JSON.stringify(defaultWho))
+    expect(defaultWho).toEqual({ cookie: 'signed in as default-user', local: 'signed in as default-local' })
+
+    // 新空间：它从默认档案继承，并且**落在默认空间当前所在的 origin** 上。
+    const created = await manager.command('create', 'inh-1')
+    console.log('RAW inheritance: ' + JSON.stringify(created.space?.inherited))
+    expect(created.space?.inherited?.sourceUrl).toBe(`${site.origin}/local-site`)
+    expect(created.space?.inherited?.localStorageOrigin).toBe(site.origin)
+    expect((created.space?.inherited?.cookiesInSpace ?? 0) > 0).toBe(true)
+
+    const seen = await withSpacePage(shell, 'inh-1', async (page) => ({
+      cookie: await whoIs(page, `${site.origin}/cookie-site`),
+      local: await whoIs(page, `${site.origin}/local-site`),
+      origin: await page.evaluate(() => location.origin),
+    }))
+    console.log('RAW the new space sees: ' + JSON.stringify(seen))
+    // 两半都读回：cookie 是全局复制的，localStorage 是"它落脚的那个 origin"复制过来的。
+    expect(seen.cookie).toBe('signed in as default-user')
+    expect(seen.local).toBe('signed in as default-local')
+    expect(seen.origin).toBe(site.origin)
+    // 默认空间的原件也还在（继承是复制，不是搬家）。
+    const stillThere = await withSpacePage(shell, 'default', (page) => whoIs(page, `${site.origin}/cookie-site`))
+    expect(stillThere).toBe('signed in as default-user')
+  })
+
+  it('验收 3 的边界：默认档案里**另一个 origin** 的 localStorage 不会被继承（cookie 会）', async () => {
+    // 默认档案在另一个 origin 上也有一份登录态。cookie 是按域存的，localStorage 是按 origin 存的。
+    const otherWho = await withSpacePage(shell, 'default', async (page) => {
+      const local = await signInWithLocalStorage(page, `${site.altOrigin}/local-site`, 'default-other')
+      const cookie = await signInWithCookie(page, `${site.altOrigin}/cookie-site`, 'default-other-cookie')
+      return { local, cookie }
+    })
+    console.log('RAW default space on the other origin: ' + JSON.stringify({ altOrigin: site.altOrigin, ...otherWho }))
+    expect(otherWho).toEqual({ local: 'signed in as default-other', cookie: 'signed in as default-other-cookie' })
+    // 两个地址确实是两个 origin、两个 cookie 域（否则下面那条"跨 origin 也继承"什么也证明不了）。
+    const domains = await cookiesInSpace(shell, 'default', `${site.altOrigin}/cookie-site`)
+    console.log('RAW default cookie domains: ' + JSON.stringify({ domains, altOrigin: site.altOrigin }))
+    expect(new URL(site.altOrigin).hostname).not.toBe(new URL(site.origin).hostname)
+    // 让它停在第一个 origin 上：新空间会落到这里，localStorage 的复制只覆盖"它落脚的那个 origin"。
+    const landed = await withSpacePage(shell, 'default', (page) => whoIs(page, `${site.origin}/local-site`))
+    expect(landed).toBe('signed in as default-local')
+
+    await manager.command('create', 'inh-2')
+    const seen = await withSpacePage(shell, 'inh-2', async (page) => ({
+      otherLocal: await whoIs(page, `${site.altOrigin}/local-site`),
+      otherCookie: await whoIs(page, `${site.altOrigin}/cookie-site`),
+      thisLocal: await whoIs(page, `${site.origin}/local-site`),
+    }))
+    console.log('RAW the new space on both origins: ' + JSON.stringify(seen))
+    // 这一条就是那张能力边界表：另一个域的 cookie 也继承得到（cookie 是按 domain 全量复制的）……
+    expect(seen.otherCookie).toBe('signed in as default-other-cookie')
+    // ……而另一个 origin 的 localStorage 继承不到（没有 API 能枚举"哪些 origin 有 localStorage"，
+    // 而且给一个本 partition 没有 frame 的 origin 写 localStorage 会被 CDP 直接拒绝）。
+    expect(seen.otherLocal).toBe('signed out')
+    // 它落脚的那个 origin 上的 localStorage 是继承到了的。
+    expect(seen.thisLocal).toBe('signed in as default-local')
+  })
+
+  it('验收 2：两个空间在同一站点各自登录，互相看不见（先证明同源）', async () => {
+    await manager.command('create', 'iso-a')
+    await manager.command('create', 'iso-b')
+    // 两个空间**明确**站在同一个地址上，这样"同源"是被摆出来的，不是碰巧的。
+    const landing = await withSpacePage(shell, 'iso-a', (page) => whoIs(page, `${site.origin}/cookie-site`))
+    const landingB = await withSpacePage(shell, 'iso-b', (page) => whoIs(page, `${site.origin}/cookie-site`))
+    console.log('RAW where the two spaces stand: ' + JSON.stringify({ landing, landingB }))
+
+    const signedIn = await withSpacePage(shell, 'iso-a', (page) => signInWithCookie(page, `${site.origin}/cookie-site`, 'alpha'))
+    expect(signedIn).toBe('signed in as alpha')
+
+    // 先证明同源：否则"看不见"能被 origin 不同解释。
+    const origins = await withSpacePage(shell, 'iso-b', (page) => page.evaluate(() => location.origin))
+    console.log('RAW origins: ' + JSON.stringify({ a: site.origin, b: origins }))
+    expect(origins).toBe(site.origin)
+
+    const bSees = await withSpacePage(shell, 'iso-b', (page) => whoIs(page, `${site.origin}/cookie-site`))
+    console.log('RAW what iso-b sees while iso-a is alpha: ' + JSON.stringify(bSees))
+    // 同源、却看不见 alpha：那不是一个罐子。
+    expect(bSees).not.toBe('signed in as alpha')
+
+    const betaSeen = await withSpacePage(shell, 'iso-b', (page) => signInWithCookie(page, `${site.origin}/cookie-site`, 'beta'))
+    expect(betaSeen).toBe('signed in as beta')
+
+    // 两个空间各自还在自己的那个人身上，谁也没把谁挤掉；默认档案也没被碰到。
+    const readBack = {
+      a: await withSpacePage(shell, 'iso-a', (page) => whoIs(page, `${site.origin}/cookie-site`)),
+      b: await withSpacePage(shell, 'iso-b', (page) => whoIs(page, `${site.origin}/cookie-site`)),
+      fallback: await withSpacePage(shell, 'default', (page) => whoIs(page, `${site.origin}/cookie-site`)),
+    }
+    console.log('RAW three spaces, same site, after two logins: ' + JSON.stringify(readBack))
+    expect(readBack.a).toBe('signed in as alpha')
+    expect(readBack.b).toBe('signed in as beta')
+    expect(readBack.fallback).toBe('signed in as default-user')
+
+    // 语言上也对得上：三个空间各在自己的 partition 上，罐子也确实各是各的。
+    const state = readState(shell)
+    const paths = ['default', 'iso-a', 'iso-b'].map((name) => spaceOf(state, name)?.storagePath)
+    const jars = {
+      a: await cookiesInSpace(shell, 'iso-a', `${site.origin}/cookie-site`),
+      b: await cookiesInSpace(shell, 'iso-b', `${site.origin}/cookie-site`),
+    }
+    console.log('RAW storage paths and cookie jars: ' + JSON.stringify({ paths, jars }))
+    expect(new Set(paths).size).toBe(3)
+    expect(jars.a.some((cookie) => cookie.value === 'alpha')).toBe(true)
+    expect(jars.b.some((cookie) => cookie.value === 'beta')).toBe(true)
+    expect(jars.a.some((cookie) => cookie.value === 'beta')).toBe(false)
+    expect(jars.b.some((cookie) => cookie.value === 'alpha')).toBe(false)
+  })
+
+  it('验收 4：所有工具只作用于当前空间（另一个空间一步都没动）', async () => {
+    const cdpUrl = shell.handshake.cdpUrl
+    const tools = desktopViewTools(() => manager.adopt(cdpUrl), { spaces: manager })
+    const navigate = tools.find((tool) => tool.name === 'browser_navigate')
+    const evaluate = tools.find((tool) => tool.name === 'browser_evaluate')
+    const space = tools.find((tool) => tool.name === 'browser_space')
+    const names = tools.map((tool) => tool.name)
+    console.log('RAW registered tools: ' + JSON.stringify(names))
+    expect(navigate).toBeDefined()
+    expect(evaluate).toBeDefined()
+    expect(space).toBeDefined()
+
+    // 两个空间都摆到一个已知地址上：否则"另一个没动"可能只是因为它本来就在那儿。
+    await withSpacePage(shell, 'iso-a', (page) => page.goto(`${site.origin}/cookie-site`))
+    await withSpacePage(shell, 'iso-b', (page) => page.goto(`${site.origin}/cookie-site`))
+
+    await manager.command('use', 'iso-a')
+    const moved = await navigate?.execute({ url: `${site.origin}/other` }, IGNORED_EXEC)
+    const readByTool = await evaluate?.execute({ expression: 'location.href' }, IGNORED_EXEC)
+    // 另一个空间用**绕开插件**的那条连接读回来：它必须一步没动。
+    const untouched = await withSpacePage(shell, 'iso-b', (page) => page.url())
+    console.log('RAW scoped navigation: ' + JSON.stringify({ moved, readByTool, untouched }))
+    expect(readByTool).toBe(`${site.origin}/other`)
+    expect(untouched).toBe(`${site.origin}/cookie-site`)
+
+    // 换一个当前空间，同一个工具调用落在另一块视图上：作用域是"当前空间"，不是"那一个会话"。
+    const switched = await space?.execute({ action: 'use', name: 'iso-b' }, IGNORED_EXEC)
+    console.log('RAW switch through the tool: ' + JSON.stringify(switched?.message))
+    await navigate?.execute({ url: `${site.origin}/local-site` }, IGNORED_EXEC)
+    const readBack = {
+      b: await withSpacePage(shell, 'iso-b', (page) => page.url()),
+      a: await withSpacePage(shell, 'iso-a', (page) => page.url()),
+    }
+    console.log('RAW after switching the space: ' + JSON.stringify(readBack))
+    expect(readBack.b).toBe(`${site.origin}/local-site`)
+    // A 停在它自己上一次被驱动到的地方：B 的动作一步也没落在它身上。
+    expect(readBack.a).toBe(`${site.origin}/other`)
+
+    // 工具报出来的空间表也是外壳读回的那一份。
+    const table = await space?.execute({ action: 'list' }, IGNORED_EXEC)
+    const published = shellRecord<{ active: string; spaces: Array<{ name: string }> }>(shell.stdout(), 'SPACES')
+    console.log('RAW tool table vs published state: ' + JSON.stringify({ tool: table?.active, published: published?.active }))
+    expect(table?.active).toBe('iso-b')
+    expect(published?.active).toBe('iso-b')
+    expect(table?.spaces.map((entry) => entry.name).sort()).toEqual(published?.spaces.map((entry) => entry.name).sort())
+  })
+})
