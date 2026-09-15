@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { chromium, type Browser, type Page } from 'playwright'
 
 /**
  * Test support for driving the real shell process.
@@ -68,6 +69,61 @@ export interface ViewHandshake {
   fixtureOrigin: string
 }
 
+/** One view placement the shell applied, as published on stdout. */
+export interface ViewPlacement {
+  /** What asked for this placement (`initial-bounds`, `panel-report`, `panel-none`, `window-resize`, …). */
+  cause: string
+  /** What the shell *decided*: whether the view should be shown. */
+  visible: boolean
+  /** The rectangle the panel asked for, or null when it asked for none. */
+  bounds: { x: number; y: number; width: number; height: number } | null
+  /** What `view.getBounds()` actually answered after the placement ran. */
+  applied: { x: number; y: number; width: number; height: number } | null
+  /**
+   * What `view.getVisible()` actually answered after the placement ran, or null when
+   * no view existed yet. This is Electron's answer, not the shell's decision: it is
+   * the only way to tell "the shell intended to hide the view" from "the view is
+   * hidden".
+   */
+  appliedVisible: boolean | null
+  /** Whether the window clipped the requested rectangle. */
+  clamped: boolean
+  /** Why the placement came out the way it did. */
+  reason: string
+  /** The window's content size at the time. */
+  windowSize: { width: number; height: number }
+}
+
+/**
+ * Connect to the shell's CDP endpoint and return the page whose CDP target id is `targetId`.
+ *
+ * `Target.getTargetInfo` is what makes this a lookup by *identity* rather than by
+ * URL or by type: the window's page and the native view are both CDP `page` targets,
+ * so neither of the cheap answers is the right one.
+ *
+ * @param cdpUrl - the shell's loopback endpoint.
+ * @param targetId - the target to find.
+ * @returns the opened connection and the matching page. The caller closes the connection.
+ */
+export async function pageForTarget(cdpUrl: string, targetId: string): Promise<{ browser: Browser; page: Page }> {
+  const browser = await chromium.connectOverCDP(cdpUrl, { timeout: 30_000 })
+  try {
+    for (const context of browser.contexts()) {
+      for (const page of context.pages()) {
+        const session = await context.newCDPSession(page)
+        const { targetInfo } = await session.send('Target.getTargetInfo')
+        await session.detach()
+        if (targetInfo?.targetId === targetId) return { browser, page }
+      }
+    }
+  } catch (error) {
+    await browser.close()
+    throw error
+  }
+  await browser.close()
+  throw new Error(`no page in ${cdpUrl} had target id ${targetId}`)
+}
+
 /** A running shell process under test. */
 export interface ShellProcess {
   /** The Electron child process. */
@@ -82,6 +138,20 @@ export interface ShellProcess {
   alive: () => boolean
   /** Resolve once `predicate(stdout)` holds, or reject on timeout. */
   waitFor: (predicate: (stdout: string) => boolean, description: string, timeoutMs?: number) => Promise<void>
+  /**
+   * Wait until a placement satisfying `predicate` has been published, and return it.
+   * @param predicate - which placement counts.
+   * @param description - what is being waited for, for the failure message.
+   * @param timeoutMs - how long to wait.
+   * @returns the matching placement.
+   */
+  waitForPlacement: (
+    predicate: (placement: ViewPlacement) => boolean,
+    description: string,
+    timeoutMs?: number,
+  ) => Promise<ViewPlacement>
+  /** The latest placement published so far, or undefined when none has been. */
+  latestPlacement: () => ViewPlacement | undefined
   /** Terminate the shell and its descendants, and drop the temporary profile. */
   stop: () => Promise<void>
 }
@@ -89,24 +159,41 @@ export interface ShellProcess {
 /** Default time to wait for the shell to publish its handshake. */
 const START_TIMEOUT_MS = 90_000
 
+/** Options accepted by {@link startShell}. */
+export interface StartShellOptions {
+  /** How long to wait for the handshake. */
+  timeoutMs?: number
+  /** Window size, e.g. `{width: 900, height: 600}`. Defaults to the shell's own. */
+  windowSize?: { width: number; height: number }
+}
+
 /**
  * Launch the Electron shell and wait for it to publish the view identity.
  * @param args - extra shell arguments.
- * @param options - timeout override.
+ * @param options - timeout and window size.
  * @returns the running shell.
  */
 export async function startShell(
   args: string[] = [],
-  options: { timeoutMs?: number } = {},
+  options: StartShellOptions = {},
 ): Promise<ShellProcess> {
   const timeoutMs = options.timeoutMs ?? START_TIMEOUT_MS
+  const sizeArgs =
+    options.windowSize === undefined
+      ? []
+      : // `--window-size` reuses the rectangle parser; only width and height are read.
+        ['--window-size', `0,0,${options.windowSize.width},${options.windowSize.height}`]
   // A per-run profile keeps concurrent runs (and the developer's own profile) untouched.
   const userDataDir = mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-test-'))
-  const child = spawn(electronExecutable(), [SHELL_MAIN, '--user-data-dir', userDataDir, ...args], {
-    cwd: REPO_ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  })
+  const child = spawn(
+    electronExecutable(),
+    [SHELL_MAIN, '--user-data-dir', userDataDir, ...sizeArgs, ...args],
+    {
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    },
+  )
   let out = ''
   let err = ''
   child.stdout?.on('data', (chunk: Buffer) => {
@@ -186,6 +273,29 @@ export async function startShell(
     throw new Error(`timed out waiting for ${description}\n--- stdout ---\n${out}\n--- stderr ---\n${err}`)
   }
 
+  const latestPlacement = (): ViewPlacement | undefined => {
+    const all = viewPlacements(out)
+    return all.length === 0 ? undefined : all[all.length - 1]
+  }
+
+  const waitForPlacement = async (
+    predicate: (placement: ViewPlacement) => boolean,
+    description: string,
+    waitMs = 30_000,
+  ): Promise<ViewPlacement> => {
+    const deadline = Date.now() + waitMs
+    for (;;) {
+      const match = viewPlacements(out).find(predicate)
+      if (match !== undefined) return match
+      if (Date.now() >= deadline) break
+      await new Promise((settle) => setTimeout(settle, 50))
+    }
+    throw new Error(
+      `timed out waiting for ${description}\n--- placements seen ---\n` +
+        `${JSON.stringify(viewPlacements(out), null, 2)}\n--- stdout ---\n${out}\n--- stderr ---\n${err}`,
+    )
+  }
+
   return {
     child,
     handshake,
@@ -193,8 +303,34 @@ export async function startShell(
     stderr: () => err,
     alive,
     waitFor,
+    waitForPlacement,
+    latestPlacement,
     stop,
   }
+}
+
+/**
+ * Every view placement the shell published, in order.
+ *
+ * The shell prints one `DSH_SHELL VIEW {...}` line per placement — this is how the
+ * test sees the shell's own half of the rectangle channel, in the shell's own
+ * process, rather than inferring it from the panel's side.
+ *
+ * @param stdout - the shell's accumulated stdout.
+ * @returns the placements, in the order they were applied.
+ */
+export function viewPlacements(stdout: string): ViewPlacement[] {
+  const placements: ViewPlacement[] = []
+  for (const line of stdout.split('\n')) {
+    const match = /^DSH_SHELL VIEW (.*)$/.exec(line.trim())
+    if (match === null) continue
+    try {
+      placements.push(JSON.parse(match[1]) as ViewPlacement)
+    } catch {
+      /* ignore a partially flushed line */
+    }
+  }
+  return placements
 }
 
 /**

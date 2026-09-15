@@ -19,6 +19,14 @@ const DEFAULT_BOUNDS = { x: 760, y: 0, width: 440, height: 800 }
 const DEFAULT_TIMEOUT_MS = 30000
 
 /**
+ * DSH profile holding this plugin, used by `--dsh`.
+ *
+ * Spelled out rather than relying on `dsh web`, which is a hardcoded alias of
+ * `--profile web` — a profile this plugin is not installed in.
+ */
+const DEFAULT_DSH_PROFILE = 'dshviewer'
+
+/**
  * Parse a `x,y,w,h` rectangle.
  * @param {string} raw - the raw `--bounds` value.
  * @returns {{x: number, y: number, width: number, height: number}} the rectangle.
@@ -48,7 +56,10 @@ function parseArgv(argv) {
     userDataDir: undefined,
     show: true,
     dshCommand: 'dsh',
+    dshProfile: DEFAULT_DSH_PROFILE,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    rectChannel: true,
+    placementFile: undefined,
     help: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
@@ -71,6 +82,9 @@ function parseArgv(argv) {
       case '--dsh-command':
         options.dshCommand = value()
         break
+      case '--dsh-profile':
+        options.dshProfile = value()
+        break
       case '--bounds':
         options.bounds = parseBounds(value())
         break
@@ -91,6 +105,12 @@ function parseArgv(argv) {
         break
       case '--timeout-ms':
         options.timeoutMs = Number(value())
+        break
+      case '--placement-file':
+        options.placementFile = value()
+        break
+      case '--no-rect-channel':
+        options.rectChannel = false
         break
       case '--no-show':
         options.show = false
@@ -116,20 +136,32 @@ function usage() {
     '',
     '  --url <url>              URL for the window (DSH UI or any page). Default: built-in fixture /shell',
     '  --view-url <url>         Initial URL for the native browser view. Default: built-in fixture /view',
-    '  --dsh                    Start `dsh web --no-open --port 0`, parse its address, load it in the window,',
-    '                           and hand the view over to it through DSH_DESKTOP_VIEW_* environment variables',
+    '  --dsh                    Start `dsh --profile <profile> --no-open --port 0`, parse its address, load it in',
+    '                           the window, and hand the view over to it through DSH_DESKTOP_VIEW_* variables',
     '  --dsh-command <cmd>      Executable used by --dsh (default: dsh)',
+    "  --dsh-profile <name>     DSH profile used by --dsh (default: dshviewer)",
+    '                           (never `dsh web`: that is a hardcoded alias of --profile web)',
     '  --bounds x,y,w,h         View rectangle inside the window (default: 760,0,440,800)',
-    '  --window-size w,h        Window size (default: 1200,800)',
+    '  --window-size x,y,w,h    Window size; only w and h are used (default: 1200,800)',
+    '                           (e.g. --window-size 0,0,1200,800)',
     '  --cdp-port <n>           Programmable endpoint port; 0 lets the OS choose (default: 0)',
     '  --user-data-dir <dir>    Chromium profile directory (default: <appData>/dsh-desktop-shell)',
     '  --timeout-ms <n>         Startup timeout (default: 30000)',
+    '  --placement-file <file>  Mirror the latest view placement into this JSON file',
+    '  --no-rect-channel        Do not inject the panel rectangle channel into the window',
     '  --no-show                Create the window hidden',
     '  -h, --help               Print this text',
     '',
     'On success the shell prints one line to stdout:',
     '  DSH_DESKTOP_VIEW_HANDSHAKE {"cdpUrl":"...","targetId":"...", ...}',
+    '',
+    'Every placement change prints one line to stdout:',
+    '  DSH_SHELL VIEW {"cause":"panel-report","visible":true,"bounds":{...},',
+    '                  "applied":{...},"appliedVisible":true,"reason":"reported"}',
+    '                           `cause` is what asked for the placement (panel-report,',
+    '                           panel-none, window-resize, navigation, initial-bounds);',
+    '                           `reason` is why the decision came out that way.',
   ].join('\n')
 }
 
-module.exports = { parseArgv, parseBounds, usage, DEFAULT_BOUNDS, DEFAULT_WINDOW, DEFAULT_TIMEOUT_MS }
+module.exports = { parseArgv, parseBounds, usage, DEFAULT_BOUNDS, DEFAULT_DSH_PROFILE, DEFAULT_WINDOW, DEFAULT_TIMEOUT_MS }

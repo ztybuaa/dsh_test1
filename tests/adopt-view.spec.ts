@@ -158,10 +158,41 @@ describe('--dsh — the shell hands the view to the child it launches', () => {
       expect(received.cdpUrl).toBe(shell.handshake.cdpUrl)
       expect(received.targetId).toBe(shell.handshake.targetId)
       expect(received.viewUrl).toBe(shell.handshake.viewUrl)
-      expect(received.argv).toEqual(['web', '--no-open', '--port', '0'])
+      // `dsh web` is a hardcoded alias of `--profile web`, and this plugin is not
+      // installed there: the child must be started on the plugin's own profile, named
+      // explicitly. The fake DSH is what makes this assertable at all (`argv` is the
+      // real argv the child received), and it pins the *shape*, not a spelling.
+      expect(received.argv).toEqual(['--profile', 'dshviewer', '--no-open', '--port', '0'])
+      // ...and the shell publishes the argv it used, so a wrong profile is visible in
+      // the shell's own output instead of only in the child's behaviour.
+      const published = /^DSH_SHELL DSH_ARGV (.*)$/m.exec(shell.stdout())
+      expect(JSON.parse(published?.[1] ?? '{}')).toEqual({
+        command: `node ${FAKE_DSH}`,
+        argv: ['--profile', 'dshviewer', '--no-open', '--port', '0'],
+      })
 
       const loaded = /^DSH_SHELL DSH_URL (.*)$/m.exec(shell.stdout())
       expect(JSON.parse(loaded?.[1] ?? '{}')).toEqual({ url: `${shell.handshake.fixtureOrigin}/shell` })
+    } finally {
+      await shell.stop()
+    }
+  }, 120_000)
+
+  it('starts the child on the profile the caller asked for', async () => {
+    // The profile is a parameter, not a constant: pointing the shell at a different
+    // profile must not need a code change. "demo-profile" does not exist anywhere; it
+    // only has to reach the child's argv.
+    const shell = await startShell(['--dsh', '--dsh-profile', 'demo-profile', '--dsh-command', `node ${FAKE_DSH}`])
+    try {
+      await shell.waitFor(
+        (out) => /^DSH_SHELL DSH_URL /m.test(out),
+        'the shell to load the address printed by its child',
+        60_000,
+      )
+      const forwarded = forwardedHostOutput(shell.stdout()).join('')
+      const received = JSON.parse(/FAKE_DSH_HANDSHAKE (\{.*\})/.exec(forwarded)?.[1] ?? '{}') as { argv?: string[] }
+      console.log('RAW child argv with --dsh-profile: ' + JSON.stringify(received.argv))
+      expect(received.argv).toEqual(['--profile', 'demo-profile', '--no-open', '--port', '0'])
     } finally {
       await shell.stop()
     }
