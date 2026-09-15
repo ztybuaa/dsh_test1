@@ -87,3 +87,27 @@
 - 「面板不再是画面、而是浏览器本身」这条**在技术上成立**，且不需要 screencast 管线。
 - 可以砍掉：focus emulation、合成输入的坐标换算、viewport 贴合、MJPEG 帧流。
 - 但**宿主必须提供那块视图**：官方桌面版未经改动做不到（见 `desktop-embedded-browser-view.zh.md`），因此需要 fork 宿主或自建外壳。
+
+## 7. 追加实测：目标的身份可以由两端各自独立取得
+
+上面第 4 节第 2 条说"必须辨认目标"。为了确认"按身份领养"这条路真的可行，又量了一次：对每个页面执行 `context.newCDPSession(page)`，再 `send('Target.getTargetInfo')`，把它返回的 `targetInfo.targetId` 与 `/json/list` 里的 `id` 逐一比对。
+
+原始输出（`/json/list` 是地面真相）：
+
+```
+/json/list:
+  F71E9839A9949727AFD031F1CF9EB11F  type=page  http://127.0.0.1:9344/sidebar
+  65179BDAFE0387EF2C09A0DF53BFD939  type=page  http://127.0.0.1:9344/shell
+
+per page -> Target.getTargetInfo:
+  shell   -> 65179BDAFE0387EF2C09A0DF53BFD939  type=page  matchesJsonList=true
+  sidebar -> F71E9839A9949727AFD031F1CF9EB11F  type=page  matchesJsonList=true
+```
+
+**结论**：`Target.getTargetInfo` 可用，返回的 `targetId` 与 `/json/list` 的 `id` **完全一致**。因此：
+
+- 宿主可以用 `webContents.fromDevToolsTargetId(targetId)` 反查回 `webContents`、与视图的 `webContents` 比对，从而**确定地**得到视图的 targetId；
+- 插件可以独立地用 `Target.getTargetInfo` 取得每个页面的 targetId；
+- **两端取到的是同一个 id** —— 所以握手可以建立在身份上，不需要靠 URL 猜，也不需要哨兵地址兜底。
+
+（URL 仍可作为兜底，但**不应作为首选**：页面一导航它就失效。）
