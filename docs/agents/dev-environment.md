@@ -54,3 +54,23 @@ $env:ELECTRON_MIRROR = 'https://mirrors.huaweicloud.com/electron/'
 
 - `G:\dsh-electron-probe\` —— 原生视图 × CDP 的可行性探针（结论见 `docs/research/electron-native-view-cdp-probe.md`）
 - `G:\electron-mirror\` —— 校验过的 Electron 二进制
+
+## 5. npm 能装，但不代表官方 registry 可达
+
+实测（同一时刻）：`registry.npmjs.org` **超时**，`registry.npmmirror.com` **通**。
+
+好消息是 `npm config get registry` **已经指向** `https://registry.npmmirror.com`，所以 **`npm install` 不受影响**——失败的只是"直连官方 registry"。需要显式指定时用 `npm install --registry=https://registry.npmmirror.com`。
+
+**不要**把"`registry.npmjs.org` 打不开"误判成"npm 装不了东西"。
+
+## 6. Playwright 的浏览器缓存已经存在，而且本项目根本不需要浏览器
+
+`%LOCALAPPDATA%\ms-playwright` 已有约 **711 MB** 缓存：`chromium-1234` 426.7 MB、`chromium_headless_shell-1234` 270.8 MB、`ffmpeg-1011`、`winldd-1007`、`daemon`。所以 `npm install` 里 playwright 那一步通常**不需要真的下载浏览器**。
+
+本项目**从不 `launch` 任何浏览器**——它只 `connectOverCDP` 连外壳里那块原生视图。因此即使缓存为空，也可以直接跳过浏览器下载：
+
+```pwsh
+$env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+```
+
+（也可写进仓库 `.npmrc` 的 `playwright_skip_browser_download=1`。但**不要**为这条去打断一个正在正常进行的安装。）
