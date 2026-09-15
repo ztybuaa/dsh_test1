@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { inflateSync } from 'node:zlib'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Page } from 'playwright'
 import { assertSupportedJsonSchema, validateJsonSchemaValue, type JsonSchemaNode } from '@deepseek-ai/dsh-tools'
@@ -15,6 +14,7 @@ import {
   type PageSnapshot,
 } from '../src/session.ts'
 import { desktopViewTools, type ToolDependencies } from '../src/tools.ts'
+import { readPng } from './png-facts.ts'
 import { pageForTarget, removeWhenFree, startShell, type ShellProcess } from './shell-harness.ts'
 
 /**
@@ -50,107 +50,6 @@ const FIXTURE_BOX_RGB = '47,111,176'
 
 /** How many times a read is retried while an asynchronously captured fact lands. */
 const CAPTURE_ATTEMPTS = 50
-
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
-
-/** What a PNG says about itself, as read here rather than by the implementation. */
-interface PngFacts {
-  /** Width in encoded pixels. */
-  width: number
-  /** Height in encoded pixels. */
-  height: number
-  /** Bits per channel, from IHDR. */
-  bitDepth: number
-  /** PNG colour type, from IHDR (6 = RGBA, 2 = RGB). */
-  colorType: number
-  /** Every distinct RGB triple among the decoded pixels. */
-  colors: Set<string>
-}
-
-/** The Paeth predictor, as the PNG specification defines it. */
-function paeth(a: number, b: number, c: number): number {
-  const p = a + b - c
-  const pa = Math.abs(p - a)
-  const pb = Math.abs(p - b)
-  const pc = Math.abs(p - c)
-  if (pa <= pb && pa <= pc) return a
-  return pb <= pc ? b : c
-}
-
-/** Undo one scanline's filter in place, given the reconstructed row above it. */
-function unfilter(row: Buffer, previous: Buffer, filter: number, bpp: number): void {
-  for (let index = 0; index < row.length; index++) {
-    const left = index >= bpp ? row[index - bpp] : 0
-    const up = previous[index] ?? 0
-    const upLeft = index >= bpp ? (previous[index - bpp] ?? 0) : 0
-    let value = row[index]
-    if (filter === 1) value += left
-    else if (filter === 2) value += up
-    else if (filter === 3) value += Math.floor((left + up) / 2)
-    else if (filter === 4) value += paeth(left, up, upLeft)
-    row[index] = value & 0xff
-  }
-}
-
-/**
- * Read a PNG for itself: signature, IHDR, and the decoded pixel colours.
- *
- * It is deliberately a second implementation of "what is in these bytes". The claim being
- * checked is that the tool delivered a real PNG of the view with the page's content in it,
- * and asking the code under test whether it did would not check anything.
- *
- * @param bytes - the file or attachment bytes.
- * @returns the image's dimensions and the distinct colours it contains.
- */
-function readPng(bytes: Buffer): PngFacts {
-  if (bytes.length < 8 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
-    throw new Error('not a PNG: the 8-byte signature is missing')
-  }
-  let offset = 8
-  let header: { width: number; height: number; bitDepth: number; colorType: number; interlace: number } | undefined
-  const data: Buffer[] = []
-  while (offset + 12 <= bytes.length) {
-    const length = bytes.readUInt32BE(offset)
-    const type = bytes.toString('ascii', offset + 4, offset + 8)
-    const chunk = bytes.subarray(offset + 8, offset + 8 + length)
-    if (type === 'IHDR') {
-      header = {
-        width: chunk.readUInt32BE(0),
-        height: chunk.readUInt32BE(4),
-        bitDepth: chunk[8],
-        colorType: chunk[9],
-        interlace: chunk[12],
-      }
-    } else if (type === 'IDAT') {
-      data.push(Buffer.from(chunk))
-    }
-    offset += 12 + length
-    if (type === 'IEND') break
-  }
-  if (header === undefined) throw new Error('the PNG has no IHDR chunk')
-
-  const channels = header.colorType === 6 ? 4 : header.colorType === 2 ? 3 : 0
-  const colors = new Set<string>()
-  if (channels !== 0 && header.bitDepth === 8 && header.interlace === 0) {
-    const raw = inflateSync(Buffer.concat(data))
-    const stride = header.width * channels
-    let previous = Buffer.alloc(stride)
-    let cursor = 0
-    for (let y = 0; y < header.height && cursor < raw.length; y++) {
-      const filter = raw[cursor]
-      cursor += 1
-      const row = Buffer.from(raw.subarray(cursor, cursor + stride))
-      cursor += stride
-      unfilter(row, previous, filter, channels)
-      for (let x = 0; x < header.width; x++) {
-        const at = x * channels
-        colors.add(`${row[at]},${row[at + 1]},${row[at + 2]}`)
-      }
-      previous = row
-    }
-  }
-  return { width: header.width, height: header.height, bitDepth: header.bitDepth, colorType: header.colorType, colors }
-}
 
 /** The digest the test uses to compare two byte sequences it obtained separately. */
 function sha256(bytes: Buffer | Uint8Array): string {

@@ -1,5 +1,16 @@
 import type { Browser, BrowserContext, ElementHandle, Page, Response } from 'playwright'
 import { chromium } from 'playwright'
+import {
+  MARK_PLANS,
+  clearOverlay,
+  mountOverlay,
+  overlayConfig,
+  paintOverlay,
+  readFlashNeedsSecondPaint,
+  type OverlayConfig,
+  type OverlayKind,
+  type ViewPoint,
+} from './overlay.ts'
 
 /**
  * Adopt-mode browser session.
@@ -192,6 +203,29 @@ interface RefTarget {
   facts: ElementFacts
 }
 
+/**
+ * What one action can tell the overlay while it runs.
+ *
+ * The action body is what knows where the action is aimed and where it lands, so it
+ * reports both; the wrapper in {@link AdoptedViewSession.action} is what draws them and
+ * what draws the failure mark when the body throws.
+ */
+interface ActionOverlay {
+  /**
+   * Where the action is aimed, in viewport CSS pixels — the point the hit test used
+   * (ADR-0007). Nothing is drawn when there is no point.
+   */
+  aim: (point: ViewPoint | undefined) => Promise<void>
+  /**
+   * Where the action lands, when that is not where it aimed.
+   *
+   * A drag lands on its target and a scroll-into-view only has a landing point once it
+   * has scrolled, so the landing place has to be reportable on its own. Left unreported,
+   * the aimed point is used.
+   */
+  landed: (point: ViewPoint | undefined) => void
+}
+
 /** How long a default action may take when the caller does not say. */
 const DEFAULT_TIMEOUT_MS = 30_000
 
@@ -255,8 +289,12 @@ const INTERACTIVE_ROLES = [
  * second, hand-rolled one matters: the same predicate decides what a later click can
  * act on, so the snapshot lists what can actually be acted on instead of a
  * near-miss of it.
+ *
+ * Exported so a test can ask the engine the *same* question with the *same* selector —
+ * the guard "the cursor overlay must not match it" (T8) is only worth anything if the
+ * test reads the real selector instead of a copy that can drift.
  */
-const SNAPSHOT_SELECTOR = [
+export const SNAPSHOT_SELECTOR = [
   'a[href]:visible',
   'button:visible',
   'input:visible',
@@ -754,6 +792,24 @@ export class AdoptedViewSession {
   private consoleMessages: ConsoleMessageRecord[] = []
   private failedRequests: FailedRequestRecord[] = []
 
+  /**
+   * What the injected cursor overlay is told to draw (T8).
+   *
+   * It is data, not behaviour: the page-side functions receive this object whole, so
+   * there is exactly one place that says what a mark looks like — and that place can be
+   * unit-tested without a browser.
+   */
+  private readonly overlay: OverlayConfig = overlayConfig()
+
+  /**
+   * Resolves once the overlay exists in the current document.
+   *
+   * Marks wait on it, so an action taken immediately after adoption is not drawn into a
+   * document that has no overlay yet. It is never awaited by an action's result: the
+   * overlay is a hint, and a hint must not be able to fail an action.
+   */
+  private overlayReady: Promise<void> = Promise.resolve()
+
   private constructor(
     private readonly browser: Browser,
     private readonly context: BrowserContext,
@@ -788,7 +844,17 @@ export class AdoptedViewSession {
     // and clearing at load would throw away exactly the errors that explain a page that
     // never finishes.
     page.on('framenavigated', (frame) => {
-      if (frame === page.mainFrame()) this.forgetPageObservations()
+      if (frame !== page.mainFrame()) return
+      this.forgetPageObservations()
+      // The overlay lives in the document, so the next document needs its own. Two
+      // mechanisms, both idempotent, because they cover different windows: the init
+      // script gets the overlay in before the new document can paint anything, and this
+      // hook re-asserts it on the commit the observation buffers already hang off — one
+      // lifecycle instead of two. Measured (T8): an `evaluate` alone does *not* survive a
+      // navigation, either mechanism on its own *does* re-mount on a real navigation, and
+      // the init script runs while `document.documentElement` is still null — which is
+      // why the mount carries its own `DOMContentLoaded` fallback.
+      void this.mountOverlayInPage()
     })
     page.on('console', (message) => {
       const location = message.location()
@@ -818,6 +884,15 @@ export class AdoptedViewSession {
         summary: request.failure()?.errorText ?? 'the request failed with no reason reported',
       })
     })
+    // The overlay (T8): the document the session adopted right now gets one, and every
+    // later document gets one from the init script registered here. Both are fire and
+    // forget — a hint that cannot be drawn is not a reason for adopting a view to fail.
+    // The promise is kept only so a mark drawn immediately after adoption waits for the
+    // mount instead of landing in a document that has no overlay yet.
+    this.overlayReady = page
+      .addInitScript(mountOverlay, this.overlay)
+      .then(async () => await this.mountOverlayInPage())
+      .catch(() => undefined)
   }
 
   /**
@@ -890,6 +965,16 @@ export class AdoptedViewSession {
    */
   async snapshot(): Promise<PageSnapshot> {
     this.assertOpen()
+    return await this.withReadFlash(async () => await this.collectSnapshot())
+  }
+
+  /**
+   * The snapshot itself, without the overlay's read flash.
+   *
+   * Split out so the public entry point can wrap exactly one thing — the read — in the
+   * visible hint, instead of the hint being threaded through the collection.
+   */
+  private async collectSnapshot(): Promise<PageSnapshot> {
     const locator = this.page.locator(SNAPSHOT_SELECTOR)
     const handles = await locator.elementHandles()
     // The handles go in as the page function's argument, and Playwright resolves them to
@@ -935,11 +1020,14 @@ export class AdoptedViewSession {
    */
   async clickRef(ref: number): Promise<void> {
     this.assertOpen()
-    const target = await this.targetOf(ref, 'clicked', true)
-    this.assertClickable(ref, target.facts, 'clicked')
-    await this.perform(`click on ref ${ref} (${target.facts.description})`, () =>
-      target.handle.click({ timeout: this.timeoutMs }),
-    )
+    await this.action(async (overlay) => {
+      const target = await this.targetOf(ref, 'clicked', true)
+      this.assertClickable(ref, target.facts, 'clicked')
+      await overlay.aim(target.facts.hit?.point)
+      await this.perform(`click on ref ${ref} (${target.facts.description})`, () =>
+        target.handle.click({ timeout: this.timeoutMs }),
+      )
+    })
   }
 
   /**
@@ -952,11 +1040,14 @@ export class AdoptedViewSession {
    */
   async hoverRef(ref: number): Promise<void> {
     this.assertOpen()
-    const target = await this.targetOf(ref, 'hovered', true)
-    this.assertClickable(ref, target.facts, 'hovered')
-    await this.perform(`hover on ref ${ref} (${target.facts.description})`, () =>
-      target.handle.hover({ timeout: this.timeoutMs }),
-    )
+    await this.action(async (overlay) => {
+      const target = await this.targetOf(ref, 'hovered', true)
+      this.assertClickable(ref, target.facts, 'hovered')
+      await overlay.aim(target.facts.hit?.point)
+      await this.perform(`hover on ref ${ref} (${target.facts.description})`, () =>
+        target.handle.hover({ timeout: this.timeoutMs }),
+      )
+    })
   }
 
   /**
@@ -973,10 +1064,13 @@ export class AdoptedViewSession {
    */
   async typeRef(ref: number, text: string): Promise<void> {
     this.assertOpen()
-    const target = await this.targetOf(ref, 'typed into')
-    await this.perform(`typing into ref ${ref} (${target.facts.description})`, () =>
-      target.handle.type(text, { timeout: this.timeoutMs }),
-    )
+    await this.action(async (overlay) => {
+      const target = await this.targetOf(ref, 'typed into')
+      await overlay.aim(target.facts.hit?.point)
+      await this.perform(`typing into ref ${ref} (${target.facts.description})`, () =>
+        target.handle.type(text, { timeout: this.timeoutMs }),
+      )
+    })
   }
 
   /**
@@ -993,10 +1087,13 @@ export class AdoptedViewSession {
    */
   async fillRef(ref: number, value: string): Promise<void> {
     this.assertOpen()
-    const target = await this.targetOf(ref, 'filled')
-    await this.perform(`filling ref ${ref} (${target.facts.description})`, () =>
-      target.handle.fill(value, { timeout: this.timeoutMs }),
-    )
+    await this.action(async (overlay) => {
+      const target = await this.targetOf(ref, 'filled')
+      await overlay.aim(target.facts.hit?.point)
+      await this.perform(`filling ref ${ref} (${target.facts.description})`, () =>
+        target.handle.fill(value, { timeout: this.timeoutMs }),
+      )
+    })
   }
 
   /**
@@ -1012,14 +1109,19 @@ export class AdoptedViewSession {
    */
   async pressKey(key: string, ref?: number): Promise<void> {
     this.assertOpen()
-    if (ref === undefined) {
-      await this.perform(`key press ${JSON.stringify(key)}`, () => this.page.keyboard.press(key))
-      return
-    }
-    const target = await this.targetOf(ref, 'pressed')
-    await this.perform(`key press ${JSON.stringify(key)} in ref ${ref} (${target.facts.description})`, () =>
-      target.handle.press(key, { timeout: this.timeoutMs }),
-    )
+    await this.action(async (overlay) => {
+      if (ref === undefined) {
+        // No ref means no element, hence no point to aim at: the key goes wherever the
+        // page put focus, and the overlay says that with a ring rather than a cursor.
+        await this.perform(`key press ${JSON.stringify(key)}`, () => this.page.keyboard.press(key))
+        return
+      }
+      const target = await this.targetOf(ref, 'pressed')
+      await overlay.aim(target.facts.hit?.point)
+      await this.perform(`key press ${JSON.stringify(key)} in ref ${ref} (${target.facts.description})`, () =>
+        target.handle.press(key, { timeout: this.timeoutMs }),
+      )
+    })
   }
 
   /**
@@ -1035,20 +1137,23 @@ export class AdoptedViewSession {
    */
   async selectRef(ref: number, option: string): Promise<string[]> {
     this.assertOpen()
-    const target = await this.targetOf(ref, 'used to select an option')
-    try {
-      return await target.handle.selectOption(option, { timeout: this.timeoutMs })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (/Did not find some options/.test(message)) {
-        throw new ViewActionError(
-          'failed',
-          `browser-view: ref ${ref} (${target.facts.description}) has no option matching ${JSON.stringify(option)} — ` +
-            "the string is matched against each option's value or its label; call browser_snapshot to see the control.",
-        )
+    return await this.action(async (overlay) => {
+      const target = await this.targetOf(ref, 'used to select an option')
+      await overlay.aim(target.facts.hit?.point)
+      try {
+        return await target.handle.selectOption(option, { timeout: this.timeoutMs })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (/Did not find some options/.test(message)) {
+          throw new ViewActionError(
+            'failed',
+            `browser-view: ref ${ref} (${target.facts.description}) has no option matching ${JSON.stringify(option)} — ` +
+              "the string is matched against each option's value or its label; call browser_snapshot to see the control.",
+          )
+        }
+        throw classifyActionFailure(error, `selecting ${JSON.stringify(option)} in ref ${ref} (${target.facts.description})`)
       }
-      throw classifyActionFailure(error, `selecting ${JSON.stringify(option)} in ref ${ref} (${target.facts.description})`)
-    }
+    })
   }
 
   /**
@@ -1066,30 +1171,37 @@ export class AdoptedViewSession {
    */
   async dragRef(fromRef: number, toRef: number): Promise<void> {
     this.assertOpen()
-    const source = await this.targetOf(fromRef, 'dragged', true)
-    this.assertClickable(fromRef, source.facts, 'dragged')
-    const target = await this.targetOf(toRef, 'dropped on', true)
-    this.assertClickable(toRef, target.facts, 'dropped on')
-    const from = await source.handle.boundingBox()
-    const to = await target.handle.boundingBox()
-    if (from === null || to === null) {
-      throw new ViewActionError(
-        'not-visible',
-        `browser-view: ref ${fromRef} (${source.facts.description}) or ref ${toRef} (${target.facts.description}) ` +
-          'has no box, so there is no point to drag between.',
+    await this.action(async (overlay) => {
+      const source = await this.targetOf(fromRef, 'dragged', true)
+      this.assertClickable(fromRef, source.facts, 'dragged')
+      const target = await this.targetOf(toRef, 'dropped on', true)
+      this.assertClickable(toRef, target.facts, 'dropped on')
+      const from = await source.handle.boundingBox()
+      const to = await target.handle.boundingBox()
+      if (from === null || to === null) {
+        throw new ViewActionError(
+          'not-visible',
+          `browser-view: ref ${fromRef} (${source.facts.description}) or ref ${toRef} (${target.facts.description}) ` +
+            'has no box, so there is no point to drag between.',
+        )
+      }
+      const start = { x: from.x + from.width / 2, y: from.y + from.height / 2 }
+      const end = { x: to.x + to.width / 2, y: to.y + to.height / 2 }
+      // The two ends of a drag are two different places on the page: the cursor goes to
+      // where the drag starts, the ripple to where it lands. Drawing both at one of them
+      // would misreport the gesture.
+      await overlay.aim(start)
+      overlay.landed(end)
+      await this.perform(
+        `drag of ref ${fromRef} (${source.facts.description}) onto ref ${toRef} (${target.facts.description})`,
+        async () => {
+          await this.page.mouse.move(start.x, start.y)
+          await this.page.mouse.down()
+          await this.page.mouse.move(end.x, end.y, { steps: 12 })
+          await this.page.mouse.up()
+        },
       )
-    }
-    const start = { x: from.x + from.width / 2, y: from.y + from.height / 2 }
-    const end = { x: to.x + to.width / 2, y: to.y + to.height / 2 }
-    await this.perform(
-      `drag of ref ${fromRef} (${source.facts.description}) onto ref ${toRef} (${target.facts.description})`,
-      async () => {
-        await this.page.mouse.move(start.x, start.y)
-        await this.page.mouse.down()
-        await this.page.mouse.move(end.x, end.y, { steps: 12 })
-        await this.page.mouse.up()
-      },
-    )
+    })
   }
 
   /**
@@ -1104,12 +1216,20 @@ export class AdoptedViewSession {
    */
   async scrollToRef(ref: number): Promise<ElementBounds> {
     this.assertOpen()
-    const target = await this.targetOf(ref, 'scrolled to')
-    await this.perform(`scroll to ref ${ref} (${target.facts.description})`, () =>
-      target.handle.scrollIntoViewIfNeeded({ timeout: this.timeoutMs }),
-    )
-    const after = (await target.handle.evaluate(inspectElement)) as ElementFacts
-    return after.rect
+    return await this.action(async (overlay) => {
+      const target = await this.targetOf(ref, 'scrolled to')
+      await this.perform(`scroll to ref ${ref} (${target.facts.description})`, () =>
+        target.handle.scrollIntoViewIfNeeded({ timeout: this.timeoutMs }),
+      )
+      // The rectangle that comes back is read from the element *after* the scroll, so the
+      // caller can see it is now inside the viewport instead of taking this method's word
+      // for it. The ripple's point comes out of the same single pass: aiming *before* the
+      // scroll would be aiming at nothing, because the element this action exists for is
+      // typically the one that was outside the viewport (ADR-0007).
+      const after = (await target.handle.evaluate(inspectElement)) as ElementFacts
+      overlay.landed(after.hit?.point)
+      return after.rect
+    })
   }
 
   /**
@@ -1121,7 +1241,11 @@ export class AdoptedViewSession {
   async scroll(direction: 'up' | 'down', amount: number): Promise<void> {
     this.assertOpen()
     const delta = direction === 'down' ? amount : -amount
-    await this.page.evaluate((pixels) => window.scrollBy(0, pixels), delta)
+    // A direction scroll has no element and no point, so the overlay shows a ring: a
+    // cursor would claim the agent pointed somewhere, and it did not.
+    await this.action(async () => {
+      await this.page.evaluate((pixels) => window.scrollBy(0, pixels), delta)
+    })
   }
 
   /**
@@ -1154,26 +1278,32 @@ export class AdoptedViewSession {
     }
     if (options.selector !== undefined) {
       const selector = options.selector
-      try {
-        await this.page.locator(selector).first().waitFor({ state: 'visible', timeout: timeoutMs })
-      } catch (error) {
-        throw this.timedOutWaiting(`selector ${JSON.stringify(selector)}`, timeoutMs, error)
-      }
-      return { waited: `selector ${selector}`, elapsedMs: Date.now() - started }
+      // A wait that ends without what it waited for is exactly the case the overlay must
+      // not draw as a success, so both branches run through the same outcome contract.
+      return await this.action(async () => {
+        try {
+          await this.page.locator(selector).first().waitFor({ state: 'visible', timeout: timeoutMs })
+        } catch (error) {
+          throw this.timedOutWaiting(`selector ${JSON.stringify(selector)}`, timeoutMs, error)
+        }
+        return { waited: `selector ${selector}`, elapsedMs: Date.now() - started }
+      })
     }
     const text = options.text as string
-    try {
-      // `innerText` is what the page *renders*, so text that exists only inside a
-      // `display:none` subtree does not count as having appeared.
-      await this.page.waitForFunction(
-        (wanted) => (document.body.innerText ?? '').includes(wanted),
-        text,
-        { timeout: timeoutMs },
-      )
-    } catch (error) {
-      throw this.timedOutWaiting(`text ${JSON.stringify(text)}`, timeoutMs, error)
-    }
-    return { waited: `text ${JSON.stringify(text)}`, elapsedMs: Date.now() - started }
+    return await this.action(async () => {
+      try {
+        // `innerText` is what the page *renders*, so text that exists only inside a
+        // `display:none` subtree does not count as having appeared.
+        await this.page.waitForFunction(
+          (wanted) => (document.body.innerText ?? '').includes(wanted),
+          text,
+          { timeout: timeoutMs },
+        )
+      } catch (error) {
+        throw this.timedOutWaiting(`text ${JSON.stringify(text)}`, timeoutMs, error)
+      }
+      return { waited: `text ${JSON.stringify(text)}`, elapsedMs: Date.now() - started }
+    })
   }
 
   /**
@@ -1195,14 +1325,16 @@ export class AdoptedViewSession {
   async extractText(maxChars?: number): Promise<ExtractedText> {
     this.assertOpen()
     const cap = Math.max(0, maxChars ?? this.maxChars)
-    // Self-contained on purpose: only this function's source crosses into the page.
-    const read = await this.page.evaluate(() => {
-      const body = document.body
-      const text = body === null ? '' : body.innerText
-      return { text, totalChars: text.length }
+    return await this.withReadFlash(async () => {
+      // Self-contained on purpose: only this function's source crosses into the page.
+      const read = await this.page.evaluate(() => {
+        const body = document.body
+        const text = body === null ? '' : body.innerText
+        return { text, totalChars: text.length }
+      })
+      const text = cutText(read.text, cap)
+      return { text, truncated: read.totalChars > text.length, totalChars: read.totalChars }
     })
-    const text = cutText(read.text, cap)
-    return { text, truncated: read.totalChars > text.length, totalChars: read.totalChars }
   }
 
   /**
@@ -1256,6 +1388,10 @@ export class AdoptedViewSession {
    */
   async screenshot(path: string): Promise<Buffer> {
     this.assertOpen()
+    // The agent asked for the page, so the page is what it gets: the marks come off
+    // first. Without this a cursor left over from the click just before would end up in
+    // the model's image of the site.
+    await this.clearOverlayMarks()
     const attemptMs = Math.max(1_000, Math.min(this.timeoutMs, SCREENSHOT_ATTEMPT_MS))
     let lastError: unknown
     for (let attempt = 1; attempt <= SCREENSHOT_ATTEMPTS; attempt++) {
@@ -1444,6 +1580,139 @@ export class AdoptedViewSession {
       await run()
     } catch (error) {
       throw classifyActionFailure(error, subject)
+    }
+  }
+
+  /**
+   * Make sure the overlay exists in the current document.
+   *
+   * Idempotent by construction (the page-side mount looks before it creates, measured:
+   * running it twice in one document leaves exactly one container), so every caller can
+   * just ask for it rather than track whether it already happened.
+   */
+  private async mountOverlayInPage(): Promise<void> {
+    try {
+      await this.page.evaluate(mountOverlay, this.overlay)
+    } catch {
+      // An evaluation that lands in the gap between two documents is refused by a
+      // destroyed execution context. That is not a failure: the next document mounts its
+      // own overlay through the init script registered in the constructor.
+    }
+  }
+
+  /**
+   * Draw one mark on the overlay.
+   *
+   * The overlay is a hint for a person watching, so a draw that cannot happen is dropped
+   * rather than raised: it must never be a reason for an action to fail. There is one
+   * case where it is dropped silently — a document whose overlay is not there (the page
+   * removed it, or the mount for this document has not landed yet) — and the marks simply
+   * do not appear in it. Mounting has its own three paths (this document on adoption,
+   * every new document through the init script, and `framenavigated`) and a fourth, hidden
+   * one inside the painter would only make "who mounts" unanswerable (T8).
+   *
+   * @param kind - which mark to draw.
+   * @param point - where, in viewport CSS pixels; only point-shaped marks use it.
+   */
+  private async paint(kind: OverlayKind, point?: ViewPoint): Promise<void> {
+    try {
+      await this.overlayReady
+      await this.page.evaluate(
+        paintOverlay,
+        point === undefined ? { config: this.overlay, kind } : { config: this.overlay, kind, point },
+      )
+    } catch {
+      /* a mark that cannot be drawn is not an action failure */
+    }
+  }
+
+  /**
+   * The overlay half of one action: aim before, and the *outcome* after.
+   *
+   * It wraps the **whole** action body, including "resolve the element and decide whether
+   * it can be acted on" — three of the four failure reasons (not-visible, obscured,
+   * not-found) are thrown there, before the action has begun. Only a contract that
+   * encloses that step can promise "a failure is drawn as a failure, wherever it came
+   * from"; a wrapper around the engine call alone would show a failure mark only when the
+   * engine was the one that failed.
+   *
+   * The two halves say different things on purpose: the cursor means "the agent is aiming
+   * here", the ripple means "it landed here", and a failure draws a red ring over the
+   * whole viewport instead — so a click that never happened is never drawn as a click
+   * that did.
+   *
+   * @param body - the action; it reports where it aims and, when that differs, where it
+   *   lands, through the {@link ActionOverlay} it is handed.
+   * @returns whatever the body returned.
+   */
+  private async action<T>(body: (overlay: ActionOverlay) => Promise<T>): Promise<T> {
+    let aimed: ViewPoint | undefined
+    let where: ViewPoint | undefined
+    let reported = false
+    const overlay: ActionOverlay = {
+      aim: async (point) => {
+        aimed = point
+        if (point !== undefined) await this.paint('aim', point)
+      },
+      landed: (point) => {
+        where = point
+        reported = true
+      },
+    }
+    let result: T
+    try {
+      result = await body(overlay)
+    } catch (error) {
+      await this.paint('failed')
+      throw error
+    }
+    const landed = reported ? where : aimed
+    // No point at all means the action was about the page as a whole (a direction scroll,
+    // a key press with no ref): a ring around the view is the honest shape for that, where
+    // a cursor would claim the agent pointed somewhere it did not.
+    await this.paint(landed === undefined ? 'page' : 'point', landed)
+    return result
+  }
+
+  /**
+   * The overlay half of one read: the viewport lights up while the page is being read.
+   *
+   * The flash carries no text on purpose — a text node anywhere in the overlay would
+   * put characters into the page's own `innerText`, and `browser_extract` promises to
+   * return exactly that (T8's measurement three).
+   *
+   * It is drawn at the *start* of the read, because a slow read is the case a person
+   * most needs to see; and if the read outlasts the flash it is drawn again at the end,
+   * so a long read does not end with no visible sign that it finished.
+   *
+   * @param read - the read itself.
+   * @returns whatever the read returned.
+   */
+  private async withReadFlash<T>(read: () => Promise<T>): Promise<T> {
+    const started = Date.now()
+    await this.paint('read')
+    try {
+      return await read()
+    } finally {
+      if (readFlashNeedsSecondPaint(Date.now() - started, MARK_PLANS.read.lifetimeMs ?? 0)) {
+        await this.paint('read')
+      }
+    }
+  }
+
+  /**
+   * Take the marks off the overlay before the agent photographs the page.
+   *
+   * The image `browser_screenshot` returns is the page, for a model that asked to see
+   * the page: a leftover cursor or ring in it would be the agent photographing its own
+   * furniture. Measured: with no marks on it the overlay contributes exactly zero
+   * pixels, so what the capture contains is the page and nothing else (T8).
+   */
+  private async clearOverlayMarks(): Promise<void> {
+    try {
+      await this.page.evaluate(clearOverlay, this.overlay)
+    } catch {
+      /* as above: housekeeping for a hint */
     }
   }
 
