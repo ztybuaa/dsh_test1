@@ -79,5 +79,24 @@
 ## 5. 本底稿未验证的
 
 - 上述 Desktop 侧的 `dsh-app://` 通道结论来自源码走读，**未在真实 Desktop 上端到端跑过**。
-- 第一方右栏 tab 系统在**第三方插件**里的实际装载路径未实测（注册契约是公开的，注释也明确"a tab type may ship from outside this repository"，但没跑过）。
-- 面板 body 自报 `getBoundingClientRect()` 给宿主来摆放原生视图的做法，是本项目的设计设想，**未验证**。
+- ~~第一方右栏 tab 系统在**第三方插件**里的实际装载路径未实测~~ → **已验到宿主层，见第 6 节**；面板 body 在真页面里**渲染并报到正确矩形**仍未跑过（属 T2）。
+- 面板 body 自报 `getBoundingClientRect()` 给宿主来摆放原生视图的做法是本项目的设计约定；其**坐标映射**已单独实测（见 `page-coordinates-map-to-view-bounds.md`），但**端到端的矩形流动**仍未跑过（属 T2）。
+
+## 6. 已验证：第三方插件的客户端半边会被组合进宿主的启动图
+
+2026-09-15 实测：真起一次 `dsh --profile dshviewer --no-open --port 0`，取回 `/` 的 index.html。
+
+`index.html` 里 `__DSH_BOOT__` 存在，字符串 `dsh-desktop-view` 出现 **5 次**。启动图里我们那一条是：
+
+```json
+{"id":"dsh-desktop-view",
+ "url":"/plugins/??dsh-desktop-view/client.js&rev=2ed34b2fe6047b6e-48",
+ "rev":"2ed34b2fe6047b6e-48",
+ "inject":[],"immediately":true}
+```
+
+它同时出现在三处：批次脚本的 `entries` 列表（`…/client.js` 那串，按执行顺序）、`entries` 数组、以及 plugin 行列表。
+
+**结论**：`package.json` 里声明 `exports["./client"]` 与 `dsh.client` 之后，宿主会自动把该插件**组合进客户端启动图**，并在 `/plugins/…` 上提供它的客户端 bundle；`id` 等于包名（与第 1 节的注册契约一致），`inject` / `immediately` 按声明生效。
+
+**本节只证明"宿主把它接上了"** —— 面板 body 真的渲染出来并报到正确矩形，仍需 T2 的证据。
