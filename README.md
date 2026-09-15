@@ -37,7 +37,10 @@ npm test
 ```
 
 它会真的拉起 `shell/main.js`(真 Electron、真窗口、真 `WebContentsView`),用插件的
-`AdoptedViewSession` 领养那块视图,然后断言:navigate 成功、能读到 DOM、click 生效(DOM 变更)。
+`AdoptedViewSession` 领养那块视图,然后按票分层断言:T1 的身份与领养、T2 的面板矩形 → 视图摆放、
+T3 的 `ref` 与 bounds、T4 的各类动作**外部效果**(点击改 DOM、填表后 `value` 真是那个值、Enter 触发提交、
+悬停才出现的东西真的出现、下拉选中的值、拖拽后顺序与几何都变了、滚动到元素用页面自己的
+`getBoundingClientRect()` 验证)以及**四类失败原因各自被区分开**。
 
 ## 直接用外壳
 
@@ -98,6 +101,33 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 
 `--help` 有全部开关。
 
+### 让 Agent 操作那一格(T4 交互面)
+
+`browser_snapshot` 给出带 `ref` 的可交互元素;下面这些工具**只按 `ref` 定位元素**,不让模型手写选择器:
+
+| 工具 | 作用 | 关键点 |
+|---|---|---|
+| `browser_click` | 点击 `ref` | 点不到时错误里会写清是哪一种 |
+| `browser_type` | 把 `ref` 的内容**替换**成 `text` | 一次设定值,不产生按键事件;`<input>` / `<textarea>` / `[contenteditable]` 都可用 |
+| `browser_type_keys` | 往 `ref` 里**逐键**输入 `text` | 每个字符都是真按键事件(自动补全、掩码这类控件要的就是这个);追加在已有内容之后 |
+| `browser_press_key` | 按一个键 | 不带 `ref` 时发给页面当前焦点(先 `browser_type` 再 `Enter` 就是提交表单);带 `ref` 则先聚焦该元素 |
+| `browser_hover` | 悬停 `ref` | 悬停后才出现的东西,再拍一次快照就有 `ref` 了 |
+| `browser_select` | 选中 `ref` 这个 `<select>` 里的某个选项 | 选项按 **value 或 label** 匹配 |
+| `browser_drag` | 把 `fromRef` 拖到 `toRef` | 真鼠标手势:按住源元素中心、分步移动、在目标中心松开 |
+| `browser_scroll` | 带 `ref`:滚动到该元素进入视口;不带 `ref`:按 `direction`/`amount` 滚像素 | |
+| `browser_wait` | 等 `ms` 固定时长 / 等 `selector` 出现 / 等 `text` 出现(三选一,`timeout` 限时) | |
+
+**动作失败一定说得出原因**,四类互不混淆(每类都在夹具页上有对应用例):
+
+| 失败原因 | 什么情况 | 错误里带着什么 |
+|---|---|---|
+| 超时 `timeout` | 等待没等到 | 等的是什么、给了多少毫秒、当前地址 |
+| 被遮挡 `obscured` | 元素可见、可点,但中心点上压着别的东西 | 遮挡者的描述(如 `div#act-blocker "blocker panel"`)与探测点坐标 |
+| 不可见 `not-visible` | 元素还在文档里,但没渲染(无渲染框或 `visibility: hidden`) | 元素描述 + "这就是快照用的那条 `:visible` 规则" |
+| 不存在 `not-found` | `ref` 不在最近一次快照里,或它钉住的那个节点已被移除 | `ref` 编号 + 元素描述 + 让它重拍快照 |
+
+另有一类 `stale-ref`:`ref` 属于视图已经不再显示的那个文档(导航之后),错误会给出当前地址。
+
 ## 身份握手为什么这么做
 
 同一个 Electron 应用里,**窗口页面和视图都是 CDP 的 `type: "page"`**,所以类型和 URL 都不能用来
@@ -116,21 +146,23 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 | `shell/geometry.js` | 摆放决定:面板矩形 ↔ 窗口裁剪,以及"没有矩形"与"没有地方"的区别 |
 | `shell/panel-rect.js` | 面板测量的**唯一事实源**:`getBoundingClientRect()` → 上报,null = 没有矩形 |
 | `shell/preload.js` | 矩形通道的页面半边:`contextBridge` 暴露 `window.__dshDesktopView`(只给窗口) |
-| `shell/fixture.js` | 内置离线夹具站点(回环、系统挑端口):`/shell`、`/view`、`/other`、`/panel` |
+| `shell/fixture.js` | 内置离线夹具站点(回环、系统挑端口):`/shell`、`/view`、`/other`、`/panel`、`/snapshot`、`/snapshot-many`、`/slow`、`/interact` |
 | `shell/cdp.js` | 端点等待、`/json/list`、`webContents` ↔ `targetId` 身份映射 |
 | `src/client-body.js` | 客户端半边:右栏 tab 类型(含 guide 入口)+ body + 面板组件,由构建脚本拼进 `client.js` |
-| `src/session.ts` | 领养模式会话:`goto` / `title` / `url` / `textOf` / `click` / `close` |
-| `src/tools.ts` | 唯一工具 `browser_navigate` |
+| `src/session.ts` | 领养模式会话:导航 / 快照 / 按 `ref` 的动作(点击、输入、按键、悬停、下拉、拖拽、滚动、三种等待)与失败原因定性 |
+| `src/tools.ts` | 工具面:`browser_navigate`、`browser_snapshot`,以及 T4 的 `browser_click` / `_type` / `_type_keys` / `_press_key` / `_hover` / `_select` / `_drag` / `_scroll` / `_wait` |
 | `src/index.ts` | 插件入口:`name` / `inject` / `Config` / `apply` |
 | `scripts/build-client.mjs` | 把 `shell/panel-rect.js` + `src/client-body.js` 拼成 `client.js`(带 `--check`) |
 | `client.js` | **生成文件**:宿主 `/plugins/…` 拉取的那一份,别手改 |
 | `tests/adopt-view.spec.ts` | T1 接缝测试 + `--dsh` 环境变量与 profile 交接测试 |
 | `tests/panel-placement.spec.ts` | T2 接缝测试:面板报矩形 → 外壳摆放视图 → 视图自己被读回 |
+| `tests/snapshot.spec.ts` | T3 接缝测试:ref 与 bounds,以及跨文档的 ref 失效语义 |
+| `tests/interaction.spec.ts` | T4 接缝测试:各类动作的外部效果,以及四类失败原因各自被区分开 |
 | `tests/client-half.spec.ts` | 客户端半边:宿主加载契约、tab 类型 + guide 入口、body、生成物是否陈旧 |
 | `tests/shell-harness.ts` | 测试用外壳进程夹具 |
 | `tests/fixtures/fake-dsh-web.mjs` | 假的 DSH,用来验证环境变量与 argv 交接 |
 
 ## 本仓库**不**包含
 
-screencast、MJPEG、`webServer`、mirror、`dsh-better-sidebar`、任务空间、快照、工具全集 ——
-都是被淘汰或属于后续票的东西。
+screencast、MJPEG、`webServer`、mirror、`dsh-better-sidebar`、任务空间、观测工具(截图 / 读正文 /
+执行表达式 / 接口数据,T5)、光标覆盖层(T8)—— 都是被淘汰或属于后续票的东西。

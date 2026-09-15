@@ -196,6 +196,164 @@ const SNAPSHOT_PAGE = `<!doctype html>
 </body></html>`
 
 /**
+ * The interaction page (T4).
+ *
+ * One page per action, and every action's effect is something a *different*
+ * mechanism can read back: a click changes a text node, hover reveals a control
+ * that was not in the snapshot, a drop reorders real children, and typing shows
+ * up in `input.value` and in a keydown counter.
+ *
+ * Three controls exist only to be *un-actionable*, so the three non-timeout
+ * failure reasons have a home:
+ *
+ *  - `#act-blocked` is fully covered by `#act-blocker`, which is deliberately a
+ *    plain `<div>`: it is not in the snapshot, it is a perfectly ordinary visible
+ *    box, and the only thing wrong with the world is that a click aimed at the
+ *    button would land on it. The engine agrees — a click on `#act-blocked` would
+ *    be retried forever — but the point of the fixture is that the *reason* is
+ *    nameable, and the covering element's `id` is what names it.
+ *  - `#act-hide-me` keeps its box and turns `visibility: hidden` on demand, so
+ *    "not visible" cannot be confused with "has no box" or "is gone".
+ *  - `#act-remove-me` is removed from the document on demand.
+ *
+ * `#act-far` sits at `top: 1500px`, well below the 800px-tall view: it is the
+ * element "scroll to" has to bring into the viewport.
+ *
+ * `#act-keycount` is not decoration. Playwright's `fill` sets a value through the
+ * editing pipeline (no key events) while `type` presses one key per character, so
+ * a counter that only keydown can move is how "input" and "fill" are told apart
+ * from the outside rather than from the implementation's own word.
+ */
+const INTERACT_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>interact-page</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 13px system-ui; }
+  .probe { position: absolute; box-sizing: border-box; }
+  #act-alpha { left: 20px; top: 20px; width: 150px; height: 32px; }
+  #act-blocked { left: 200px; top: 20px; width: 200px; height: 32px; }
+  /* The cover: same rectangle, drawn on top, and not an interactive element. */
+  #act-blocker { position: absolute; left: 200px; top: 20px; width: 200px; height: 32px;
+                 z-index: 5; background: rgba(200, 40, 40, 0.85); color: #fff;
+                 line-height: 32px; text-align: center; }
+  #act-input { left: 20px; top: 64px; width: 150px; height: 32px; }
+  #act-hide-trigger { left: 200px; top: 64px; width: 200px; height: 32px; }
+  #act-hide-me { left: 20px; top: 108px; width: 150px; height: 32px; }
+  #act-remove-trigger { left: 200px; top: 108px; width: 200px; height: 32px; }
+  #act-remove-me { left: 20px; top: 152px; width: 150px; height: 32px; }
+  #act-select { left: 200px; top: 152px; width: 200px; height: 32px; }
+  #act-editable { left: 20px; top: 196px; width: 150px; height: 40px; border: 1px solid #888;
+                  padding: 2px; overflow: hidden; }
+  #act-effect { position: absolute; left: 200px; top: 196px; font-family: ui-monospace, monospace; }
+  #act-keycount { position: absolute; left: 200px; top: 220px; font-family: ui-monospace, monospace; }
+  #act-hover { left: 20px; top: 240px; width: 150px; height: 32px; background: #eef; border: 1px solid #88a; }
+  #act-reveal { position: absolute; left: 160px; top: 0; width: 150px; height: 32px; display: none; }
+  #act-hover:hover #act-reveal { display: block; }
+  #act-key-input { left: 20px; top: 284px; width: 150px; height: 32px; }
+  #act-submit { left: 200px; top: 284px; width: 200px; height: 32px; }
+  #act-submitted { position: absolute; left: 20px; top: 320px; font-family: ui-monospace, monospace; }
+  #act-delay { left: 200px; top: 328px; width: 200px; height: 32px; }
+  #act-late { left: 20px; top: 372px; width: 150px; height: 32px; }
+  #act-late2 { position: absolute; left: 200px; top: 372px; font-family: ui-monospace, monospace; }
+  #act-list { position: absolute; left: 20px; top: 416px; width: 400px; }
+  .drag-item { display: block; width: 150px; height: 32px; margin-bottom: 8px; text-align: left;
+               box-sizing: border-box; }
+  #act-far { left: 20px; top: 1500px; width: 150px; height: 32px; }
+</style></head>
+<body>
+<button id="act-alpha" class="probe" onclick="document.getElementById('act-effect').textContent='alpha-clicked'">alpha</button>
+<button id="act-blocked" class="probe">blocked control</button>
+<div id="act-blocker">blocker panel</div>
+<input id="act-input" class="probe" type="text" placeholder="name field">
+<button id="act-hide-trigger" class="probe">hide the target</button>
+<button id="act-hide-me" class="probe">hide target</button>
+<button id="act-remove-trigger" class="probe">remove the target</button>
+<button id="act-remove-me" class="probe">remove target</button>
+<select id="act-select" class="probe" aria-label="colour">
+  <option value="red">Red</option>
+  <option value="green" selected>Green</option>
+  <option value="blue">Blue</option>
+</select>
+<div id="act-editable" class="probe" contenteditable="true" aria-label="editable note">seed text</div>
+<output id="act-effect">none</output>
+<output id="act-keycount">keydowns:0</output>
+<div id="act-hover" class="probe" role="button" aria-label="hover me">hover me<button id="act-reveal">revealed control</button></div>
+<form id="act-form" action="/interact">
+  <input id="act-key-input" class="probe" type="text" placeholder="key field">
+  <button id="act-submit" class="probe" type="submit">submit form</button>
+</form>
+<output id="act-submitted">nothing submitted</output>
+<button id="act-delay" class="probe">start the delayed updates</button>
+<button id="act-late" class="probe" hidden>late text</button>
+<output id="act-late2">not yet</output>
+<div id="act-list">
+  <div id="act-item-1" class="drag-item" role="button" draggable="true">item one</div>
+  <div id="act-item-2" class="drag-item" role="button" draggable="true">item two</div>
+</div>
+<button id="act-far" class="probe">far control</button>
+<script>
+(function () {
+  var byId = function (id) { return document.getElementById(id) }
+
+  byId('act-alpha').addEventListener('click', function () {
+    byId('act-effect').textContent = 'alpha-clicked'
+  })
+  byId('act-hide-trigger').addEventListener('click', function () {
+    // Keeps its rectangle on purpose: "hidden" must not be confusable with "no box".
+    byId('act-hide-me').style.visibility = 'hidden'
+  })
+  byId('act-remove-trigger').addEventListener('click', function () {
+    byId('act-remove-me').remove()
+  })
+  byId('act-form').addEventListener('submit', function (event) {
+    event.preventDefault()
+    byId('act-submitted').textContent = 'submitted:' + byId('act-key-input').value
+  })
+
+  // Every keydown in the text field, so "typed as keys" and "value set in one
+  // operation" are different observable facts.
+  var keydowns = 0
+  byId('act-input').addEventListener('keydown', function () {
+    keydowns += 1
+    byId('act-keycount').textContent = 'keydowns:' + keydowns
+  })
+
+  byId('act-delay').addEventListener('click', function () {
+    setTimeout(function () { byId('act-late').hidden = false }, 300)
+    setTimeout(function () { byId('act-late2').textContent = 'second-stage' }, 900)
+  })
+
+  // HTML5 drag and drop: the source is remembered on dragstart, the drop moves it
+  // to the other item's place (so a swap in either direction is a real reorder).
+  var dragSource = null
+  var list = byId('act-list')
+  var items = list.querySelectorAll('.drag-item')
+  for (var i = 0; i < items.length; i++) {
+    items[i].addEventListener('dragstart', function (event) {
+      dragSource = event.currentTarget
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = 'move'
+        event.dataTransfer.setData('text/plain', event.currentTarget.id)
+      }
+    })
+  }
+  list.addEventListener('dragover', function (event) { event.preventDefault() })
+  list.addEventListener('drop', function (event) {
+    event.preventDefault()
+    var target = event.target.closest ? event.target.closest('.drag-item') : null
+    if (dragSource === null || target === null || target === dragSource) return
+    if (dragSource.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      list.insertBefore(dragSource, target.nextSibling)
+    } else {
+      list.insertBefore(dragSource, target)
+    }
+    dragSource = null
+  })
+})()
+</script>
+</body></html>`
+
+/**
  * The truncation page (T3): more interactive elements than the default cap of 200,
  * each with a non-empty box so none of them is excluded for being invisible. It is
  * how "the snapshot stops at maxElements and says so" is observed at the default cap,
@@ -236,6 +394,7 @@ const ROUTES = {
   '/view': () => ({ body: page('view-page', `<p>Initial content of the native browser view.</p>${button('view')}`), type: 'text/html; charset=utf-8' }),
   '/other': () => ({ body: page('other-page', `<p>Reached by navigating the view.</p>${button('other')}`), type: 'text/html; charset=utf-8' }),
   '/snapshot': () => ({ body: SNAPSHOT_PAGE, type: 'text/html; charset=utf-8' }),
+  '/interact': () => ({ body: INTERACT_PAGE, type: 'text/html; charset=utf-8' }),
   '/snapshot-many': () => ({ body: MANY_PAGE, type: 'text/html; charset=utf-8' }),
   '/slow': () => ({ slow: SLOW_PAGE, type: 'text/html; charset=utf-8' }),
   '/panel': () => ({ body: PANEL_PAGE, type: 'text/html; charset=utf-8' }),
