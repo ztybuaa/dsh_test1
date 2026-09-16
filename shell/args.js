@@ -65,8 +65,19 @@ function parseArgv(argv) {
     help: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
-    const flag = argv[index]
+    const raw = argv[index]
+    // 等号形式（`--url=<url>`）与空格形式等价，只对这两个开关生效。
+    //
+    // 为什么文档优先写等号形式：Electron 在**应用代码跑起来之前**就会因为"一个独立的
+    // URL 参数后面还跟着别的参数"直接退出（零输出、退出码 0xFFFFFFFF），所以
+    // `--url <url> --view-url <url>` 这种写法根本轮不到这里解析 —— 外壳运行时救不了自己。
+    // 等号形式把 URL 留在开关 token 里，那条规则不会触发。规则刻画与原始测量见
+    // docs/research/t14-cli-url-token-kills-electron.md。
+    const equals = raw.startsWith('--url=') || raw.startsWith('--view-url=') ? raw.indexOf('=') : -1
+    const flag = equals === -1 ? raw : raw.slice(0, equals)
+    const inlineValue = equals === -1 ? undefined : raw.slice(equals + 1)
     const value = () => {
+      if (inlineValue !== undefined) return inlineValue
       index += 1
       if (index >= argv.length) throw new Error(`${flag} requires a value`)
       return argv[index]
@@ -147,8 +158,15 @@ function usage() {
   return [
     'Usage: electron shell/main.js [options]',
     '',
-    '  --url <url>              URL for the window (DSH UI or any page). Default: built-in fixture /shell',
-    '  --view-url <url>         Initial URL for the native browser view. Default: built-in fixture /view',
+    '  --url=<url>              URL for the window (DSH UI or any page). Default: built-in fixture /shell',
+    '  --view-url=<url>         Initial URL for the native browser view. Default: built-in fixture /view',
+    '                           Write URL switches with `=`. A bare URL argument followed by any further',
+    '                           argument makes electron.exe quit *before this program runs*: no output,',
+    '                           exit code 0xFFFFFFFF, no usage text — so `--url <url> --view-url <url>`',
+    '                           never reaches this parser, and the shell cannot defend itself at runtime.',
+    '                           The space form (`--url <url>`) is only survivable while that URL is the',
+    '                           last argument; the `=` form is never affected.',
+    '                           Rule and raw measurements: docs/research/t14-cli-url-token-kills-electron.md',
     '  --dsh                    Start `dsh --profile <profile> --no-open --port 0`, parse its address, load it in',
     '                           the window, and hand the view over to it through DSH_DESKTOP_VIEW_* variables',
     '  --dsh-command <cmd>      Executable used by --dsh (default: dsh)',

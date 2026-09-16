@@ -338,6 +338,12 @@ T6DRIVE {"kind":"persist-read","value":{"cookie":"","local":null,"session":null,
 
 **本票的影响**：探针与测试都避开这个形状（唯一一个 URL 参数放最后，或不通过 CLI 传 URL）；**没有**顺手去修外壳的 CLI 解析（不属本票范围）。
 
+> 续集：票 **#14** 把这半张表补完了（94 个形状、判据的精确边界、等号形式在任何位置都免疫），
+> 并据此改了 README 与 `--help` 的写法、给 `args.js` 补上 `--url=<url>` / `--view-url=<url>`、
+> 加了一条跑文档命令的守卫测试。完整规则与原始输出见
+> [`t14-cli-url-token-kills-electron.md`](t14-cli-url-token-kills-electron.md) ——
+> 本节那张表与它逐条一致，唯一被**放宽**的是"标准 scheme"这个说法：`foo:` / `tel:+123` 一样触发。
+
 ---
 
 ## 9. 对实现的直接含义

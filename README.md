@@ -78,10 +78,24 @@ npm run shell
 npm run shell:fixture
 
 # ③ 手工写法与全部开关,仍然照旧(--help 有全部开关)
+#    URL 开关一律写等号形式(`--url=<url>`),理由见下面那段
 npx electron shell/main.js
-npx electron shell/main.js --url https://example.com --view-url https://example.org
+npx electron shell/main.js --url=https://example.com --view-url=https://example.org
 npx electron shell/main.js --dsh
 ```
+
+> **URL 开关一律写等号形式**(`--url=<url>` / `--view-url=<url>`)。
+> 写成空格形式(`--url <url>`)时,只要那个 URL 参数**后面还有任何别的参数**,Electron 就会在
+> **应用代码跑起来之前**直接退出:**零输出**,退出码 `0xFFFFFFFF` —— 连 `shell/args.js` 的 argv 校验
+> 都轮不到执行,也就是说**外壳运行时救不了自己**,`--help` 也不会打出来。用户看到的是"命令敲了,
+> 什么都没发生"。
+>
+> 已经量到的边界(完整规则表与原始输出见
+> [`docs/research/t14-cli-url-token-kills-electron.md`](docs/research/t14-cli-url-token-kills-electron.md)):
+> 等号形式**在任何位置都免疫**;空格形式只在"这个 URL 就是最后一个参数"时才安全 ——
+> 所以 `--view-url https://…` 写在末尾能用只是**位置**安全,后面再追加一个参数就立刻变成上面那条。
+> 单字母"方案"(`C:\x`、`a:b`)不算 URL,开关叫什么名字不影响这条规则;外壳自己 spawn 的 `dsh`
+> 子进程跑的是 Node、argv 里也没有 URL,不受影响。
 
 - **①** 就是 `electron shell/main.js --dsh`:外壳**自己拉起** DSH、**让系统挑端口**(`--port 0`)、
   **不打开你的系统默认浏览器**(`--no-open`);窗口里装的是 DSH 的界面,侧边栏那一格交给原生浏览器视图。
@@ -89,7 +103,7 @@ npx electron shell/main.js --dsh
   [`docs/research/t12-one-command-and-the-three-first-evidence.md`](docs/research/t12-one-command-and-the-three-first-evidence.md)。
 - **②** 是开发用的那条路:没有 DSH,窗口与视图都装内置夹具页(`/shell`、`/view`)。
 - **③** `shell/main.js` 的所有开关(`--url` / `--view-url` / `--bounds` / `--cdp-port` / `--proxy` …)
-  照旧可用;往脚本上追加参数也一样:`npm run shell -- --view-url https://www.bing.com`。
+  照旧可用;往脚本上追加参数也一样:`npm run shell -- --view-url=https://www.bing.com`。
 - **同时开两个外壳**:给每个一个自己的档案目录
   (`npm run shell -- --user-data-dir $env:TEMP\dsh-shell-2`)。共用默认目录"能用",但第二个外壳的
   磁盘缓存会报 `Unable to move the cache: 拒绝访问`(实测,见上面那份底稿 §4.3)。
@@ -317,6 +331,7 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 | `tests/client-half.spec.ts` | 客户端半边:宿主加载契约、tab 类型 + guide 入口、body、生成物是否陈旧 |
 | `tests/shell-harness.ts` | 测试用外壳进程夹具(也能跑**任意一条会打印握手的命令**——票 #12 用它跑真的 `npm run shell`;`makeTempDshHome` 现搭一个临时 `DSH_HOME`,用户自己的 `.dsh` 一个字节都不碰) |
 | `tests/acceptance.spec.ts` | 票 #12 的验收:`npm run shell` 一条命令起完整外壳、不抢端口(两个外壳同时)、不打开系统浏览器、真宿主 `ctx.tools` 注册表本体、经注册表驱动那一格、截图进真附件 store 并读回 |
+| `tests/cli-shape.spec.ts` | 票 #14 的守卫:**本文档里每一条外壳命令都是已证明安全的形状**,而且带 URL 的那条会被**原样跑一遍**;反证 = 旧形状必须秒退 `0xFFFFFFFF`(规则与原始测量见 [`docs/research/t14-cli-url-token-kills-electron.md`](docs/research/t14-cli-url-token-kills-electron.md)) |
 | `tests/fixtures/dsh-probe/` | 只读探针插件:装进临时 profile,在真宿主里读回注册表本体并驱动那一格(票 #12 用) |
 | `docs/acceptance-checklist.md` | 给用户看的验收清单(每条标明谁验的、以及本期不做什么) |
 | `tests/fixtures/fake-dsh-web.mjs` | 假的 DSH,用来验证环境变量与 argv 交接 |
