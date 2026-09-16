@@ -311,7 +311,15 @@ describe('票 #11 · 那一格渲染的是说明文字，不是空白', () => {
           }
           for (const child of children.flat()) {
             if (child === null || child === undefined || child === false) continue
-            element.append(String(child))
+            // 真的 DOM 节点就**挂上去**，别的收成文本。
+            //
+            // 这一条是 T13 加的：面板那棵树从"一个 div 里一段文案"变成了"根 div 里还有一格"，
+            // 而 `String(child)` 会把那一格变成 `"[object HTMLDivElement]"` —— 于是面板看起来
+            // **渲染成了一串乱码**，而那与被测代码毫无关系（它是这个替身不够用）。
+            // 真 React 里 `createElement` 返回的是虚拟节点，这里的替身直接返回 DOM 节点，
+            // 所以"是节点就 append"才是它与真 React 在这件事上等价的写法。
+            if (child instanceof Node) element.append(child)
+            else element.append(String(child))
           }
           return element
         },
@@ -356,10 +364,14 @@ describe('票 #11 · 那一格渲染的是说明文字，不是空白', () => {
           tabInfo: () => ({ sidebar: { expanded: true }, tab: { visible: true } }),
         })
         document.body.replaceChildren(element)
+        // 那一格自报的状态**不在根节点上**：T13 之后根节点里多了一条工具条，
+        // 而状态挂在装视图的那一格上（工具条让出了它的高度）。所以这里找的是**那一格**，
+        // 而不是渲染出来的最外层 —— 后者从"面板"变成了"面板 + 工具条"。
+        const pane = element.querySelector('[data-dsh-desktop-view-panel]')
         return {
           language,
           text: (element.innerText ?? '').trim(),
-          state: element.getAttribute('data-dsh-desktop-view-panel'),
+          state: pane === null ? null : pane.getAttribute('data-dsh-desktop-view-panel'),
           delivered: host.DshPanelRect.deliver({ x: 0, y: 0, width: 10, height: 10 }),
         }
       }
@@ -434,6 +446,8 @@ describe('票 #11 · 那一格渲染的是说明文字，不是空白', () => {
 describe('票 #11 · 无外壳时工具的注册面与回答', () => {
   /** 真的 `apply()` 注册出来的工具，原样留着。 */
   let registered: ToolDefinition[] = []
+  /** `apply()` 往宿主连接服务上挂出去的路由（T13）。 */
+  let hostRoutes: Array<{ path: string; methods: readonly string[] }> = []
   /** 执行工具时的第二个参数，本仓库既有测试的写法。 */
   const IGNORED_EXEC = undefined as unknown as Parameters<ToolDefinition['execute']>[1]
   /** 被临时摘掉的环境变量，测完放回去。 */
@@ -446,10 +460,22 @@ describe('票 #11 · 无外壳时工具的注册面与回答', () => {
       delete process.env[key]
     }
     registered = []
+    /** 面板那条通道注册出去的路由（T13：宿主那半边会往 `connection.fetch` 上挂它）。 */
+    const registeredRoutes: Array<{ path: string; methods: readonly string[] }> = []
     const ctx = {
       effect: (fn: () => unknown) => fn(),
       attachments: {},
       tools: { register: (tool: ToolDefinition) => registered.push(tool) },
+      // 没有外壳时的宿主仍然有这条服务（它是载体无关的注册表），所以这里照实提供它：
+      // 注册**会**成功，而每一条 RPC 在领养视图时失败并如实说"没有端点"（T13）。
+      connection: {
+        fetch: {
+          register: (route: { path: string; methods: readonly string[] }) => {
+            registeredRoutes.push(route)
+            return () => Promise.resolve()
+          },
+        },
+      },
     }
     apply(ctx as never, {
       timeoutMs: 30_000,
@@ -457,6 +483,7 @@ describe('票 #11 · 无外壳时工具的注册面与回答', () => {
       maxChars: 20_000,
       screenshotDir: '.',
     } as never)
+    hostRoutes = registeredRoutes
   })
 
   afterAll(() => {
@@ -521,6 +548,9 @@ describe('票 #11 · 无外壳时工具的注册面与回答', () => {
       browser_evaluate: { expression: '1' },
       browser_upload: { ref: 1, path: 'x' },
       browser_space: { action: 'list' },
+      // T13：导航与缩放那条工具。`action` 是必填的，所以这里也给它 ——
+      // 少了它这一条会停在"参数校验失败"，而这一条要问的是"没有端点时它说什么"。
+      browser_view: { action: 'back' },
     }
 
     const answers: Array<{ tool: string; args: Record<string, unknown>; message: string }> = []

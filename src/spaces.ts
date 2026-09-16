@@ -68,6 +68,14 @@ export interface SpaceRecord {
   isDefault: boolean
   /** `session.cookies.get({})` 的条数，读回来的。 */
   cookieCount: number
+  /**
+   * `webContents.getZoomFactor()` 的读回值（票 #13 的缩放）。
+   *
+   * **缩放是每块视图自己的属性**，所以它跟着空间走，而不是跟着"当前是哪个空间"走
+   * —— 与 `per-space 一块视图` 同一层。缺省 = 外壳没说（旧外壳不发布这个字段，
+   * 或者这块视图的 webContents 已经不在了），**不**当成 1。
+   */
+  zoom?: number
   /** 外壳建这个空间时真的搬过来了什么，读回来的。 */
   inherited?: {
     sourceUrl: string
@@ -160,6 +168,12 @@ export interface SpaceManagerOptions {
   maxChars: number
   /** 等外壳处理请求时的轮询间隔。 */
   pollMs?: number
+  /**
+   * 外壳握手里说的初始页（`DSH_DESKTOP_VIEW_URL`），交给会话供「重新开始」用（T13）。
+   *
+   * 缺省 = 外壳没说，那时「重新开始」会退到空白页并**说出来**，而不是假装回到了哪一页。
+   */
+  initialUrl?: string
 }
 
 /** 等外壳处理请求时的轮询间隔：本地小文件，快一点没有代价。 */
@@ -269,6 +283,11 @@ export function parseSpaceState(raw: string): SpaceState | undefined {
       active: space.active === true,
       isDefault: space.isDefault === true,
       cookieCount: typeof space.cookieCount === 'number' ? space.cookieCount : 0,
+      // 缩放只在**读得回来**的时候才带上：`getZoomFactor()` 是唯一的真值来源，
+      // 视图没了就没人能回答它，那时缺省比编一个 1 更诚实（工具会因此说"外壳没说"）。
+      ...(typeof space.zoom === 'number' && Number.isFinite(space.zoom) && space.zoom > 0
+        ? { zoom: space.zoom }
+        : {}),
       ...(space.inherited !== undefined && space.inherited !== null
         ? { inherited: space.inherited as SpaceRecord['inherited'] }
         : {}),
@@ -322,8 +341,16 @@ export interface SpaceRequest {
   id: number
   /** 期望的当前空间。 */
   active: string
-  /** 期望存在的空间名列表。 */
-  spaces: string[]
+  /**
+   * 期望存在的空间。每一项可以只是一个名字，也可以带上**这块视图期望的缩放**
+   * （`{name, zoom}`，票 #13）。
+   *
+   * 为什么缩放挂在空间这一层，而不是单开一条通道：缩放本来就是**每块视图自己的属性**，
+   * 而"每空间一块视图"正是这张表已经在表达的事实；单开一条通道就是拿一条通道干两件事。
+   * 为什么只有被改动的那个空间带 `zoom`：这条请求是**期望状态的快照**，把没打算动的空间
+   * 也写上一个值，就等于"外壳按这个值把它改回去"，用户用 Ctrl+滚轮在别处调过的缩放会被抹掉。
+   */
+  spaces: Array<string | { name: string; zoom: number }>
 }
 
 /**
@@ -390,6 +417,44 @@ export function planRequest(
 }
 
 /**
+ * 把"给某一个空间换缩放"算成一条请求（票 #13）。
+ *
+ * 与 {@link planRequest} 分开，是因为它服务的是**另一件事**：`planRequest` 管的是
+ * "有哪些空间、当前是哪个"，而这条只管"这块视图的缩放该是多少"。混进 `planRequest`
+ * 会把 `browser_space` 的动作表也拖上一个 `zoom` 参数，那不是这张票要的形状。
+ *
+ * 纯函数：不碰文件、不连外壳，所以"给不存在的空间设缩放"这类判断能不起外壳被单独读回。
+ *
+ * @param state - 最近一次读到的实际状态。
+ * @param name - 要改缩放的空间名。
+ * @param zoom - 期望的缩放值（范围由 `src/navigation.ts` 的 `normalizeZoom` 负责，这里只管名字）。
+ * @returns 请求，或一条能直接给模型看的错误。
+ */
+export function planZoom(
+  state: SpaceState,
+  name: string,
+  zoom: number,
+): { request: SpaceRequest } | { error: string } {
+  const wanted = name.trim()
+  if (!state.spaces.some((space) => space.name === wanted)) {
+    return {
+      error:
+        `there is no space named "${wanted}" in the desktop shell ` +
+        `(it has: ${state.spaces.map((space) => space.name).join(', ')}); ` +
+        'call browser_space with action "list" to see which spaces exist',
+    }
+  }
+  return {
+    request: {
+      id: state.requestId + 1,
+      active: state.active,
+      // 只有这一个空间带 `zoom`，其余原样是名字（理由见 {@link SpaceRequest.spaces}）。
+      spaces: state.spaces.map((space) => (space.name === wanted ? { name: space.name, zoom } : space.name)),
+    },
+  }
+}
+
+/**
  * 把状态渲染成给模型看的几行。
  *
  * 跳过的记录**在这里说**：一张少了一条的表如果不说明它少了一条，读的人只会以为那个空间
@@ -440,6 +505,13 @@ export class SpaceManager {
   private readonly maxElements: number
   private readonly maxChars: number
   private readonly pollMs: number
+  /**
+   * 外壳握手里说的**初始页**（`DSH_DESKTOP_VIEW_URL`），「重新开始」要回到的就是它（T13）。
+   *
+   * 为什么不从状态表里那个 `url` 取：那是**视图现在在哪**（它会跟着导航变），而"重新开始"
+   * 要的是**外壳当初把它放在哪**。两句话长得像，意思不同。
+   */
+  private readonly initialUrl: string | undefined
   private readonly sessions = new Map<string, AdoptedViewSession>()
 
   /** @param options - 通道目录、超时与两个读取上限。 */
@@ -454,6 +526,7 @@ export class SpaceManager {
     this.maxElements = options.maxElements
     this.maxChars = options.maxChars
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS
+    this.initialUrl = options.initialUrl
   }
 
   /**
@@ -529,9 +602,19 @@ export class SpaceManager {
       timeoutMs: this.timeoutMs,
       maxElements: this.maxElements,
       maxChars: this.maxChars,
+      // 「重新开始」要回到的那一页来自**握手**，不是状态表里那个会跟着导航变的 `url`（T13）。
+      ...(this.initialUrl !== undefined && this.initialUrl !== '' ? { url: this.initialUrl } : {}),
       // 下载日志与空间状态**在同一个通道目录里**：都是外壳写、插件读的那一半
       // （ADR-0011）。没有通道就没有下载日志，`browser_download` 会如实说"没人可问"。
       ...(this.downloadJournalFile !== undefined ? { downloadJournalFile: this.downloadJournalFile } : {}),
+      // 缩放（T13）：插件够不到 Electron 的 `setZoomFactor`，所以缩放**只能**请外壳去做，
+      // 而做与读回走的是同一条既有通道（ADR-0013）。会话拿到的是一个绑到**这个空间**上的口子，
+      // 所以"缩哪个视图"这件事不需要再传一次空间名。
+      zoomPort: {
+        setZoom: async (value: number) => (await this.setZoom(record.name, value)).zoom,
+      },
+      // 领养时的缩放用外壳**已经发布的读回值**当起点：会话手里那个数不许比外壳知道的更自信。
+      ...(record.zoom !== undefined ? { zoom: record.zoom } : {}),
     })
     this.sessions.set(record.name, session)
     return session
@@ -580,6 +663,41 @@ export class SpaceManager {
           ? `the active space is now "${after.active}"`
           : `closed the space "${name}" and erased its storage; its directory is removed when the shell next starts`
     return { action, state: after, ...(record !== undefined ? { space: record } : {}), message }
+  }
+
+  /**
+   * 把某一个空间的视图缩放到某个值，**等外壳真的做完并读回**（票 #13）。
+   *
+   * 这就是"工具调用必须是确定的"那一条在缩放上的写法：写下去的请求带一个单调递增的 id，
+   * 外壳做完它、把 `getZoomFactor()` 的读回值写进 state，这里等那个 id 并把**读回的那个数**
+   * 返回给调用方。外壳没发布 zoom（旧外壳，或那块视图已经没了）时**抛**，不编一个数 ——
+   * 一个没读回来的"我已经缩放了"正是这张票要消灭的形状。
+   *
+   * @param name - 空间名。
+   * @param zoom - 期望的缩放值。
+   * @returns 外壳读回来的缩放值，以及它发布的那条空间记录。
+   * @throws 没有这个空间、外壳拒绝了请求、或外壳没发布读回值时。
+   */
+  async setZoom(name: string, zoom: number): Promise<{ zoom: number; space: SpaceRecord }> {
+    const before = this.requireState()
+    const planned = planZoom(before, name, zoom)
+    if ('error' in planned) throw new Error(planned.error)
+    this.writeRequest(planned.request)
+    const after = await this.awaitRequest(planned.request.id)
+    if (after.error !== null) {
+      throw new Error(`the desktop shell refused space request ${planned.request.id}: ${after.error}`)
+    }
+    const record = after.spaces.find((space) => space.name === name.trim())
+    if (record === undefined) {
+      throw new Error(`the desktop shell stopped describing the space "${name.trim()}" while its zoom was being set`)
+    }
+    if (record.zoom === undefined) {
+      throw new Error(
+        `the desktop shell handled zoom request ${planned.request.id} but published no zoom for "${record.name}": ` +
+          'the view cannot be reported as zoomed without the factor the shell read back from Electron',
+      )
+    }
+    return { zoom: record.zoom, space: record }
   }
 
   /** Close every adopted session. Disconnecting never closes the shell that owns the views. */

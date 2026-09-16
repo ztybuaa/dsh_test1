@@ -433,6 +433,16 @@ export interface StartShellOptions {
    * DSH 就会把 profile、会话、凭据全写在临时目录里。
    */
   env?: NodeJS.ProcessEnv
+  /**
+   * 让外壳的窗口**真的显示出来**（票 #13 的像素验收要它）。
+   *
+   * 缺省（false）用 `windowsHide: true` 起外壳 —— 那是本套件一直以来的做法，也**只有在那种
+   * 情况下**窗口才不出现在屏幕/窗口枚举里：实测 `windowsHide: true` 会让 Windows 把该进程的
+   * 第一个顶层窗口按 `SW_HIDE` 建出来，于是布局、CDP、发布的状态**一切照常**，只是没有画面。
+   *
+   * 量像素的那条路必须把它设成 true：没有真实画面就没有"用户在窗格里看到什么"这回事。
+   */
+  windowVisible?: boolean
 }
 
 /** Options accepted by {@link ShellProcess.stop}. */
@@ -511,7 +521,8 @@ export async function launchShellProcess(input: LaunchShellInput): Promise<Shell
     {
       cwd: options.cwd ?? REPO_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
+      // 只有"要量像素"的那条路才把窗口显示出来（见 {@link StartShellOptions.windowVisible}）。
+      windowsHide: options.windowVisible !== true,
       ...(options.env === undefined ? {} : { env: { ...process.env, ...options.env } }),
     },
   )

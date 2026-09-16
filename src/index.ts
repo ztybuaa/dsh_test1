@@ -5,6 +5,7 @@ import { AdoptedViewSession, DEFAULT_MAX_CHARS, DEFAULT_MAX_ELEMENTS } from './s
 import { resolveScreenshotDir } from './screenshots.ts'
 import { SpaceManager, spaceChannelFrom, userDataDirFromSpaceState } from './spaces.ts'
 import { desktopViewTools } from './tools.ts'
+import { registerViewRpc } from './view-host.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'desktop-view'
@@ -16,8 +17,15 @@ export const name = 'desktop-view'
  * *through* that service, so a deployment without it would leave the tool able to write
  * a file and unable to deliver an image. Declaring it in `inject` makes the loader wait
  * for the service instead of letting the tool discover its absence at call time.
+ *
+ * `connection` is the carrier-neutral RPC service (ADR-0003). It is what lets the **panel's**
+ * toolbar reach this process — the panel is a page inside the shell's own window, so a click
+ * there has no other way back to the view's CDP session (T13). It is `connection` and **not**
+ * `connection` plus `webServer`: measured, `ctx.connection.fetch.register()` does not read
+ * `webServer` (unlike `rpc.handle`, which does), and requiring `webServer` would refuse to
+ * mount this plugin in a host that has no web server at all.
  */
-export const inject = ['tools', 'attachments']
+export const inject = ['tools', 'attachments', 'connection']
 
 /** Plugin configuration. */
 export interface Config {
@@ -90,6 +98,10 @@ export function apply(ctx: Context, config: Config): void {
           timeoutMs: config.timeoutMs,
           maxElements: config.maxElements,
           maxChars: config.maxChars,
+          // 握手说的那一页：「重新开始」要回到的就是它（T13）。
+          // 从这一层传下去，因为**默认空间的状态表里那个 `url` 不是它** —— 那个值是
+          // "视图现在在哪"，会跟着导航变。
+          ...(url !== undefined && url !== '' ? { initialUrl: url } : {}),
         })
 
   /**
@@ -157,6 +169,17 @@ export function apply(ctx: Context, config: Config): void {
       if (spaces !== undefined) void spaces.close()
     }
   })
+
+  // 面板那半边的入口（T13）。它注册在**同一个** `adopt` 上，所以工具条上的"后退"与
+  // Agent 的 `browser_view` 调的是同一个会话、同一个活动空间 —— 这正是这张票把两个面
+  // 放在一张票里的原因。注册失败不算致命（比如一个没有 web 载体的宿主）：
+  // 那种情况下工具照旧，只是面板上那条工具条按不动，而那句话由面板自己显示。
+  ctx.effect(() => {
+    const disposers = registerViewRpc(ctx, adopt)
+    return () => {
+      for (const dispose of disposers) void dispose().catch(() => undefined)
+    }
+  }, 'desktop-view: panel RPC')
 
   // The store the screenshot publishes into is the deployment's own attachment service,
   // taken from the context rather than constructed here: the caller (the model session)

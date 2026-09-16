@@ -10,6 +10,7 @@ import {
   describeSpaceTable,
   parseSpaceState,
   planRequest,
+  planZoom,
   spaceChannelFrom,
   type SpaceState,
 } from '../src/spaces.ts'
@@ -54,7 +55,11 @@ const shellSpaces = require('../shell/spaces.js') as {
     previous: string | undefined,
     listing: { ok: true; targetId?: string; listedPages?: number; webContentsId?: number } | { ok: false; error: string },
   ) => { targetId?: string; targetIdSource: 'resolved' | 'remembered' | 'unavailable'; targetIdReason?: string }
-  parseRequest: (raw: unknown) => { ok: true; request: { id: number; active: string; spaces: string[] } } | { ok: false; error: string }
+  parseRequest: (
+    raw: unknown,
+  ) =>
+    | { ok: true; request: { id: number; active: string; spaces: string[]; zooms: Array<{ name: string; zoom: number }> } }
+    | { ok: false; error: string }
   partitionDirectoryName: (partition: string) => string
   partitionForSpace: (name: string) => string
   reconcile: (input: { current: string[]; request: { active: string; spaces: string[] } }) => {
@@ -390,9 +395,76 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     for (const result of results.slice(1)) expect(result.ok).toBe(false)
   })
 
+  it('票 #13：请求里那块视图可以带上 zoom；只有**被改动的那一个**带，形状不对的拒绝', () => {
+    // 一项可以只是名字，也可以是 `{name, zoom}`；归一化之后 zoom 单独成一张表。
+    const named = shellSpaces.parseRequest({
+      id: 9,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', zoom: 0.5 }],
+    })
+    console.log('RAW parseRequest with a zoom: ' + JSON.stringify(named))
+    expect(named.ok).toBe(true)
+    if (!named.ok) return
+    expect(named.request.spaces).toEqual(['default', 'task-1'])
+    expect(named.request.zooms).toEqual([{ name: 'task-1', zoom: 0.5 }])
+
+    // 形状不对的拒绝：0、负数、NaN、字符串都过不去，理由说得清它是什么。
+    for (const bad of [0, -1, Number.NaN, '0.5']) {
+      const refused = shellSpaces.parseRequest({
+        id: 10,
+        active: 'default',
+        spaces: ['default', { name: 'task-1', zoom: bad }],
+      })
+      console.log(`RAW parseRequest zoom ${JSON.stringify(bad)}: ` + JSON.stringify(refused))
+      expect(refused.ok, `zoom ${JSON.stringify(bad)} must be refused`).toBe(false)
+      if (refused.ok) continue
+      expect(refused.error).toContain('greater than 0')
+    }
+    // 合法的 0.25 与 5 都要过（范围是插件的策略，这里只管形状）。
+    for (const good of [0.25, 5]) {
+      const accepted = shellSpaces.parseRequest({
+        id: 11,
+        active: 'default',
+        spaces: ['default', { name: 'task-1', zoom: good }],
+      })
+      expect(accepted.ok, `zoom ${good} must be accepted`).toBe(true)
+    }
+  })
+
+  it('票 #13：协议的形状变了，版本号跟着加一（两边能明确地对不上）', () => {
+    console.log('RAW SPACE_PROTOCOL: ' + JSON.stringify({ shell: shellSpaces.SPACE_PROTOCOL, channel: shellSpaces.spaceChannel('C:\\p').protocol }))
+    // 请求里多了可选的 `zoom`、state 里多了每条记录的 `zoom` —— 加一。
+    expect(shellSpaces.SPACE_PROTOCOL).toBe(2)
+    expect(shellSpaces.spaceChannel('C:\\p').protocol).toBe(2)
+  })
+
+  it('票 #13：planZoom 把"给某一个空间换缩放"算成一条请求，只给那一个带 zoom', () => {
+    const state = {
+      protocol: 2,
+      requestId: 4,
+      error: null,
+      active: 'task-1',
+      userDataDir: 'C:\\p',
+      spaces: [{ name: 'default' } as never, { name: 'task-1' } as never],
+      skipped: [],
+    }
+    const planned = planZoom(state, 'default', 0.5)
+    console.log('RAW planZoom: ' + JSON.stringify(planned))
+    if ('error' in planned) throw new Error(planned.error)
+    // id 单调加一、当前空间不动、**只有** default 带上 zoom —— 其余原样是名字。
+    expect(planned.request.id).toBe(5)
+    expect(planned.request.active).toBe('task-1')
+    expect(planned.request.spaces).toEqual([{ name: 'default', zoom: 0.5 }, 'task-1'])
+
+    // 不认识的空间：说得清有哪几个。
+    const refused = planZoom(state, 'ghost', 0.5)
+    console.log('RAW planZoom(ghost): ' + JSON.stringify(refused))
+    expect('error' in refused).toBe(true)
+  })
+
   it('插件侧：create 顺手切过去、关掉当前空间时接班的是默认空间、名字不认识时说得清', () => {
     const state = {
-      protocol: 1,
+      protocol: 2,
       requestId: 7,
       error: null,
       active: 'default',
