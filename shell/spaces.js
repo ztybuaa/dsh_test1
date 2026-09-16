@@ -77,7 +77,7 @@ const DOWNLOAD_JOURNAL_FILE_NAME = 'downloads.json'
 const PENDING_DELETION_FILE_NAME = 'pending-deletion.json'
 
 /** 控制通道的协议版本；形状变了就加一，让两边能明确地对不上。 */
-const SPACE_PROTOCOL = 1
+const SPACE_PROTOCOL = 2
 
 /**
  * 一个空间名是不是合法。
@@ -161,8 +161,13 @@ function spaceChannel(userDataDir) {
  * 拒绝的理由都写清楚，因为这条消息会一路走到模型面前：含糊的"请求非法"没法修，
  * "空间名 `Task 1` 不合法：只允许小写字母、数字与连字符"能。
  *
+ * 每一项可以只是一个名字，也可以带上这块视图期望的**缩放**（`{name, zoom}`，票 #13）。
+ * 缩放只校验**形状**（有限正数）：合法范围是插件那边的策略（`src/navigation.ts` 的
+ * `ZOOM_MIN`–`ZOOM_MAX`），在这里再写一份迟早会与它不一致 —— 与空间名的方向相反，
+ * 名字的形状权威在外壳（它拿名字去建目录），缩放的权威在插件。
+ *
  * @param {unknown} raw - 从 `request.json` 解析出来的东西。
- * @returns {{ok: true, request: {id: number, active: string, spaces: string[]}} | {ok: false, error: string}} 归一化结果。
+ * @returns {{ok: true, request: {id: number, active: string, spaces: string[], zooms: Array<{name: string, zoom: number}>}} | {ok: false, error: string}} 归一化结果。
  */
 function parseRequest(raw) {
   if (raw === null || typeof raw !== 'object') return { ok: false, error: 'the request is not a JSON object' }
@@ -170,6 +175,7 @@ function parseRequest(raw) {
   if (!Number.isInteger(id) || id < 1) return { ok: false, error: `the request id must be a positive integer, got ${JSON.stringify(id)}` }
   if (!Array.isArray(raw.spaces)) return { ok: false, error: 'the request carries no `spaces` array' }
   const names = []
+  const zooms = []
   for (const candidate of raw.spaces) {
     const name = typeof candidate === 'string' ? candidate : candidate?.name
     if (!isValidSpaceName(name)) {
@@ -182,6 +188,17 @@ function parseRequest(raw) {
     }
     if (names.includes(name)) return { ok: false, error: `the space "${name}" is listed twice` }
     names.push(name)
+    const wanted = typeof candidate === 'string' ? undefined : candidate?.zoom
+    if (wanted === undefined || wanted === null) continue
+    if (typeof wanted !== 'number' || !Number.isFinite(wanted) || wanted <= 0) {
+      return {
+        ok: false,
+        error:
+          `the zoom for the space "${name}" must be a finite number greater than 0, got ${JSON.stringify(wanted)}. ` +
+          'The range a person may pick (0.25-5) is the plugin\'s policy, not this channel\'s',
+      }
+    }
+    zooms.push({ name, zoom: wanted })
   }
   // 默认空间一直在：一条把它丢掉的请求不是"关闭默认空间"，是插件算错了，所以拒绝而不是照做。
   if (!names.includes(DEFAULT_SPACE)) {
@@ -190,7 +207,7 @@ function parseRequest(raw) {
   if (typeof raw.active !== 'string' || !names.includes(raw.active)) {
     return { ok: false, error: `the active space ${JSON.stringify(raw.active)} is not one of the requested spaces` }
   }
-  return { ok: true, request: { id, active: raw.active, spaces: names } }
+  return { ok: true, request: { id, active: raw.active, spaces: names, zooms } }
 }
 
 /**

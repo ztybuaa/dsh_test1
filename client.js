@@ -347,7 +347,7 @@ window.__ModuleLoader__.load({
 		  root.DshViewToolbar = api
 		})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
 		  'use strict'
-
+		
 		  /**
 		   * The buttons, in the order a person reads them.
 		   *
@@ -369,12 +369,12 @@ window.__ModuleLoader__.load({
 		    { action: 'zoom-in', label: '+', title: 'zoom in', shortcut: null },
 		    { action: 'restart', label: 'restart', title: 'go back to the page this pane started on', shortcut: null },
 		  ]
-
+		
 		  /** The actions in {@link BUTTONS}, for a caller that needs to check one is real. */
 		  var ACTIONS = BUTTONS.map(function (button) {
 		    return button.action
 		  })
-
+		
 		  /**
 		   * Whether one button should be pressable right now.
 		   *
@@ -399,7 +399,7 @@ window.__ModuleLoader__.load({
 		    if (action === 'forward') return state.canGoForward === true
 		    return true
 		  }
-
+		
 		  /**
 		   * The zoom percentage a person reads.
 		   *
@@ -414,7 +414,7 @@ window.__ModuleLoader__.load({
 		    if (typeof zoom !== 'number' || !isFinite(zoom)) return '\u2014'
 		    return Math.round(zoom * 100) + '%'
 		  }
-
+		
 		  /**
 		   * The one line under the buttons.
 		   *
@@ -436,7 +436,7 @@ window.__ModuleLoader__.load({
 		    if (parts.length === 0) return 'reading the view\u2026'
 		    return parts.join(' \u2014 ')
 		  }
-
+		
 		  /**
 		   * Whether a keystroke should be treated as a toolbar shortcut.
 		   *
@@ -460,10 +460,10 @@ window.__ModuleLoader__.load({
 		    }
 		    return null
 		  }
-
+		
 		  /** Height of the toolbar strip, in CSS pixels. The panel keeps the rest. */
 		  var TOOLBAR_HEIGHT_PX = 34
-
+		
 		  return {
 		    BUTTONS: BUTTONS,
 		    ACTIONS: ACTIONS,
@@ -488,33 +488,33 @@ window.__ModuleLoader__.load({
 	 * dependency between the two regions explicit instead of accidental.
 	 */
 	var DshPanelRect = globalThis.DshPanelRect
-
+	
 	/**
 	 * The toolbar's own decisions — which buttons there are, when one is unavailable, what the
 	 * status line says. Spliced from `src/toolbar.js`, and readable in a plain test too.
 	 */
 	var DshViewToolbar = globalThis.DshViewToolbar
-
+	
 	/**
 	 * @typedef {object} PanelRectApi
 	 * @property {(rect: {x: number, y: number, width: number, height: number} | null) => void} setRect
 	 */
-
+	
 	/**
 	 * The tab type's identity in the tab system. A package name is the natural value:
 	 * it is the key the body registers under in the `sidebar.right.pane.tab` seat.
 	 */
 	var TYPE_ID = 'dsh-desktop-view'
-
+	
 	/**
 	 * Type discriminator. `openTab('desktop-view')` opens this type; a page type
 	 * declares no `patterns`, so it claims no resource address.
 	 */
 	var TYPE_KIND = 'desktop-view'
-
+	
 	/** Copy namespace key: the tab title is read fresh on every use, so a language change needs no re-registration. */
 	var NS = 'desktopView'
-
+	
 	/** Title of the tab chip in both shipped languages. */
 	var DICTIONARIES = {
 	  zh: {
@@ -528,7 +528,7 @@ window.__ModuleLoader__.load({
 	    'guide.description': 'Hand this sidebar pane to the native browser view',
 	  },
 	}
-
+	
 	/**
 	 * Panel copy, also in both languages. Not part of the locale namespace: the panel must render before it can translate.
 	 *
@@ -557,19 +557,19 @@ window.__ModuleLoader__.load({
 	    missing: 'This pane reports no rectangle (collapsed or switched away).',
 	  },
 	}
-
+	
 	/** @returns {string} the two-letter language code to copy in. */
 	function language() {
 	  var raw = typeof navigator !== 'undefined' && navigator !== null ? navigator.language : ''
 	  return typeof raw === 'string' && raw.slice(0, 2).toLowerCase() === 'zh' ? 'zh' : 'en'
 	}
-
+	
 	/** @returns {object} the copy table for the current language. */
 	function copy() {
 	  var table = COPY[language()]
 	  return table !== undefined ? table : COPY.en
 	}
-
+	
 	/**
 	 * The client context, kept where the toolbar can reach it.
 	 *
@@ -579,7 +579,7 @@ window.__ModuleLoader__.load({
 	 * this plugin gets to do.
 	 */
 	var clientContext = null
-
+	
 	/**
 	 * The channel the panel's buttons call, and the endpoints on it.
 	 *
@@ -589,12 +589,12 @@ window.__ModuleLoader__.load({
 	 * names live in `src/view-rpc.ts`; this is the client half of that one contract.
 	 */
 	var RPC_CHANNEL = '/api'
-
+	
 	/** The endpoint a given action is called on: `desktop-view-back`, `desktop-view-state`, … */
 	function endpointFor(action) {
 	  return 'desktop-view-' + action
 	}
-
+	
 	/**
 	 * One button press: ask the host to do it, and hand back the state it read afterwards.
 	 *
@@ -639,7 +639,7 @@ window.__ModuleLoader__.load({
 	    }
 	  }
 	}
-
+	
 	/**
 	 * The toolbar strip above the browser view.
 	 *
@@ -667,7 +667,7 @@ window.__ModuleLoader__.load({
 	    message: '',
 	    busy: false,
 	  })
-
+	
 	  /** Ask the host what is true right now, and show that. */
 	  var refresh = react.useCallback(function () {
 	    void callView(props.ctx, 'state').then(function (next) {
@@ -676,7 +676,7 @@ window.__ModuleLoader__.load({
 	      })
 	    })
 	  }, [])
-
+	
 	  /**
 	   * Run one action, then show what the host read back **after** it.
 	   *
@@ -697,13 +697,13 @@ window.__ModuleLoader__.load({
 	    },
 	    [],
 	  )
-
+	
 	  // The first read happens once the strip is on screen. It is deliberately not part of a
 	  // render: a render that started a request would start one per re-render.
 	  react.useEffect(function () {
 	    refresh()
 	  }, [])
-
+	
 	  // Keyboard shortcuts. Registered on the window because the panel is one element among
 	  // many in the DSH window and a person's hands are usually in the chat box.
 	  react.useEffect(function () {
@@ -723,7 +723,7 @@ window.__ModuleLoader__.load({
 	      window.removeEventListener('keydown', onKeyDown)
 	    }
 	  }, [])
-
+	
 	  var children = []
 	  for (var index = 0; index < toolbar.BUTTONS.length; index++) {
 	    var button = toolbar.BUTTONS[index]
@@ -764,7 +764,7 @@ window.__ModuleLoader__.load({
 	      ),
 	    )
 	  }
-
+	
 	  return react.createElement(
 	    'div',
 	    {
@@ -804,7 +804,7 @@ window.__ModuleLoader__.load({
 	    ),
 	  )
 	}
-
+	
 	/**
 	 * The panel — the whole visible surface of this plugin in the sidebar.
 	 *
@@ -821,7 +821,7 @@ window.__ModuleLoader__.load({
 	  var hasShell = DshPanelRect.hasShell()
 	  var hostRef = react.useRef(null)
 	  var [report, setReport] = react.useState({ rect: null, state: 'detached' })
-
+	
 	  // The observer outlives every render, so it is created once and its `element` is
 	  // re-read on every measurement: React may replace the DOM node without the
 	  // measurement ever being wrong about which node it is looking at.
@@ -838,7 +838,7 @@ window.__ModuleLoader__.load({
 	      },
 	    })
 	  }, [])
-
+	
 	  react.useEffect(function () {
 	    // The element only exists after the first commit, so the first measurement
 	    // happens here rather than during render. Reporting on every mount (not only on
@@ -853,15 +853,15 @@ window.__ModuleLoader__.load({
 	      if (hasShell) DshPanelRect.deliver(null)
 	    }
 	  }, [])
-
+	
 	  elementRef.current = hostRef.current
-
+	
 	  var caption = !hasShell
 	    ? copy().noShell
 	    : report.rect === null
 	      ? copy().missing
 	      : copy().ready
-
+	
 	  // Two stacked rows: the toolbar, and the rectangle the native view parks on.
 	  //
 	  // The measured element is the *lower* one, and that is deliberate: the view covers exactly
@@ -907,10 +907,10 @@ window.__ModuleLoader__.load({
 	      caption,
 	    ),
 	  )
-
+	
 	  return inner
 	}
-
+	
 	/**
 	 * Register this plugin's client half.
 	 *
@@ -921,7 +921,7 @@ window.__ModuleLoader__.load({
 	  var t = typeof ctx.locale?.bind === 'function' ? ctx.locale.bind(NS) : function () { return 'Browser' }
 	  // The toolbar reads this on render; see the note on the variable itself.
 	  clientContext = ctx
-
+	
 	  // Stage one: what the type IS.
 	  ctx.effect(function () {
 	    return ctx.sidebarRightTabs.register({
@@ -960,11 +960,11 @@ window.__ModuleLoader__.load({
 	      ],
 	    })
 	  }, 'desktop-view: tab type')
-
+	
 	  ctx.effect(function () {
 	    return ctx.locale.register(NS, DICTIONARIES)
 	  }, 'desktop-view: dictionaries')
-
+	
 	  // Stage two: the body, under this definition's own `id`. One registration serves
 	  // every tab of the kind, in every pane, docked or floating.
 	  ctx.effect(function () {
@@ -973,7 +973,7 @@ window.__ModuleLoader__.load({
 	    })
 	  }, 'desktop-view: tab body')
 	}
-
+	
 	exports.apply = apply
 	exports.inject = ['slots', 'locale', 'sidebarRightTabs', 'connection']
 		//#endregion

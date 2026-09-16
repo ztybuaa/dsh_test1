@@ -750,9 +750,10 @@ export function desktopViewTools(
         'session has history to go back or forward to; "restart" navigates the view back to the initial page the ' +
         'shell published (a blank page when there is none) and resets the zoom. A back/forward/reload that does ' +
         'not happen says which kind of failure it was: no history entry, the page refused to leave, or a timeout. ' +
-        'Zooming shrinks the layout viewport, so more of a wide page fits on screen — but it does NOT scale the ' +
-        'page down: a page with a fixed-width layout is still clipped at the pane\'s edge, just at a wider scroll ' +
-        'position. Use browser_scroll to move around such a page.',
+        'Zooming really scales the page, the way a browser does: zooming OUT (below 1) makes a fixed-width page ' +
+        'fit in the pane with everything visible, and zooming IN magnifies it. It is applied by the shell to the ' +
+        'view itself, so it survives navigation, and the value reported back is the one the shell read from ' +
+        'Electron rather than the one that was asked for.',
       parameters: {
         action: {
           type: 'string',

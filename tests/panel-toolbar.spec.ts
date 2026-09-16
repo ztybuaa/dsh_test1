@@ -207,35 +207,67 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
     expect(String(value.url)).toBe(viewUrlNow())
   }, 120_000)
 
-  it('缩放：面板那两个动作真的改了页面自己报的 devicePixelRatio 与视口', async () => {
-    // 先把缩放清干净（面板那一页上"100%"就是宿主记着的那个值）。
-    await session.clearMetricsOverride()
+  it('缩放：面板那两个动作真的改了页面自己报的 devicePixelRatio 与视口，而且延迟量得出来', async () => {
+    // 先把缩放清干净：**走面板那条路**回 100%（这一份手里的 `session` 是测试自己领养的，
+    // 没有外壳那条缩放口子 —— 缩放只能请外壳做，见 ADR-0013）。
+    await callPanelChannel('zoom-reset', { cookie })
     const factsBefore = await pageFacts()
     const before = await viewDpr()
+    // 面板那一按到画面真的变了，要过**两道轮询**：面板 → 宿主（HTTP）→ 空间请求文件 →
+    // 外壳每 150ms 读一次 → 生效。所以这里掐表，并把结果如实打出来（ADR-0013 的诚实清单）。
+    //
+    // 量到的比"一个轮询间隔"大得多（第一次按 1.1 秒量级），所以**冷热各按一次**：
+    // 第一次那一按还要顺带把宿主那半边（adopt、状态读回）的冷路径走完。
+    const cold = Date.now()
     const zoomIn = await callPanelChannel('zoom-in', { cookie })
+    const coldMs = Date.now() - cold
     const afterIn = await viewDpr()
     const valueIn = valueOf(zoomIn, 'zoom-in')
+    const warm = Date.now()
+    const zoomInAgain = await callPanelChannel('zoom-in', { cookie })
+    const warmMs = Date.now() - warm
+    const valueInAgain = valueOf(zoomInAgain, 'zoom-in')
     console.log(
       'RAW zoom-in over the panel channel: ' +
-        JSON.stringify({ status: zoomIn.status, dprBefore: before, dprAfter: afterIn, value: valueIn }),
+        JSON.stringify({
+          status: zoomIn.status,
+          dprBefore: before,
+          dprAfter: afterIn,
+          coldMs,
+          warmMs,
+          value: valueIn,
+          second: valueInAgain,
+        }),
     )
     expect(zoomIn.status).toBe(200)
-    // 一比就变的是**视口**（缩放的定义就是"视口按比例变小"）—— 页面自己读得到。
+    // 一比就变的是**视口**（缩放＝布局视口按比例变、内容按同一比例画出来）—— 页面自己读得到。
     expect(Number(valueIn.innerWidth)).toBeLessThan(Number(factsBefore.innerWidth))
     expect(Number(valueIn.zoom)).toBeGreaterThan(1)
-    // 而 `devicePixelRatio` 被拨到那个 zoom 上：这正是"缩放后 dpr 跟着变"。
-    expect(Math.abs(Number(valueIn.devicePixelRatio) - Number(valueIn.zoom))).toBeLessThan(0.01)
-    expect(Math.abs(afterIn - Number(valueIn.zoom))).toBeLessThan(0.01)
+    // 而 `devicePixelRatio` = **屏幕 dpr × zoom**：这正是"缩放后 dpr 跟着变"。
+    // 屏幕 dpr 从这一按之前那一次读回里取（那时 zoom=1，所以那个 dpr 就是屏幕 dpr）。
+    expect(Math.abs(Number(valueIn.devicePixelRatio) - before * Number(valueIn.zoom))).toBeLessThan(0.02)
+    expect(Math.abs(afterIn - Number(valueIn.devicePixelRatio))).toBeLessThan(0.02)
     expect(afterIn).not.toBe(before)
+    // 延迟：这两条是**读回来的**，不是估的。第一按是冷路径，第二按是热路径 ——
+    // 两个数都记在报告与 ADR 的诚实清单里；门禁给的是"这一按确实会到"的宽松上界，
+    // 不是把量到的值抄成断言（抄下来会让它变成一条测不出来任何东西的句子）。
+    expect(coldMs, 'the first press must reach the view').toBeLessThan(5000)
+    expect(warmMs, 'a repeat press must reach the view').toBeLessThan(5000)
+    // 第二次按**再往前一档**（100% → 110% → 125%）—— 顺带证明这两按不是同一次调用的两种说法。
+    const zoomInSteps = [1.1, 1.25]
+    expect(Math.abs(Number(valueIn.zoom) - zoomInSteps[0])).toBeLessThan(0.001)
+    expect(Math.abs(Number(valueInAgain.zoom) - zoomInSteps[1])).toBeLessThan(0.001)
 
+    const startedReset = Date.now()
     const reset = await callPanelChannel('zoom-reset', { cookie })
+    const elapsedReset = Date.now() - startedReset
     const valueReset = valueOf(reset, 'zoom-reset')
-    console.log('RAW zoom-reset over the panel channel: ' + JSON.stringify(valueReset))
+    console.log('RAW zoom-reset over the panel channel: ' + JSON.stringify({ elapsedMs: elapsedReset, value: valueReset }))
     expect(Number(valueReset.zoom)).toBe(1)
-    // 重置之后页面自己报的视口回到原来那个值（源视口是会话第一次读下来的那个）。
+    // 重置之后页面自己报的视口回到原来那个值（源视口 = 布局视口 × zoom）。
     const factsReset = await pageFacts()
     expect(Number(factsReset.innerWidth)).toBe(Number(factsBefore.innerWidth))
-    expect(Math.abs((await viewDpr()) - 1)).toBeLessThan(0.01)
+    expect(Math.abs((await viewDpr()) - before)).toBeLessThan(0.02)
   }, 180_000)
 
   it('后退 / 前进 / 刷新：地址由**视图自己**读回，不是回答里那个字段', async () => {

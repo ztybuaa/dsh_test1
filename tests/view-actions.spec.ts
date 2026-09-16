@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Page } from 'playwright'
 import { AdoptedViewSession } from '../src/session.ts'
+import { SpaceManager } from '../src/spaces.ts'
 import { desktopViewTools, type ToolDependencies } from '../src/tools.ts'
 import {
   VIEW_ACTIONS,
@@ -61,6 +62,8 @@ const WIDE_PAGE = (next: string): string => `<!doctype html>
         scrollWidth: document.documentElement.scrollWidth,
         barWidth: document.getElementById('t13-bar').getBoundingClientRect().width,
         markerLeft: document.getElementById('t13-marker').getBoundingClientRect().left,
+        // 按钮自己写下的效果：用来证明"按 ref 点击真的落在那个元素上"（读效果，不读坐标）。
+        out: document.getElementById('t13-out').textContent,
       })
       document.getElementById('t13-facts').textContent = text
       return text
@@ -101,9 +104,8 @@ const SLOT = { width: 620, height: 800 }
 /**
  * 屏幕的设备像素比。
  *
- * 定下来再断言，而不是把 1.5 抄进断言里：这个文件的断言要说的是"截图 = 视口 × 屏幕 dpr"
- * 这条关系，而不是"这台机器的显示器是多少"。它只在 `zoom = 1` 时成立（T13 之后的新关系，
- * 见 `docs/adr/0013-*.md`），所以它出现在**没有缩放**的那几条里。
+ * 定下来再断言，而不是把 1.5 抄进断言里：这个文件的断言要说的是"布局视口 × 屏幕 dpr"
+ * 这条关系，而不是"这台机器的显示器是多少"。
  */
 const SCREEN_DPR = 1.5
 
@@ -116,8 +118,8 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
   let server: { close: () => Promise<void> }
   let origin: string
   let dir: string
-  /** 那一次"从来没有被模拟过"的截图尺寸（见 `beforeAll` 里的说明）。 */
-  let virginShot: { width: number; height: number }
+  /** 缩放那条通道：插件请外壳改缩放，走的就是它（T13）。 */
+  let spaces: SpaceManager
   /** 那条独立连接是不是被主动关掉了（守卫那一条要关它，见那里的说明）。 */
   let probeClosed = false
 
@@ -138,11 +140,11 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
   }
 
   /**
-   * 页面**最右端**那块红标在图上出现了几个像素。
+   * 页面**最右端**那块红标在**截图**里出现了几个像素。
    *
-   * 这是这一份里最硬的一条仪器：`innerWidth` 变小只说明视口窄了，
-   * 只有"页面 x=1150..1195 那块像素出现在图里"才说明**内容被缩小了**。
-   * 它在条子里（y=40..160），所以取样落在条子上。
+   * 注意它回答的是"**布局视口**里看得见它吗"，**不是**"窗格里看得见吗"：截图由 CDP 交付，
+   * 尺寸等于布局视口 × 屏幕 dpr，**不等于窗格的物理像素**。真窗口像素那条证据在
+   * `tests/zoom-pixels.spec.ts` 里（`desktopCapturer` 抓真窗口），这一支只用来量布局。
    */
   const markerPixels = async (name: string): Promise<number> => {
     const shot = await shotOnDisk(name)
@@ -182,30 +184,26 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
     dir = mkdtempSync(join(tmpdir(), 'dsh-t13-'))
     // 视图矩形就是"窄栏"：620 x 800，固定宽度 1200px 的页面在里面必然被裁切。
     shell = await startShell([`--view-url=${origin}/one`, '--bounds', '0,0,620,800'], {
-      windowSize: { width: 1240, height: 860 },
+      windowSize: { width: 1240, height: 900 },
     })
-    session = await AdoptedViewSession.adopt({
-      cdpUrl: shell.handshake.cdpUrl,
-      targetId: shell.handshake.targetId,
+    // **缩放经真外壳走**（票 #13 的决定，ADR-0013 决定二）：`setZoomFactor()` 是 Electron 的
+    // API，插件够不到，所以会话拿到的那个缩放口子绑在空间通道上。会话由 `SpaceManager` 领养，
+    // 于是这一份里"缩放生效了吗"的答案来自**外壳读回的 `getZoomFactor()`**，不是我们写下去的值。
+    spaces = new SpaceManager({
+      dir: shell.handshake.spaceChannel.dir,
       timeoutMs: 30_000,
-      url: shell.handshake.viewUrl,
+      maxElements: 200,
+      maxChars: 20_000,
+      initialUrl: shell.handshake.viewUrl,
     })
+    session = await spaces.adopt(shell.handshake.cdpUrl)
     probe = await pageForTarget(shell.handshake.cdpUrl, shell.handshake.targetId)
     tools = desktopViewTools(() => Promise.resolve(session), {} as ToolDependencies)
-    // **先**量一次"从来没有被模拟过"的视图：那一次截图是 T5 时代的关系
-    // （视口 × 屏幕 dpr = 930x1200）。放在这里是因为它只能量一次 —— 一旦
-    // `setViewportSize` 被调过，Playwright 自己记的 `_metricsOverride` 就永久生效，
-    // 交付图片从那以后都由它决定（ADR-0013）。后面每一条都在那个状态里量。
-    const virgin = await session.screenshot(join(dir, 'zoom-100-virgin.png'))
-    const virginPng = readPng(readFileSync(join(dir, 'zoom-100-virgin.png')))
-    console.log(
-      `RAW the never-emulated view: png=${virginPng.width}x${virginPng.height} bytes=${virgin.length}`,
-    )
-    virginShot = { width: virginPng.width, height: virginPng.height }
   }, 120_000)
 
   afterAll(async () => {
     if (probe !== undefined && !probeClosed) await probe.browser.close().catch(() => undefined)
+    if (spaces !== undefined) await spaces.close()
     if (session !== undefined) await session.close().catch(() => undefined)
     if (shell !== undefined) await shell.stop()
     if (server !== undefined) await server.close()
@@ -327,7 +325,7 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
 
   // ── 验收二：缩放（含重置），dpr 与截图尺寸都跟着变，有断言钉住 ─────────────────
 
-  it('零点：1200px 的页面在 620px 的栏里确实被裁切', async () => {
+  it('零点：1200px 的页面在 620px 的栏里确实被裁切，而截图正是 T5 那条关系', async () => {
     await session.goto(`${origin}/one`)
     await session.resetZoom()
     const facts = await pageFacts()
@@ -337,56 +335,50 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
     expect(facts.innerWidth).toBe(SLOT.width)
     expect(facts.scrollWidth).toBe(1200)
     expect(facts.barWidth).toBe(1200)
-    // 缩放**重置**之后截图是 620x800：T13 之后"截图 = 布局视口 × 页面报的 dpr"，
-    // 而重置后的 dpr 是 1 —— 于是它是 620x800，**不是** T5 时代那个 930x1200。
-    // 那条老关系（视口 × 屏幕 dpr）只在"这个视图从来没有被模拟过"时成立（ADR-0013），
-    // 而那个状态在 `beforeAll` 里已经量过一次了。
-    expect(shot.width).toBe(SLOT.width)
-    expect(shot.height).toBe(SLOT.height)
-    expect(virginShot.width).toBe(Math.round(SLOT.width * SCREEN_DPR))
-    expect(virginShot.height).toBe(Math.round(SLOT.height * SCREEN_DPR))
-    // 两条关系都钉住，因为"缩放之后截图变小了"必须是一个**被解释过的**变化，
-    // 而不是一个意外：老关系 → 新关系，中间那一步是 `setViewportSize`。
-    expect(shot.width).toBeLessThan(virginShot.width)
+    // 100% 时截图就是窗格的物理像素：**布局视口 × 屏幕 dpr** = 620×800 × 1.5（T5 那条关系）。
+    // 缩放≠1 时同一条关系照样成立，只是布局视口变了 —— 见下一条。
+    expect(shot.width).toBe(Math.round(SLOT.width * SCREEN_DPR))
+    expect(shot.height).toBe(Math.round(SLOT.height * SCREEN_DPR))
   }, 120_000)
 
-  it('缩放让**同屏看到更多页面内容**，但它**不会**把固定宽度页面缩小到完整可见（已知边界，有反证）', async () => {
+  it('缩小到 50% 才真的把 1200px 的页面带进那一格：布局视口 1240、内容按 1/zoom 画出来', async () => {
     await session.goto(`${origin}/one`)
-    // 从"撤掉模拟"的状态出发，好让这一条量的是**缩放做了什么**，而不是上一个用例的残留。
-    // （`clearMetricsOverride` 是给这种"把两种状态分开量"用的，产品路径不用它。）
-    await session.clearMetricsOverride()
-    // 仪器先自检：不缩放时，1200px 页面最右端那块红标**必须看不见**（620 < 1150）。
+    await session.resetZoom()
+    // 仪器先自检：100% 时页面最右端的红标**不该**出现在布局视口里（620 < 1150）。
     const markerAtOne = await markerPixels('zoom-100-marker.png')
     console.log(`RAW the page-rightmost marker at 100%: ${markerAtOne} red pixels (must be 0 — the instrument works)`)
     expect(markerAtOne).toBe(0)
 
-    const result = await session.zoomTo(1.94)
+    const result = await session.zoomTo(0.5)
     const facts = await pageFacts()
-    const shot = await shotOnDisk('zoom-194.png')
-    console.log('RAW zoom 194%: ' + JSON.stringify({ result, facts, shot: { width: shot.width, height: shot.height } }))
+    const shot = await shotOnDisk('zoom-50.png')
+    console.log(
+      'RAW zoom 50%: ' +
+        JSON.stringify({ result, facts, shot: { width: shot.width, height: shot.height } }),
+    )
 
-    // 1. 布局视口真的变小了：620 / 1.94 = 319（floor）。
-    expect(result.innerWidth).toBe(319)
-    expect(facts.innerWidth).toBe(319)
-    // 2. 这正是它的用处：视口里放得下的页面宽度 = innerWidth × zoom（= 620，即整块窗格）。
-    //    于是"同屏能看到多少页面"变成了原来的 1/zoom —— 从 620px 变成 1200px。
-    expect(Number(facts.innerWidth) * result.zoom).toBeGreaterThanOrEqual(facts.innerWidth as number)
-    expect(Number(facts.innerWidth) * result.zoom).toBeGreaterThan(620 - 2)
-    // 3. 条子自己的布局宽度没变（变的是视口，不是页面）。
+    // 1. 布局视口**变宽**了：620 / 0.5 = 1240（页面自己读得到）。
+    expect(result.innerWidth).toBe(1240)
+    expect(facts.innerWidth).toBe(1240);
+    // 2. 于是那条 1200px 的条子**装得下**：没有横向溢出，整页在同屏里。
     expect(facts.barWidth).toBe(1200)
-    // 4. **反证**：页面最右端那块红标**仍然看不见**。这一条是这张票最重要的一句实话 ——
-    //    `setViewportSize` 让视口变窄，**内容没有被缩小**，所以"固定宽度页面塞进窄栏里
-    //    完整显示"**没有**被解决（见 ADR-0013）。将来谁把这条当 bug 去修，会先撞到这条断言。
-    const markerAtZoom = await markerPixels('zoom-194-marker.png')
-    console.log(`RAW the page-rightmost marker at 194%: ${markerAtZoom} red pixels (still 0: the content was NOT scaled down)`)
-    expect(markerAtZoom).toBe(0)
+    expect(Number(facts.scrollWidth)).toBeLessThanOrEqual(Number(facts.innerWidth))
+    // 3. 页面读到的 dpr = 屏幕 dpr × zoom —— 内容真的被按一半画出来了。
+    expect(Math.abs(Number(facts.devicePixelRatio) - SCREEN_DPR * 0.5)).toBeLessThan(0.01)
+    // 4. 同一支红标量具在**布局**里看得见它了（真窗口像素那条在 tests/zoom-pixels.spec.ts）。
+    const markerAtHalf = await markerPixels('zoom-50-marker.png')
+    console.log(`RAW the page-rightmost marker at 50%: ${markerAtHalf} red pixels (in the layout viewport)`)
+    expect(markerAtHalf).toBeGreaterThan(0)
+    // 5. 缩放算出来的源视口回到那块窗格：1240 × 0.5 = 620。
+    expect(result.source.width).toBe(620)
+    expect(shot.width).toBe(Math.round(1240 * SCREEN_DPR))
   }, 180_000)
 
-  it('devicePixelRatio 与截图尺寸都跟着 zoom 变，且**读自**页面与磁盘上的 PNG', async () => {
+  it('dpr 与截图尺寸都跟着 zoom 变，而且读自页面与磁盘上的 PNG', async () => {
     await session.goto(`${origin}/one`)
     const source = { width: 620, height: 800 }
     const readings: Array<{ zoom: number; dpr: number; innerWidth: number; file: { width: number; height: number } }> = []
-    for (const zoom of [1, 1.25, 2, 2.5]) {
+    for (const zoom of [0.5, 1, 1.25, 2, 2.5]) {
       const result = await session.zoomTo(zoom)
       const facts = await pageFacts()
       const shot = await shotOnDisk(`zoom-sweep-${String(zoom).replace('.', '_')}.png`)
@@ -395,38 +387,51 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
         `RAW zoom sweep ${zoom}: session=${JSON.stringify(result)} page=${JSON.stringify(facts)} png=${shot.width}x${shot.height}`,
       )
 
-      // (a) 面板/工具报的 dpr 与**页面自己读到的**是同一个数（不是"我们写下去的值"）。
-      expect(Math.abs(Number(facts.devicePixelRatio) - zoom)).toBeLessThan(0.01)
-      expect(Math.abs(result.devicePixelRatio - zoom)).toBeLessThan(0.01)
-      // (b) 截图尺寸 = floor(源视口 / zoom)，由**磁盘上那张 PNG** 量出来。
-      expect(shot.width).toBe(Math.floor(source.width / zoom))
-      expect(shot.height).toBe(Math.floor(source.height / zoom))
-      // (c) 布局视口同上。
-      expect(result.innerWidth).toBe(Math.floor(source.width / zoom))
+      // (a) 页面读到的 dpr = 屏幕 dpr × zoom（外壳侧缩放的定义），工具报的与它同一个数。
+      expect(Math.abs(Number(facts.devicePixelRatio) - SCREEN_DPR * zoom)).toBeLessThan(0.02)
+      expect(Math.abs(result.devicePixelRatio - SCREEN_DPR * zoom)).toBeLessThan(0.02)
+      // (b) 布局视口 = 源视口 / zoom（允许 1px 的取整）。
+      expect(Math.abs(Number(facts.innerWidth) - source.width / zoom)).toBeLessThanOrEqual(1)
+      // (c) 截图 = **布局视口 × 屏幕 dpr**，由磁盘上那张 PNG 量出来 —— T5 那条关系在缩放≠1 时成立，
+      //     因为它说的视口是**布局视口**，而布局视口本来就随缩放变。
+      expect(Math.abs(shot.width - Math.round(Number(facts.innerWidth) * SCREEN_DPR))).toBeLessThanOrEqual(1)
+      expect(Math.abs(shot.height - Math.round(Number(facts.innerHeight) * SCREEN_DPR))).toBeLessThanOrEqual(1)
     }
 
-    // (d) 单调性：zoom 越大，截图越小、dpr 越大 —— 两个方向都单调。
+    // (d) 单调性：zoom 越大，布局视口越小、截图越小、dpr 越大 —— 三个方向都单调。
     const zooms = readings.map((reading) => reading.zoom)
     const widths = readings.map((reading) => reading.file.width)
     const dprs = readings.map((reading) => reading.dpr)
     console.log('RAW monotonicity: ' + JSON.stringify({ zooms, widths, dprs }))
     for (let index = 1; index < readings.length; index++) {
+      expect(zooms[index]).toBeGreaterThan(zooms[index - 1])
       expect(widths[index]).toBeLessThan(widths[index - 1])
       expect(dprs[index]).toBeGreaterThan(dprs[index - 1])
     }
   }, 300_000)
 
-  it('缩放跨导航保持，重置回到 100%', async () => {
+  it('缩放跟着**视图**走，不跟着网站走：同源换页与换到另一个站点都还在', async () => {
     await session.goto(`${origin}/one`)
-    await session.zoomTo(2.5)
-    expect((await pageFacts()).innerWidth).toBe(248)
+    await session.zoomTo(0.5)
+    expect((await pageFacts()).innerWidth).toBe(1240)
 
-    // 跨导航：走到第二页，覆盖与视口都还在。
+    // 同源的下一页：缩放还在。
     await session.goto(`${origin}/two`)
     const afterNavigation = await pageFacts()
-    console.log('RAW zoom 250% after navigating to page two: ' + JSON.stringify(afterNavigation))
-    expect(afterNavigation.innerWidth).toBe(248)
-    expect(Math.abs(Number(afterNavigation.devicePixelRatio) - 2.5)).toBeLessThan(0.01)
+    console.log('RAW zoom 50% after navigating to page two: ' + JSON.stringify(afterNavigation))
+    expect(afterNavigation.innerWidth).toBe(1240)
+    expect(Math.abs(Number(afterNavigation.devicePixelRatio) - SCREEN_DPR * 0.5)).toBeLessThan(0.02)
+
+    // **另一个站点**（同一个服务器的另一个主机名）：Chromium 自己的缩放是按站点记的，
+    // 换站点会回到那个站点的默认值 —— 所以这件事必须由外壳在导航之后重新按上去，
+    // 否则"点了链接缩放就没了"。这一条量的正是那条重新按上去的规矩（见 ADR-0013）。
+    const otherSite = origin.replace('127.0.0.1', 'localhost')
+    const moved = await session.goto(`${otherSite}/one`)
+    const afterSiteChange = await pageFacts()
+    console.log('RAW zoom 50% after moving to another site: ' + JSON.stringify({ moved, afterSiteChange }))
+    expect(afterSiteChange.url).toContain('localhost')
+    expect(afterSiteChange.innerWidth, 'the zoom must follow the view, not the site').toBe(1240)
+    expect(Math.abs(Number(afterSiteChange.devicePixelRatio) - SCREEN_DPR * 0.5)).toBeLessThan(0.02)
 
     // 重置：回 100%，页面自己读到的也回 620。
     const reset = await session.resetZoom()
@@ -435,6 +440,24 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
     expect(reset.zoom).toBe(1)
     expect(facts.innerWidth).toBe(620)
     expect(facts.innerHeight).toBe(800)
+  }, 180_000)
+
+  it('缩放由外壳做、值由外壳读回：state.json 里那个数就是 getZoomFactor()', async () => {
+    await session.goto(`${origin}/one`)
+    await session.resetZoom()
+    for (const zoom of [0.5, 2, 1]) {
+      const result = await session.zoomTo(zoom)
+      const state = spaces.readState()
+      const active = state?.spaces.find((space) => space.name === state.active)
+      console.log(
+        `RAW published zoom after zoomTo(${zoom}): ` +
+          JSON.stringify({ published: active?.zoom, session: result.zoom, protocol: state?.protocol }),
+      )
+      // 会话报的那个数**必须**是外壳读回来的那个数：一个"写下去就当成了"的实现会在这里露馅。
+      expect(active?.zoom).toBeDefined()
+      expect(Math.abs(Number(active?.zoom) - zoom)).toBeLessThan(0.001)
+      expect(Math.abs(result.zoom - Number(active?.zoom))).toBeLessThan(0.001)
+    }
   }, 180_000)
 
   it('越界的 zoom 被拒绝而不是悄悄夹到边界', async () => {
@@ -457,30 +480,42 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
     await session.resetZoom()
   }, 180_000)
 
-  it('缩放之后 browser_snapshot 的 bounds 是**模拟视口**的 CSS 像素（ADR-0008 那条 1:1 只在 zoom=1 时成立）', async () => {
+  it('缩放之后 browser_snapshot 的 bounds 仍是**页面自己的 CSS 像素**，点它还是中', async () => {
     await session.goto(`${origin}/one`)
     await session.resetZoom()
     const atOne = await session.snapshot()
     const buttonAtOne = atOne.elements.find((element) => element.name === 'hit me')
     console.log('RAW snapshot at 100%: ' + JSON.stringify(buttonAtOne))
 
-    await session.zoomTo(2)
-    const atTwo = await session.snapshot()
-    const buttonAtTwo = atTwo.elements.find((element) => element.name === 'hit me')
-    console.log('RAW snapshot at 200%: ' + JSON.stringify(buttonAtTwo))
+    for (const zoom of [0.5, 2]) {
+      await session.zoomTo(zoom)
+      const snapshot = await session.snapshot()
+      const button = snapshot.elements.find((element) => element.name === 'hit me')
+      const facts = await pageFacts()
+      console.log(
+        `RAW snapshot at ${String(zoom * 100)}%: ` +
+          JSON.stringify({ button, innerWidth: facts.innerWidth, dpr: facts.devicePixelRatio }),
+      )
+      expect(button, 'the fixture button must be in the snapshot while zoomed').toBeDefined()
+      // bounds 是页面自己的坐标系（CSS 像素）：**布局**没变，所以同一份 bounds 在每一档都一样。
+      expect(button?.bounds.width).toBe(buttonAtOne?.bounds.width)
+      expect(button?.bounds.x).toBe(buttonAtOne?.bounds.x)
+      // 变的是"1 CSS 像素等于几个窗格像素"：那是 dpr，而 dpr = 屏幕 dpr × zoom。
+      // 所以"bounds 与窗格 1:1"这句话只在 zoom = 1 **且** 屏幕 dpr = 1 时为真；
+      // 它一直是"bounds 与视图的 CSS 像素 1:1"（ADR-0008 的原话），这一点没有变。
+      expect(Math.abs(Number(facts.devicePixelRatio) - SCREEN_DPR * zoom)).toBeLessThan(0.02)
 
-    expect(buttonAtOne, 'the fixture button must be in the snapshot').toBeDefined()
-    expect(buttonAtTwo, 'the fixture button must be in the snapshot while zoomed').toBeDefined()
-    // 元素在页面里的**布局**尺寸没有变（CSS 像素是页面自己的坐标系）……
-    expect(buttonAtTwo?.bounds.width).toBe(buttonAtOne?.bounds.width)
-    // ……变的是视口：bounds 一直在**视图 CSS 像素**里，而缩放把视口从 620 变成 310。
-    // 于是"bounds 与窗格物理像素 1:1"这句话**只在 zoom=1 时**为真 —— 这是量出来的，
-    // 不是推的：同一份 bounds 在 zoom=2 时描述的是一个 310px 宽的视口。
-    const facts = await pageFacts()
-    expect(facts.innerWidth).toBe(310)
-    expect(buttonAtTwo?.bounds.width).toBeCloseTo(90, 5)
+      // **验证而不是推断**：没有任何流水线依赖"bounds == 窗格物理像素"。
+      // 最可能依赖它的那条就是"按 ref 点击"—— 它拿 bounds 去决定点哪里。所以真的点一次，
+      // 并且读**页面自己写下的效果**，而不是读坐标。
+      await session.clickRef(button?.ref ?? 0)
+      const clicked = await pageFacts()
+      console.log(`RAW click by ref at ${String(zoom * 100)}%: out=${JSON.stringify(clicked.out)}`)
+      expect(clicked.out, 'a click by ref must land on the element at every zoom').toBe('t13-clicked')
+      await session.goto(`${origin}/one`)
+    }
     await session.resetZoom()
-  }, 180_000)
+  }, 300_000)
 
   // ── 验收三/四/五：面板那一格的工具条、RPC、重新开始 ────────────────────────
 

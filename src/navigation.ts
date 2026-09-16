@@ -74,28 +74,6 @@ export function stepZoom(current: number, direction: 1 | -1): number {
 }
 
 /**
- * 把一个缩放值变成"布局视口该有多大"。
- *
- * 缩放的定义就是**视口按比例变小**：`1200px` 宽的页面在 `zoom = 2` 时落在 `600` 个 CSS 像素里，
- * 于是它在屏幕上占的**物理**面积不变，而能看到的内容翻倍。这也是量出来的唯一一条真的
- * 会改变布局视口的路（见 `docs/research/t13-zoom-four-roads-measured.md`）。
- *
- * `floor` 而不是 `round`：宁可多给一个像素的视口，也不要因为四舍五入把最后一条像素挤出去
- * （缩放到 `1.94` 时 `620 / 1.94 = 319.58` —— 取 319 时内容整条可见，取 320 时会多出一条缝）。
- *
- * @param source - 视图**本来**的视口尺寸（没有缩放时的那些 CSS 像素）。
- * @param zoom - 缩放值。
- * @returns 该用的模拟视口尺寸，两边都不小于 1。
- */
-export function scaledViewport(
-  source: { width: number; height: number },
-  zoom: number,
-): { width: number; height: number } {
-  const normalize = (value: number): number => Math.max(1, Math.floor(value / zoom))
-  return { width: normalize(source.width), height: normalize(source.height) }
-}
-
-/**
  * 一次导航类动作为什么没做成。
  *
  * 三个值而不是一个 `failed`，因为它们各自的**补救**不同：`no-history` 要用户先走一段路，

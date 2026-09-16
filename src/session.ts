@@ -41,7 +41,6 @@ import {
   ObservedHistory,
   classifyNavigationFailure,
   normalizeZoom,
-  scaledViewport,
   stepZoom as nextZoomStep,
   type HistoryState,
   type NavigationFailureReason,
@@ -90,6 +89,41 @@ export interface AdoptOptions extends ViewHandle {
    * pretending nothing was downloaded (ADR-0011).
    */
   downloadJournalFile?: string
+  /**
+   * 谁来真的改这块视图的缩放（票 #13）。
+   *
+   * 缩放**必须**由外壳做：`webContents.setZoomFactor()` 是 Electron 的 API，插件够不到。
+   * 量到的理由不是"够不到所以算了"，而是**只有它同时做两件事**（见 ADR-0013 决定二）：
+   * 布局视口按比例变大/变小，**并且内容真的被按比例画出来**。插件够得到的那条 CDP 路
+   * 只做前一半 —— 窗格把模拟视口按 1:1 画出来然后裁掉，于是"缩小"不但没让整页进来，
+   * 还因为页面不再溢出而**把滚动条也弄没了**（真窗口像素实测）。
+   *
+   * 缺省 = 这个会话没有外壳可问，`zoomTo` 会**如实说不能缩放**，而不是假装缩放过。
+   */
+  zoomPort?: ViewZoomPort
+  /**
+   * 领养时**外壳已经读回**的缩放值（`state.json` 里那条空间记录的 `zoom`）。
+   *
+   * 它只是起点：会话手里的数不许比外壳知道的更自信。外壳没说时缺省是 1。
+   */
+  zoom?: number
+}
+
+/**
+ * 改缩放的那道口子（票 #13）。
+ *
+ * 它是**一道口子**而不是直接调外壳：会话只认识"把这块视图缩放到多少"，至于这件事是经
+ * 空间请求文件、还是一条将来的控制通道去做的，是调用方的事。纯逻辑的会话因此照旧可以
+ * 在没有外壳的情况下被测试，而"没有口子"与"有口子但外壳拒绝"是两句话。
+ */
+export interface ViewZoomPort {
+  /**
+   * 把这块视图的缩放设成 `zoom`。
+   *
+   * @param zoom - 目标缩放值（调用方已经用 `normalizeZoom` 校验过范围）。
+   * @returns **外壳读回来**的实际缩放值（`getZoomFactor()`），不是请求里的那个数。
+   */
+  setZoom(zoom: number): Promise<number>
 }
 
 /** Outcome of a navigation: the address actually reached, and its title. */
@@ -130,7 +164,7 @@ export interface HistoryActionResult {
  * （面板上显示的东西必须来自独立读回，不能是面板自己的局部变量）。
  */
 export interface ZoomResult {
-  /** 现在是多少（1 = 没有缩放）。 */
+  /** 现在是多少（1 = 没有缩放），**来自外壳的读回值**。 */
   zoom: number
   /** 缩放之后布局视口的宽度，来自页面自己的 `innerWidth`。 */
   innerWidth: number
@@ -138,32 +172,29 @@ export interface ZoomResult {
   innerHeight: number
   /** 缩放之后页面自己读到的 `devicePixelRatio`。 */
   devicePixelRatio: number
-  /** 没有缩放时视图本来的视口尺寸，由会话在第一次缩放时读下来。 */
+  /**
+   * 没有缩放时视图本来的视口尺寸。
+   *
+   * 它是**算出来的**，不是另读一次的：外壳侧的缩放就是"布局视口 = 源视口 / zoom"，
+   * 所以 `源视口 = 页面读到的布局视口 × zoom`（`zoom = 0.5` 时页面报 1240，源视口就是 620）。
+   * 这样它和同一次读回的 `innerWidth` 必然自洽，不会出现"两次读回之间页面换了一页"。
+   */
   source: { width: number; height: number }
-}
-
-/**
- * 用得到的 CDP 会话（只需要 `send`）。
- *
- * 单独写成一个类型是为了让"这一票只用了 `Emulation.setDeviceMetricsOverride` 这一条命令"
- * 这件事在类型上也看得见 —— 将来多一条命令就要多一个字段，改不动是看得出来的。
- */
-interface MetricsTarget {
-  send(method: string, params?: Record<string, unknown>): Promise<unknown>
 }
 
 /**
  * 面板要显示的那一整份状态（T13）。
  *
  * 每一个字段都注明它**从哪读来**，因为面板上显示的东西必须来自独立读回：
- * `url` 读自视图自己，`devicePixelRatio` / 视口读自页面自己，历史读自会话的观察账本。
+ * `url` 读自视图自己，`devicePixelRatio` / 视口读自页面自己，历史读自会话的观察账本，
+ * `zoom` 读自外壳（`getZoomFactor()`）。
  */
 export interface ViewDisplayState {
   /** 视图现在的地址。 */
   url: string
   /** 当前页面的标题，读不到时是空串。 */
   title: string
-  /** 会话记着的缩放值（1 = 100%）。 */
+  /** 外壳读回来的缩放值（1 = 100%），见 {@link AdoptedViewSession.zoomLevel}。 */
   zoom: number
   /** 页面自己读到的 `devicePixelRatio`；页面正在换文档时缺席。 */
   devicePixelRatio?: number
@@ -1222,25 +1253,19 @@ export class AdoptedViewSession {
   private readonly history = new ObservedHistory()
 
   /**
-   * 每个文档自己的 CDP 会话，按需建、随文档消失而作废。
+   * 谁来真的改这块视图的缩放，以及外壳上次读回来的那个数（T13）。
    *
-   * 缩放要用 `Emulation.setDeviceMetricsOverride`，它是**每个 target/frame 的**状态：
-   * 主文档换了（哪怕只是 iframe 导航）之后旧会话就作废，所以这里按 frame 存，
-   * 并在 `framenavigated` 上把非主框架的条目丢掉。
+   * 两者一起进来：口子回答"怎么改"，起点回答"现在是多少"。少了口子，`zoomTo` 会如实
+   * 说不能缩放；少了起点，会话只会说 1（100%），而那是**不知道**，不是事实 ——
+   * 面板上显示的数因此永远来自外壳的读回。
    */
-  private readonly metricsSessions = new Map<Frame, Promise<MetricsTarget | undefined>>()
-
   /**
-   * 视图**本来**的视口尺寸，第一次缩放时读下来（T13）。
+   * 现在是多少（1 = 没缩放）。
    *
-   * 不在这里猜它等于面板矩形：视口是视图自己的事实，读一次比推一次可靠，
-   * 而且"重置"要回到的就是它。只读一次是因为缩放之后读到的是**模拟过的**视口，
-   * 再读就会把缩放当成新的原点（每按一次 `+` 都从当前值重新出发，永远到不了头）。
+   * 它**只在外壳读回来之后**才被改写：请求里的那个数是愿望，`getZoomFactor()` 那个数才是事实。
+   * 它与页面读到的 `devicePixelRatio` 不是一回事（外壳侧是 `屏幕dpr × zoom`），见 {@link zoomTo}。
    */
-  private sourceViewport: { width: number; height: number } | undefined
-
-  /** 现在是多少（1 = 没缩放）。它与页面读到的 `devicePixelRatio` 不是一回事，见 {@link zoomTo}。 */
-  private currentZoom = 1
+  private currentZoom: number
 
   /**
    * What the injected cursor overlay is told to draw (T8).
@@ -1284,7 +1309,19 @@ export class AdoptedViewSession {
      * 它是一次快照，不是"视图现在在哪"：视图会导航走，而这个值说的是外壳当初把它放在哪。
      */
     private readonly initialUrl: string | undefined,
+    /**
+     * 缩放那道口子（T13）。缺省 = 这个会话没有外壳可问，`zoomTo` 会如实说不能缩放。
+     */
+    private readonly zoomPort: ViewZoomPort | undefined,
+    /**
+     * 领养时外壳**已经读回**的缩放值。
+     *
+     * 它只是起点：之后每一次缩放都以 `getZoomFactor()` 的读回值为准。外壳没说时是 1 ——
+     * 那表示"不知道"，而面板上显示 `100%` 与"没缩放过"在这个部署里是同一个状态。
+     */
+    zoom: number,
   ) {
+    this.currentZoom = zoom
     // A `ref` is an index into *this* document. When the view navigates on its own —
     // a link, a form submit, a redirect — the next element at that index is a
     // different element, and resolving the old index against it would act on
@@ -1312,9 +1349,6 @@ export class AdoptedViewSession {
       // 但**自己发起**的那一次要让路（见 {@link pendingTravel}）：后退/前进也会报这个事件，
       // 而把它当成"走了一段新路"会清掉前进那一侧 —— 那正是"后退一次之后前进就没了"的成因。
       if (this.pendingTravel === 0) this.history.observe(page.url())
-      // 缩放（T13）：主文档换了之后，旧文档的 CDP 会话就作废了。新的那个会在下一次
-      // 需要缩放时按需建；这里只把作废的清掉，省得 `Map` 跟着导航无限长。
-      this.metricsSessions.clear()
       // The overlay lives in the document, so the next document needs its own. Two
       // mechanisms, both idempotent, because they cover different windows: the init
       // script gets the overlay in before the new document can paint anything, and this
@@ -1415,6 +1449,10 @@ export class AdoptedViewSession {
         // 「重新开始」要回到的那一页：**外壳在握手里说的**那句 `viewUrl`（T13）。
         // 没给就没有初始页，`restart()` 会如实退到 `about:blank` 并说出来。
         options.url,
+        // 缩放（T13）：口子与"外壳读回来的起点"。两个一起传，因为"怎么改"和"现在是多少"
+        // 是同一件事的两半；少了口子，`zoomTo` 会如实说不能缩放。
+        options.zoomPort,
+        options.zoom ?? 1,
       )
     } catch (error) {
       // A failed adoption must not leave a dangling connection behind.
@@ -1643,9 +1681,6 @@ export class AdoptedViewSession {
       innerWidth = seen.innerWidth
       innerHeight = seen.innerHeight
       devicePixelRatio = seen.devicePixelRatio
-      // 顺便把源视口定下来：第一次读的时候就是没有缩放的时候，这个值后面一直用它。
-      // 放在这里而不是只放在 `zoomTo` 里，是因为值本身来自同一趟读回。
-      this.sourceViewport ??= { width: Math.max(1, Math.round(seen.innerWidth)), height: Math.max(1, Math.round(seen.innerHeight)) }
     } catch {
       // 页面正在换文档时读不到：如实缺席，面板那边显示"读不到"比显示一个旧值好。
     }
@@ -1675,66 +1710,66 @@ export class AdoptedViewSession {
   /**
    * 缩放到某个值（T13）。`1` 就是重置。
    *
-   * ## 它到底做了什么，以及为什么是这两步
+   * ## 缩放由**外壳**做，插件只是请它做
    *
-   * 缩放的定义是**布局视口按比例变小**：`1200px` 宽的页面在 `zoom = 2` 时落在 `600` 个 CSS
-   * 像素里，于是屏幕上占的**物理**面积不变、能看到的内容翻倍 —— 这正是用户那句
-   * "能不能适应侧边栏的大小"要的东西。
+   * `webContents.setZoomFactor()` 是 Electron 的 API，插件够不到（ADR-0003 明令外壳不开
+   * 控制端口），所以这条路经**既有的空间请求文件**走一趟：请求里那块视图带上期望的 `zoom`，
+   * 外壳改完把 `getZoomFactor()` 的读回值写进 `state.json`，会话拿回来的是**读回的那个数**，
+   * 不是我们写下去的那个愿望（见 `src/spaces.ts` 的 `SpaceManager.setZoom`）。
    *
-   * 实测（`docs/research/t13-zoom-four-roads-measured.md`）四条路之后只有一条真的会动布局视口：
+   * ## 为什么不是"让页面以为窗格更宽"那条 CDP 路（本轮量到后推翻的结论）
    *
-   *  1. `page.setViewportSize({ width: floor(源宽/zoom), height: floor(源高/zoom) })`
-   *     —— 布局视口真的变小，页面自己读到 `innerWidth` 变小，**跨导航保持**；
-   *  2. 补一条 `Emulation.setDeviceMetricsOverride`（同一个 CSS 尺寸 + `deviceScaleFactor: zoom`）
-   *     —— 只为了把**页面读到的** `devicePixelRatio` 拨到 zoom。少了它，面板说"200%"而页面
-   *     算出来仍是 1.5，两边对不上；而 `bounds` 与截图坐标换算都要用页面这个值。
+   * 上一轮采用的是 `page.setViewportSize(源视口/zoom)` + `Emulation.setDeviceMetricsOverride`。
+   * 它**只做了一半**：布局视口确实变了（页面读得到、跨导航保持、截图跟着变），
+   * 但**内容一个像素都没被缩放** —— 窗格把那个模拟视口按 1:1 的 DIP 画出来，然后裁掉。
    *
-   * ## 截图语义（T5 那句话在这里被作废，是有意的）
+   * 真窗口像素实测（`docs/research/t13-zoom-out-measured.md`，夹具是 1200px 的条子 +
+   * 页面最右端一块红标，视口 620×800）：
    *
-   * T5 钉住的是"截图 = 视口 × 屏幕 dpr"（本机 620×800 × 1.5 = 930×1200）。**那条只在
-   * `zoom = 1` 时成立。** 缩放之后截图尺寸是 `floor(源视口/zoom) × floor(源视口/zoom)`：
+   * ```
+   * 基线 100%             : 蓝条在窗口像素里高 388px，红标 0
+   * zoom=0.5(CDP)         : innerWidth=1240、scrollWidth=1240（"装下了"）、蓝条仍高 388px、红标 0
+   * zoom=0.5(只发覆盖)     : 同上
+   * zoom=1.94(CDP)        : 画出来的区域缩到 320 DIP，蓝条仍高 388px、红标 0
+   * 100% 且滚到最右        : 红标 20184 像素（工具自检：量具有效）
+   * zoom=0.5 且试图滚到最右 : scrollX 仍是 0 —— 页面不再溢出，**连滚都滚不到**
+   * ```
    *
-   *   zoom=1.25 → 496×640    zoom=2 → 310×400    zoom=2.5 → 248×320
+   * 最后两行是这条路被否掉的关键：CDP 的"缩小"不但没让整页进来，还把 100% 时**能滚到**的
+   * 最右端变成了**滚不到**。它不是没功能，是负功能。同一次实测里外壳侧那条
+   * （`setZoomFactor(0.5)`）蓝条高度 391→195px（正好一半）、红标出现在半尺寸位置上。
    *
-   * 根因不是我们偷懒：Playwright 在 Electron 视图上截图时，`deviceScaleFactor` 取自它**自己**
-   * 记的 `_metricsOverride`（`playwright-core/lib/coreBundle.js:37196`），而它算出来是 1
-   * —— 画面由 Electron 的合成器给，模拟覆盖不改变交付图片的像素。**只要走 CDP，
-   * 截图尺寸就只能等于布局视口。** 试过先 `setViewportSize` 再发 `deviceScaleFactor = zoom`
-   * 的覆盖再 `setViewportSize` 一次，量到仍然 `shot=310x400`。要"塞进窄栏"又要"截图尺寸守恒"，
-   * 只能由外壳去 `webContents.setZoomFactor()` —— 插件够不到（ADR-0013 记了为什么本期不做）。
+   * ## 截图语义因此**回到** T5 那句话，而不是被作废
+   *
+   * 外壳侧缩放让页面读到的 `devicePixelRatio = 屏幕dpr × zoom`，布局视口 = `源视口 / zoom`，
+   * 两者相乘恒等于窗格的物理像素：`1240 × 0.75 = 930`，与 `620 × 1.5 = 930` 是同一个数。
+   * 所以 **"截图 = 视口 × 屏幕 dpr"（T5）在缩放≠1 时照样成立** —— 漂移是 CDP 那条路
+   * 特有的毛病（Playwright 截图用的 dsf 取自它自己的 `_metricsOverride`,
+   * `playwright-core/lib/coreBundle.js:37196`，算出来是 1），它随那条路一起被删掉了。
    *
    * @param zoom - 目标缩放值，必须在 `ZOOM_MIN`–`ZOOM_MAX` 之内（`src/navigation.ts`）。
-   * @returns 缩放之后**从页面读回来**的视口、dpr 与源视口。
+   * @returns 缩放之后**从外壳与页面各自读回来**的视口、dpr 与源视口。
    * @throws RangeError 当 zoom 出界（悄悄夹到边界会让"100 倍"变成"5 倍"而不说一声）。
+   * @throws ViewActionError 当这个会话没有可问的外壳 —— 那时**不能**假装缩放过。
    */
   async zoomTo(zoom: number): Promise<ZoomResult> {
     this.assertOpen()
     const wanted = normalizeZoom(zoom)
-    const source = await this.sourceViewportSize()
-    const size = scaledViewport(source, wanted)
-    // 第一步：布局视口。这是**唯一**真的会动布局的那条路。
-    await this.page.setViewportSize(size)
-    // 第二步：把页面读到的 dpr 拨到 zoom。拿不到 CDP 会话时**不假装**缩放过：
-    // `devicePixelRatio` 会与面板上的数字对不上，那种"一半生效"比直接失败更难查。
-    const target = await this.metricsTarget()
-    if (target === undefined) {
+    if (this.zoomPort === undefined) {
       throw new ViewActionError(
         'failed',
-        'browser-view: the view cannot be zoomed — this session could not open a CDP session for the view\'s ' +
-          'main frame, so `Emulation.setDeviceMetricsOverride` could not be applied. The layout viewport was ' +
-          'already resized, so the view is at a zoomed layout with an unzoomed devicePixelRatio; ' +
-          'call browser_view action "zoom" with zoom 1 to put it back.',
+        'browser-view: the view cannot be zoomed — this session has no shell to ask. Zooming is ' +
+          "`webContents.setZoomFactor()` on the view's webContents, which only the shell can reach " +
+          '(the plugin never gets an Electron handle, ADR-0003), so the request goes through the task-space ' +
+          'channel the shell already reads. This session was adopted without that channel (no `DSH_DESKTOP_VIEW_SPACES`), ' +
+          'so the zoom is unchanged.',
       )
     }
-    await target.send('Emulation.setDeviceMetricsOverride', {
-      width: size.width,
-      height: size.height,
-      deviceScaleFactor: wanted,
-      mobile: false,
-    })
-    this.currentZoom = wanted
+    // 请外壳去改，并**用它读回来的值**当结果：请求里的那个数是愿望，`getZoomFactor()` 才是事实。
+    const applied = await this.zoomPort.setZoom(wanted)
+    this.currentZoom = applied
     await this.settle()
-    return await this.zoomReading(wanted, source)
+    return await this.zoomReading(applied)
   }
 
   /**
@@ -1751,38 +1786,6 @@ export class AdoptedViewSession {
   /** 回到 100%（T13 的"重置"之一）。 */
   async resetZoom(): Promise<ZoomResult> {
     return await this.zoomTo(1)
-  }
-
-  /**
-   * 撤掉缩放留下的模拟覆盖，并把布局视口调回**源视口**（T13）。
-   *
-   * 与 `resetZoom()` 的差别是**有没有留下模拟**：`zoomTo(1)` 之后布局视口虽然回到 620×800，
-   * 但 `Emulation.setDeviceMetricsOverride` 还在生效（`deviceScaleFactor` 被拨到 1），
-   * 于是 Playwright 截图走的是"模拟过的"那条路，交付图片是 620×800 而不是 930×1200
-   * （`docs/adr/0013-*.md` 第 4 节）。这个方法把覆盖撤掉、并把视口显式调回源尺寸，
-   * 让视图回到"没有被模拟过"的状态。
-   *
-   * 产品路径**不用**它：用户要的"100%"就是 `zoom-reset`，而那个状态下的截图正是
-   * 缩放语义该有的样子。它是给测试用来把两种状态分开量的。
-   *
-   * `setViewportSize` 不接受 `null`（Playwright 只在 `emulatedSize` 为真时才发覆盖），
-   * 所以"撤掉"只能靠显式调回源尺寸 + `clearDeviceMetricsOverride` 两件事一起做。
-   *
-   * @returns 页面自己读回来的视口与 dpr（撤掉之后读的）。
-   */
-  async clearMetricsOverride(): Promise<{ innerWidth: number; innerHeight: number; devicePixelRatio: number }> {
-    this.assertOpen()
-    const source = await this.sourceViewportSize()
-    const target = await this.metricsTarget()
-    if (target !== undefined) await target.send('Emulation.clearDeviceMetricsOverride')
-    await this.page.setViewportSize(source)
-    this.metricsSessions.clear()
-    this.currentZoom = 1
-    return await this.page.evaluate(() => ({
-      innerWidth: window.innerWidth,
-      innerHeight: window.innerHeight,
-      devicePixelRatio: window.devicePixelRatio,
-    }))
   }
 
   /**
@@ -1811,16 +1814,17 @@ export class AdoptedViewSession {
     }
   }
 
-  /** 视图本来的视口尺寸（第一次问的时候读下来，之后一直用它）。 */
-  private async sourceViewportSize(): Promise<{ width: number; height: number }> {
-    if (this.sourceViewport !== undefined) return this.sourceViewport
-    const size = await this.page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))
-    this.sourceViewport = { width: Math.max(1, Math.round(size.width)), height: Math.max(1, Math.round(size.height)) }
-    return this.sourceViewport
-  }
-
-  /** 从**页面自己**读回缩放之后的三件事。 */
-  private async zoomReading(zoom: number, source: { width: number; height: number }): Promise<ZoomResult> {
+  /**
+   * 从**页面自己**读回缩放之后的三件事，并算出源视口。
+   *
+   * 源视口是算的：外壳侧的缩放就是"布局视口 = 源视口 / zoom"，所以 `源视口 = 布局视口 × zoom`。
+   * 这样它必然与同一次读回的 `innerWidth` 自洽 —— 另读一次的话，两次读回之间页面换了一页就会
+   * 报出一对互相矛盾的数。
+   *
+   * @param zoom - 外壳读回来的缩放值。
+   * @returns 收成 {@link ZoomResult}。
+   */
+  private async zoomReading(zoom: number): Promise<ZoomResult> {
     const seen = await this.page.evaluate(() => ({
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
@@ -1831,21 +1835,11 @@ export class AdoptedViewSession {
       innerWidth: seen.innerWidth,
       innerHeight: seen.innerHeight,
       devicePixelRatio: seen.devicePixelRatio,
-      source,
+      source: {
+        width: Math.max(1, Math.round(seen.innerWidth * zoom)),
+        height: Math.max(1, Math.round(seen.innerHeight * zoom)),
+      },
     }
-  }
-
-  /** 主框架的 CDP 会话（按文档缓存；`framenavigated` 会把它清掉）。 */
-  private metricsTarget(): Promise<MetricsTarget | undefined> {
-    const frame = this.page.mainFrame()
-    const existing = this.metricsSessions.get(frame)
-    if (existing !== undefined) return existing
-    const created = this.context
-      .newCDPSession(this.page)
-      .then((session) => session as unknown as MetricsTarget)
-      .catch(() => undefined)
-    this.metricsSessions.set(frame, created)
-    return created
   }
 
   /** 让一轮布局/绘制落定，好在同一个动作里把缩放读回来（读的是页面，不是我们写下去的值）。 */

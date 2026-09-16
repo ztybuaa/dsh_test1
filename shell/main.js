@@ -575,8 +575,28 @@ function createSpace(name) {
     // （见 {@link describeSpaces}）。
     url: undefined,
     contentsGoneAt: undefined,
+    // 插件请求过的缩放（这块视图**期望**是多少）。undefined = 从没被请求过 ——
+    // 那时 `spaceRecord` 发布的是 Electron 读回来的当前值，而这里不插手。
+    zoom: undefined,
   }
   state.spaces.set(name, entry)
+  // 缩放**跟着视图走**，不跟着网站走（票 #13 定下的语义）。
+  //
+  // 为什么不跟着网站走：Chromium 自己的缩放是按**站点**记的，所以换一个站点就回到该站点的
+  // 默认值（实测：`127.0.0.1` 上设的 50%，走到 `localhost` 就没了）。而用户要的是
+  // "这一格能不能适应侧边栏的大小" —— 一个点了链接就失效的缩放不是那个意思。这张票的框架
+  // 本来就是"每空间一块视图 ⇒ 缩放是**每块视图**自己的属性"，所以这里在每次主文档导航之后
+  // 把它重新按上去。
+  //
+  // 代价写在 ADR-0013 里：用户自己用 Ctrl+滚轮调过的缩放会被下一次导航覆盖回这里的期望值。
+  // 一个属性只能有一个主子，这是"跟视图走"这条选择的必然代价。
+  view.webContents.on('did-navigate', () => {
+    const current = state.spaces.get(name)
+    if (current === undefined || current.zoom === undefined) return
+    const contents = liveContents(current)
+    if (contents === undefined) return
+    if (Math.abs(contents.getZoomFactor() - current.zoom) > 1e-6) contents.setZoomFactor(current.zoom)
+  })
   attachDownloadHandling(viewSession)
   return entry
 }
@@ -879,6 +899,10 @@ function spaceRecord(entry, contents, identity, cookieCount) {
     active: entry.name === state.activeSpace,
     isDefault: entry.name === spaces.DEFAULT_SPACE,
     cookieCount,
+    // 缩放（T13）：**从 Electron 读回来**的那个数，不是我们请求过的那个数 ——
+    // 插件侧拿它当"缩放真的生效了"的唯一证据（`SpaceManager.setZoom`）。视图没了就没有这个
+    // 字段：那时没人回答得出来，缺省比编一个 1 诚实。
+    ...(live ? { zoom: contents.getZoomFactor() } : {}),
     // 视图没了这件事**显式写明**，不静默省略：读表的人要能看见"这个空间现在动不了、为什么"。
     ...(live ? {} : { destroyed: true, contentsGoneAt: entry.contentsGoneAt }),
     ...(entry.inherited !== undefined ? { inherited: entry.inherited } : {}),
@@ -995,7 +1019,7 @@ async function publishSpaces(cause) {
  */
 async function applySpaceRequest(raw) {
   state.spaceError = null
-  const plan = { create: [], close: [], activate: state.activeSpace }
+  const plan = { create: [], close: [], activate: state.activeSpace, zoom: [] }
   const parsed = spaces.parseRequest(raw)
   // 测试缝的作用范围：只覆盖"处理一条空间请求"（含它最后一次发布），启动那次列举永远是读真的。
   state.spaceRequestRunning = true
@@ -1017,6 +1041,11 @@ async function applySpaceRequest(raw) {
         if (diff.create.length > 0) await awaitCreatedTargets(diff.create)
         for (const name of diff.close) await closeSpace(name)
         activateSpace(diff.activate)
+        // 缩放放在**最后**：先把视图建齐、关掉不要的、切到目标空间，再去改缩放 ——
+        // 反过来会让"给一个刚被关掉的空间设缩放"这种顺序错误变成一次无谓的失败。
+        // 记录到 plan 里是为了让它出现在发布的 `lastRequest` 里（诊断用）。
+        plan.zoom = parsed.request.zooms
+        for (const { name, zoom } of parsed.request.zooms) applyZoom(name, zoom)
       } catch (error) {
         state.spaceError = error?.message ?? String(error)
       }
@@ -1027,6 +1056,45 @@ async function applySpaceRequest(raw) {
   } finally {
     state.spaceRequestRunning = false
   }
+}
+
+/**
+ * 把一块视图缩放到某个值（票 #13）。
+ *
+ * 两件事决定了它长这样：
+ *
+ *  1. **只有外壳能改缩放。** `webContents.setZoomFactor()` 是 Electron 的 API，插件永远拿不到
+ *     Electron 句柄（ADR-0003：外壳不开任何监听端口），所以缩放只能请外壳做 —— 经的是**既有**
+ *     那条空间请求文件，不是一条新通道。缩放本来就是**每块视图自己的属性**，与"每空间一块视图"
+ *     同一层，所以它挂在空间记录上（见 `shell/spaces.js` 的 `parseRequest`）。
+ *  2. **它同时做两件事，这正是它比 CDP 那条路强的地方。** 布局视口按比例变（页面读到的
+ *     `innerWidth` 变了），**并且内容真的被按比例画出来**。量过：`zoom=0.5` 时那条 1200px 的
+ *     条子在真窗口像素里高度 391→195（正好一半），页面最右端的红标出现在半尺寸的位置上。
+ *     插件够得到的那条 CDP 路（`Emulation.setDeviceMetricsOverride`）只做前一半 ——
+ *     窗格把模拟视口按 1:1 画出来再裁掉，于是"缩小"还把滚动条弄没了
+ *     （`docs/research/t13-zoom-out-measured.md`）。那条路已随这次决定删除。
+ *
+ * 读回由 {@link spaceRecord} 里的 `contents.getZoomFactor()` 负责：这里**只改**，不记录改了
+ * 多少 —— 发布出去的那个数必须是 Electron 说的，不是我们写下去的。
+ *
+ * @param {string} name - 空间名（已经由 {@link spaces.parseRequest} 校验过形状）。
+ * @param {number} zoom - 期望的缩放值。
+ * @throws 空间不存在、或它的视图已经没有 webContents 时（原因会写进 state）。
+ */
+function applyZoom(name, zoom) {
+  const entry = state.spaces.get(name)
+  if (entry === undefined) throw new Error(`cannot zoom "${name}": there is no such space`)
+  const contents = liveContents(entry)
+  if (contents === undefined) {
+    throw new Error(
+      `cannot zoom "${name}": its view has no webContents any more (it was destroyed), ` +
+        'so there is nothing to scale',
+    )
+  }
+  contents.setZoomFactor(zoom)
+  // 记住**期望值**：主文档导航之后要把它重新按上去（Chromium 的缩放是按站点记的，
+  // 换站点会回到那个站点的默认值）。读回仍然走 `getZoomFactor()`。
+  entry.zoom = zoom
 }
 
 /**
