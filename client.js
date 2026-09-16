@@ -2,7 +2,8 @@
 //
 // Built by `node scripts/build-client.mjs` from:
 //   shell/panel-rect.js  (panel measurement, shared with the shell's fixture panel)
-//   src/client-body.js   (tab type, tab body, panel component)
+//   src/toolbar.js       (the panel toolbar's decisions: buttons, availability, status line)
+//   src/client-body.js   (tab type, tab body, panel and toolbar components)
 //
 // Editing this file directly will be caught by tests/client-half.spec.ts; edit the
 // sources above and regenerate instead.
@@ -316,6 +317,166 @@ window.__ModuleLoader__.load({
 		})({ exports: {} })
 		//#endregion
 
+		//#region src/toolbar.js — spliced verbatim, fenced the same way
+		//
+		// Also a UMD module, also ending in `module.exports = api`, also installing itself
+		// on the page global (`DshViewToolbar`) — the same shape as the measurement above,
+		// so a plain `require()` of the source in a test reads the very same code the
+		// bundle runs, and the fence keeps this file's export from becoming the plugin's.
+		;(function (module) {
+		/*
+		 * The panel's toolbar: what it says, and what it renders.
+		 *
+		 * It lives beside `client-body.js` and is spliced into the generated `client.js` the same
+		 * way `shell/panel-rect.js` is (see `scripts/build-client.mjs`), for the same reason: the
+		 * decisions — which buttons there are, when one is unavailable, and what the status line
+		 * says — are the part worth pinning down, and they must be reachable without a browser
+		 * (a plain `require()` of this file in a test) and without a host.
+		 *
+		 * It carries **no** copy table and **no** transport. The copy arrives as arguments, because
+		 * the panel already has that table; the transport is `ctx.connection.rpc`, which only
+		 * `client-body.js` holds. Keeping both out of here is what lets this file be pure logic.
+		 */
+		;(function (root, factory) {
+		  var api = factory()
+		  // Both assignments, unconditionally, exactly as `shell/panel-rect.js` does it:
+		  // the generated bundle needs the global, and a plain `require()` in a test needs the
+		  // export. The `typeof` guard is only about environments with no `module` at all
+		  // (a browser page, a worker) — not about choosing between the two.
+		  if (typeof module === 'object' && module !== null && module.exports) module.exports = api
+		  root.DshViewToolbar = api
+		})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+		  'use strict'
+
+		  /**
+		   * The buttons, in the order a person reads them.
+		   *
+		   * `action` is the RPC action name — the same spelling the host's endpoint table uses
+		   * (`desktop-view-back`, …), so a typo here is a 404 rather than a silently different
+		   * button. `label` is the glyph a person sees.
+		   *
+		   * `shortcut` is the keyboard key, spelled the way `KeyboardEvent.key` reports it, or
+		   * `null` for a button with none. Keyboard support is not decoration: without arrow-key
+		   * history a person has to aim at a 24-pixel button, and "go back" is the one thing this
+		   * toolbar exists for.
+		   */
+		  var BUTTONS = [
+		    { action: 'back', label: '\u2190', title: 'back', shortcut: 'ArrowLeft' },
+		    { action: 'forward', label: '\u2192', title: 'forward', shortcut: 'ArrowRight' },
+		    { action: 'reload', label: '\u21bb', title: 'reload', shortcut: 'F5' },
+		    { action: 'zoom-out', label: '\u2212', title: 'zoom out', shortcut: null },
+		    { action: 'zoom-reset', label: '100%', title: 'reset the zoom to 100%', shortcut: null },
+		    { action: 'zoom-in', label: '+', title: 'zoom in', shortcut: null },
+		    { action: 'restart', label: 'restart', title: 'go back to the page this pane started on', shortcut: null },
+		  ]
+
+		  /** The actions in {@link BUTTONS}, for a caller that needs to check one is real. */
+		  var ACTIONS = BUTTONS.map(function (button) {
+		    return button.action
+		  })
+
+		  /**
+		   * Whether one button should be pressable right now.
+		   *
+		   * `back` and `forward` are the only two that can be **known** to be unavailable, and the
+		   * knowledge is honest about its own limits: it is what this panel has *observed* the view
+		   * do since it loaded (see `src/navigation.ts`), not what the browser's history really
+		   * holds. So they go grey when nothing has been seen — and every other button stays live,
+		   * because "we do not know" must never be rendered as "you cannot". A button that lies in
+		   * that direction is worse than one that is occasionally too eager: the latter says why
+		   * when it fails, the former refuses work that would have succeeded.
+		   *
+		   * @param {string} action - one of {@link ACTIONS}.
+		   * @param {{canGoBack: boolean, canGoForward: boolean, busy: boolean, hasShell: boolean}} state
+		   * @returns {boolean} whether the button is pressable.
+		   */
+		  function isEnabled(action, state) {
+		    if (state.hasShell !== true) return false
+		    // While one request is in flight every button is off: two overlapping history moves
+		    // would race, and the panel would then be showing a state neither of them produced.
+		    if (state.busy === true) return false
+		    if (action === 'back') return state.canGoBack === true
+		    if (action === 'forward') return state.canGoForward === true
+		    return true
+		  }
+
+		  /**
+		   * The zoom percentage a person reads.
+		   *
+		   * A missing or unreadable zoom renders as `—`, not as `100%`: the panel's whole point is
+		   * that what it shows comes from a read-back, and "the read did not come back" is a
+		   * different sentence from "the zoom is 100%".
+		   *
+		   * @param {unknown} zoom - the read-back zoom, or anything at all.
+		   * @returns {string} the label.
+		   */
+		  function zoomLabel(zoom) {
+		    if (typeof zoom !== 'number' || !isFinite(zoom)) return '\u2014'
+		    return Math.round(zoom * 100) + '%'
+		  }
+
+		  /**
+		   * The one line under the buttons.
+		   *
+		   * It always says something. `message` is the host's own sentence about the last action
+		   * (including **why** it could not happen — "no page to go back to" is the answer a person
+		   * needs, and it is the reason this line exists); `url` is where the view is now, read back
+		   * rather than remembered. When neither is available yet the line says so instead of being
+		   * blank, because a blank line under a row of buttons is indistinguishable from a toolbar
+		   * that is not working.
+		   *
+		   * @param {{url: string, zoom: unknown, message: string, ok: boolean|null}} state
+		   * @returns {string} the status text.
+		   */
+		  function statusText(state) {
+		    var parts = []
+		    if (state.ok === false) parts.push('\u2717 ' + (state.message === '' ? 'the action did not happen' : state.message))
+		    else if (state.message !== undefined && state.message !== '') parts.push(state.message)
+		    if (state.url !== undefined && state.url !== '') parts.push(state.url)
+		    if (parts.length === 0) return 'reading the view\u2026'
+		    return parts.join(' \u2014 ')
+		  }
+
+		  /**
+		   * Whether a keystroke should be treated as a toolbar shortcut.
+		   *
+		   * Two refusals, both load-bearing:
+		   *
+		   *  - **a modifier is held** — `Ctrl`/`Cmd`+`ArrowLeft` is the operating system's, and
+		   *    swallowing it would break a person's own habits;
+		   *  - **the focus is in a text field** — the panel sits inside the DSH window, so the
+		   *    caret may well be in the chat box, and stealing `ArrowLeft` from someone editing a
+		   *    sentence would be a worse bug than having no shortcut at all.
+		   *
+		   * @param {{key: string, ctrlKey: boolean, metaKey: boolean, altKey: boolean}} event - the keystroke.
+		   * @param {boolean} inTextField - whether the focused element takes text input.
+		   * @returns {string|null} the action to run, or null.
+		   */
+		  function actionForKey(event, inTextField) {
+		    if (inTextField === true) return null
+		    if (event.ctrlKey === true || event.metaKey === true || event.altKey === true) return null
+		    for (var index = 0; index < BUTTONS.length; index++) {
+		      if (BUTTONS[index].shortcut !== null && BUTTONS[index].shortcut === event.key) return BUTTONS[index].action
+		    }
+		    return null
+		  }
+
+		  /** Height of the toolbar strip, in CSS pixels. The panel keeps the rest. */
+		  var TOOLBAR_HEIGHT_PX = 34
+
+		  return {
+		    BUTTONS: BUTTONS,
+		    ACTIONS: ACTIONS,
+		    TOOLBAR_HEIGHT_PX: TOOLBAR_HEIGHT_PX,
+		    isEnabled: isEnabled,
+		    zoomLabel: zoomLabel,
+		    statusText: statusText,
+		    actionForKey: actionForKey,
+		  }
+		})
+		})({ exports: {} })
+		//#endregion
+
 		//#region src/client-body.js — spliced verbatim
 	/*
 	 * Registration body of the plugin's client half — spliced below the shared panel
@@ -327,6 +488,12 @@ window.__ModuleLoader__.load({
 	 * dependency between the two regions explicit instead of accidental.
 	 */
 	var DshPanelRect = globalThis.DshPanelRect
+
+	/**
+	 * The toolbar's own decisions — which buttons there are, when one is unavailable, what the
+	 * status line says. Spliced from `src/toolbar.js`, and readable in a plain test too.
+	 */
+	var DshViewToolbar = globalThis.DshViewToolbar
 
 	/**
 	 * @typedef {object} PanelRectApi
@@ -404,6 +571,241 @@ window.__ModuleLoader__.load({
 	}
 
 	/**
+	 * The client context, kept where the toolbar can reach it.
+	 *
+	 * It is set once by {@link apply} and read by the strip on render. A module-scoped variable
+	 * rather than a prop because the tab body is registered as a component *before* `apply` has
+	 * anything to pass it, and threading `ctx` through the product's slot props is not something
+	 * this plugin gets to do.
+	 */
+	var clientContext = null
+
+	/**
+	 * The channel the panel's buttons call, and the endpoints on it.
+	 *
+	 * It is the shared `/api` channel (ADR-0003's carrier-neutral RPC, reached through
+	 * `ctx.connection.rpc.call`), and the endpoint names carry this plugin's namespace so they
+	 * cannot collide with the product's own (`credentials/*`, `session/*`). Both halves of the
+	 * names live in `src/view-rpc.ts`; this is the client half of that one contract.
+	 */
+	var RPC_CHANNEL = '/api'
+
+	/** The endpoint a given action is called on: `desktop-view-back`, `desktop-view-state`, … */
+	function endpointFor(action) {
+	  return 'desktop-view-' + action
+	}
+
+	/**
+	 * One button press: ask the host to do it, and hand back the state it read afterwards.
+	 *
+	 * Every failure is turned into a value rather than thrown onwards, because the toolbar has
+	 * exactly one place to show an outcome (the status line) and a rejected promise there would
+	 * leave the line showing the *previous* action's result — a toolbar that reports the wrong
+	 * thing is worse than one that reports nothing.
+	 *
+	 * @param {object} ctx - the plugin context, carrying `connection`.
+	 * @param {string} action - the action name.
+	 * @returns {Promise<{ok: boolean, url: string, zoom: unknown, canGoBack: boolean,
+	 *   canGoForward: boolean, message: string}>} the host's answer, or a local failure value.
+	 */
+	async function callView(ctx, action) {
+	  try {
+	    var answer = await ctx.connection.rpc.call(RPC_CHANNEL, endpointFor(action), { nonce: String(Date.now()) })
+	    if (answer === null || answer === undefined || answer.ok !== true) {
+	      var failure = answer !== null && answer !== undefined && answer.error !== undefined ? answer.error : undefined
+	      return {
+	        ok: false,
+	        url: '',
+	        zoom: undefined,
+	        canGoBack: false,
+	        canGoForward: false,
+	        message:
+	          failure !== undefined && typeof failure.message === 'string'
+	            ? failure.message
+	            : 'the desktop shell did not answer (it may not be running, or the view is gone)',
+	      }
+	    }
+	    return answer.value
+	  } catch (error) {
+	    return {
+	      ok: false,
+	      url: '',
+	      zoom: undefined,
+	      canGoBack: false,
+	      canGoForward: false,
+	      message:
+	        'this pane could not reach the shell: ' +
+	        (error !== null && error !== undefined && error.message !== undefined ? String(error.message) : String(error)),
+	    }
+	  }
+	}
+
+	/**
+	 * The toolbar strip above the browser view.
+	 *
+	 * It is **in the panel, not in the view**: the native view parks on the rectangle this
+	 * panel reports, and the panel is a page in the shell's own window, so nothing drawn here
+	 * can reach the page the agent snapshots (a test pins that with "the view's snapshot is
+	 * unchanged while the toolbar exists").
+	 *
+	 * The strip takes its height off the top and reports the remaining rectangle, so the view
+	 * is not covered by its own controls. It also **loses the race on purpose** where it should:
+	 * the status line is the only thing it says, and it says it from the host's read-back.
+	 *
+	 * @param {{ctx: object, hasShell: boolean}} props - the plugin context, and whether the shell is here.
+	 * @returns {import('react').ReactElement} the toolbar element.
+	 */
+	function Toolbar(props) {
+	  var react = require('react')
+	  var toolbar = DshViewToolbar
+	  var [state, setState] = react.useState({
+	    ok: null,
+	    url: '',
+	    zoom: undefined,
+	    canGoBack: false,
+	    canGoForward: false,
+	    message: '',
+	    busy: false,
+	  })
+
+	  /** Ask the host what is true right now, and show that. */
+	  var refresh = react.useCallback(function () {
+	    void callView(props.ctx, 'state').then(function (next) {
+	      setState(function (previous) {
+	        return Object.assign({}, previous, next, { busy: false })
+	      })
+	    })
+	  }, [])
+
+	  /**
+	   * Run one action, then show what the host read back **after** it.
+	   *
+	   * The read-back is the point: the host answers with the post-action state, so the zoom
+	   * label and the two history buttons come from the view rather than from a local guess
+	   * that could drift the moment anything else drives the view (the agent does).
+	   */
+	  var run = react.useCallback(
+	    function (action) {
+	      setState(function (previous) {
+	        return Object.assign({}, previous, { busy: true })
+	      })
+	      void callView(props.ctx, action).then(function (next) {
+	        setState(function (previous) {
+	          return Object.assign({}, previous, next, { busy: false })
+	        })
+	      })
+	    },
+	    [],
+	  )
+
+	  // The first read happens once the strip is on screen. It is deliberately not part of a
+	  // render: a render that started a request would start one per re-render.
+	  react.useEffect(function () {
+	    refresh()
+	  }, [])
+
+	  // Keyboard shortcuts. Registered on the window because the panel is one element among
+	  // many in the DSH window and a person's hands are usually in the chat box.
+	  react.useEffect(function () {
+	    function onKeyDown(event) {
+	      var target = event.target
+	      var inTextField =
+	        target !== null &&
+	        target !== undefined &&
+	        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable === true)
+	      var action = toolbar.actionForKey(event, inTextField)
+	      if (action === null) return
+	      event.preventDefault()
+	      run(action)
+	    }
+	    window.addEventListener('keydown', onKeyDown)
+	    return function () {
+	      window.removeEventListener('keydown', onKeyDown)
+	    }
+	  }, [])
+
+	  var children = []
+	  for (var index = 0; index < toolbar.BUTTONS.length; index++) {
+	    var button = toolbar.BUTTONS[index]
+	    var enabled = toolbar.isEnabled(button.action, {
+	      canGoBack: state.canGoBack,
+	      canGoForward: state.canGoForward,
+	      busy: state.busy,
+	      hasShell: props.hasShell,
+	    })
+	    children.push(
+	      react.createElement(
+	        'button',
+	        {
+	          key: button.action,
+	          type: 'button',
+	          'data-dsh-view-action': button.action,
+	          title: button.title,
+	          disabled: !enabled,
+	          onClick: (function (action) {
+	            return function () {
+	              run(action)
+	            }
+	          })(button.action),
+	          style: {
+	            font: '12px/1 system-ui',
+	            minWidth: '24px',
+	            height: '22px',
+	            padding: '0 6px',
+	            border: '1px solid var(--dsh-color-border, #d0d7de)',
+	            borderRadius: '4px',
+	            background: 'var(--dsh-color-surface, #fff)',
+	            color: 'inherit',
+	            cursor: enabled ? 'pointer' : 'not-allowed',
+	            opacity: enabled ? 1 : 0.45,
+	          },
+	        },
+	        button.label,
+	      ),
+	    )
+	  }
+
+	  return react.createElement(
+	    'div',
+	    {
+	      'data-dsh-view-toolbar': 'ready',
+	      style: {
+	        height: toolbar.TOOLBAR_HEIGHT_PX + 'px',
+	        display: 'flex',
+	        alignItems: 'center',
+	        gap: '4px',
+	        padding: '0 6px',
+	        boxSizing: 'border-box',
+	        borderBottom: '1px solid var(--dsh-color-border, #d0d7de)',
+	        background: 'var(--dsh-color-surface, #fff)',
+	        color: 'var(--dsh-color-text, #1f2328)',
+	        flex: '0 0 auto',
+	      },
+	    },
+	    children,
+	    react.createElement(
+	      'span',
+	      {
+	        'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
+	        style: {
+	          marginLeft: 'auto',
+	          font: '11px/1.3 system-ui',
+	          whiteSpace: 'nowrap',
+	          overflow: 'hidden',
+	          textOverflow: 'ellipsis',
+	          maxWidth: '45%',
+	          textAlign: 'right',
+	          opacity: state.ok === false ? 1 : 0.75,
+	          color: state.ok === false ? 'var(--dsh-color-danger, #b42318)' : 'inherit',
+	        },
+	        title: toolbar.statusText(state),
+	      },
+	      toolbar.zoomLabel(state.zoom) + ' \u00b7 ' + toolbar.statusText(state),
+	    ),
+	  )
+	}
+
+	/**
 	 * The panel — the whole visible surface of this plugin in the sidebar.
 	 *
 	 * It renders no web page. It measures itself and reports the rectangle to the
@@ -460,32 +862,53 @@ window.__ModuleLoader__.load({
 	      ? copy().missing
 	      : copy().ready
 
-	  return react.createElement(
+	  // Two stacked rows: the toolbar, and the rectangle the native view parks on.
+	  //
+	  // The measured element is the *lower* one, and that is deliberate: the view covers exactly
+	  // what the panel reports (ADR-0004), so a toolbar sharing that rectangle would be painted
+	  // over by the very view it drives. Reporting the rectangle below the strip is what makes
+	  // the buttons visible at all — and it keeps the strip in the panel, where it cannot reach
+	  // the page the agent snapshots.
+	  var inner = react.createElement(
 	    'div',
 	    {
-	      // The panel fills its slot exactly: the shell measures this element, and any
-	      // inset here would leave a strip of the pane the view does not cover.
 	      ref: hostRef,
-	      'data-dsh-desktop-view-panel': report.state,
 	      style: {
-	        position: 'relative',
 	        width: '100%',
 	        height: '100%',
 	        overflow: 'hidden',
 	        display: 'flex',
-	        alignItems: 'center',
-	        justifyContent: 'center',
-	        padding: '12px',
+	        flexDirection: 'column',
 	        boxSizing: 'border-box',
-	        textAlign: 'center',
-	        opacity: report.rect === null ? 1 : 0,
-	        color: 'var(--dsh-color-text-secondary, #6b7280)',
-	        fontSize: '12px',
-	        lineHeight: '1.5',
 	      },
 	    },
-	    caption,
+	    hasShell ? react.createElement(Toolbar, { ctx: clientContext, hasShell: hasShell }) : null,
+	    react.createElement(
+	      'div',
+	      {
+	        'data-dsh-desktop-view-panel': report.state,
+	        style: {
+	          position: 'relative',
+	          flex: '1 1 auto',
+	          minHeight: 0,
+	          overflow: 'hidden',
+	          display: 'flex',
+	          alignItems: 'center',
+	          justifyContent: 'center',
+	          padding: '12px',
+	          boxSizing: 'border-box',
+	          textAlign: 'center',
+	          opacity: report.rect === null ? 1 : 0,
+	          color: 'var(--dsh-color-text-secondary, #6b7280)',
+	          fontSize: '12px',
+	          lineHeight: '1.5',
+	        },
+	      },
+	      caption,
+	    ),
 	  )
+
+	  return inner
 	}
 
 	/**
@@ -496,6 +919,8 @@ window.__ModuleLoader__.load({
 	 */
 	function apply(ctx) {
 	  var t = typeof ctx.locale?.bind === 'function' ? ctx.locale.bind(NS) : function () { return 'Browser' }
+	  // The toolbar reads this on render; see the note on the variable itself.
+	  clientContext = ctx
 
 	  // Stage one: what the type IS.
 	  ctx.effect(function () {
@@ -550,7 +975,7 @@ window.__ModuleLoader__.load({
 	}
 
 	exports.apply = apply
-	exports.inject = ['slots', 'locale', 'sidebarRightTabs']
+	exports.inject = ['slots', 'locale', 'sidebarRightTabs', 'connection']
 		//#endregion
 
 		// The host's loader wants an object with an `apply` method, and says only

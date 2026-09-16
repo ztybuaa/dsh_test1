@@ -29,7 +29,9 @@ const read = (relativePath) => readFileSync(join(repoRoot, relativePath), 'utf8'
 
 /** The source of truth for panel measurement, shared with the shell's fixture site. */
 const PANEL_RECT = read(join('shell', 'panel-rect.js'))
-/** The registration body (tab type + body + panel). */
+/** The toolbar's own decisions: which buttons, when one is off, what the status line says. */
+const TOOLBAR = read(join('src', 'toolbar.js'))
+/** The registration body (tab type + body + panel + toolbar component). */
 const CLIENT_BODY = read(join('src', 'client-body.js'))
 
 /**
@@ -48,7 +50,8 @@ const banner = `// GENERATED FILE — do not edit.
 //
 // Built by \`node scripts/build-client.mjs\` from:
 //   shell/panel-rect.js  (panel measurement, shared with the shell's fixture panel)
-//   src/client-body.js   (tab type, tab body, panel component)
+//   src/toolbar.js       (the panel toolbar's decisions: buttons, availability, status line)
+//   src/client-body.js   (tab type, tab body, panel and toolbar components)
 //
 // Editing this file directly will be caught by tests/client-half.spec.ts; edit the
 // sources above and regenerate instead.
@@ -72,6 +75,17 @@ window.__ModuleLoader__.load({
 		// file still installs \`globalThis.DshPanelRect\`, which is all the panel needs.
 		;(function (module) {
 ${indent(indent(PANEL_RECT))}
+		})({ exports: {} })
+		//#endregion
+
+		//#region src/toolbar.js — spliced verbatim, fenced the same way
+		//
+		// Also a UMD module, also ending in \`module.exports = api\`, also installing itself
+		// on the page global (\`DshViewToolbar\`) — the same shape as the measurement above,
+		// so a plain \`require()\` of the source in a test reads the very same code the
+		// bundle runs, and the fence keeps this file's export from becoming the plugin's.
+		;(function (module) {
+${indent(indent(TOOLBAR))}
 		})({ exports: {} })
 		//#endregion
 
@@ -106,7 +120,7 @@ if (checkOnly) {
   }
   if (current !== bundle) {
     process.stderr.write(
-      'client.js is stale: it does not match shell/panel-rect.js + src/client-body.js.\n' +
+      'client.js is stale: it does not match shell/panel-rect.js + src/toolbar.js + src/client-body.js.\n' +
         'Run `node scripts/build-client.mjs` and commit the result.\n',
     )
     process.exit(1)
@@ -116,6 +130,6 @@ if (checkOnly) {
   writeFileSync(target, bundle)
   process.stdout.write(
     `wrote ${relative(process.cwd(), target)} (${bundle.length} bytes) from ` +
-      `shell/panel-rect.js + src/client-body.js\n`,
+      `shell/panel-rect.js + src/toolbar.js + src/client-body.js\n`,
   )
 }

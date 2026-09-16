@@ -160,6 +160,12 @@ export interface SpaceManagerOptions {
   maxChars: number
   /** 等外壳处理请求时的轮询间隔。 */
   pollMs?: number
+  /**
+   * 外壳握手里说的初始页（`DSH_DESKTOP_VIEW_URL`），交给会话供「重新开始」用（T13）。
+   *
+   * 缺省 = 外壳没说，那时「重新开始」会退到空白页并**说出来**，而不是假装回到了哪一页。
+   */
+  initialUrl?: string
 }
 
 /** 等外壳处理请求时的轮询间隔：本地小文件，快一点没有代价。 */
@@ -440,6 +446,13 @@ export class SpaceManager {
   private readonly maxElements: number
   private readonly maxChars: number
   private readonly pollMs: number
+  /**
+   * 外壳握手里说的**初始页**（`DSH_DESKTOP_VIEW_URL`），「重新开始」要回到的就是它（T13）。
+   *
+   * 为什么不从状态表里那个 `url` 取：那是**视图现在在哪**（它会跟着导航变），而"重新开始"
+   * 要的是**外壳当初把它放在哪**。两句话长得像，意思不同。
+   */
+  private readonly initialUrl: string | undefined
   private readonly sessions = new Map<string, AdoptedViewSession>()
 
   /** @param options - 通道目录、超时与两个读取上限。 */
@@ -454,6 +467,7 @@ export class SpaceManager {
     this.maxElements = options.maxElements
     this.maxChars = options.maxChars
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS
+    this.initialUrl = options.initialUrl
   }
 
   /**
@@ -529,6 +543,8 @@ export class SpaceManager {
       timeoutMs: this.timeoutMs,
       maxElements: this.maxElements,
       maxChars: this.maxChars,
+      // 「重新开始」要回到的那一页来自**握手**，不是状态表里那个会跟着导航变的 `url`（T13）。
+      ...(this.initialUrl !== undefined && this.initialUrl !== '' ? { url: this.initialUrl } : {}),
       // 下载日志与空间状态**在同一个通道目录里**：都是外壳写、插件读的那一半
       // （ADR-0011）。没有通道就没有下载日志，`browser_download` 会如实说"没人可问"。
       ...(this.downloadJournalFile !== undefined ? { downloadJournalFile: this.downloadJournalFile } : {}),

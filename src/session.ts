@@ -37,6 +37,15 @@ import {
   type OverlayKind,
   type ViewPoint,
 } from './overlay.ts'
+import {
+  ObservedHistory,
+  classifyNavigationFailure,
+  normalizeZoom,
+  scaledViewport,
+  stepZoom as nextZoomStep,
+  type HistoryState,
+  type NavigationFailureReason,
+} from './navigation.ts'
 
 /**
  * Adopt-mode browser session.
@@ -89,6 +98,83 @@ export interface NavigationResult {
   title: string
   /** Final address, which may differ from the requested one after redirects. */
   url: string
+}
+
+/**
+ * 一次"回到上一页/下一页/重来一次"的结果（T13）。
+ *
+ * 与 {@link NavigationResult} 分开，因为**失败是这一类动作的常态**：一个刚打开的视图就是
+ * 没有可后退的历史，而"没有历史"和"页面拒绝了"和"超时了"是三件不同的事，补救也不同
+ * （T4 那套做法）。所以这个形状里失败**不抛**，而是如实带回分类 —— 分类是给调用方分支用的
+ * **值**，那句话是给人看的。
+ */
+export interface HistoryActionResult {
+  /** 视图现在的地址，动作成功与否都读回来。 */
+  url: string
+  /** 页面的标题；读不到时是空串。 */
+  title: string
+  /** 动作真的发生了吗。 */
+  moved: boolean
+  /** 没发生时是哪一类。 */
+  reason?: NavigationFailureReason
+  /** 没发生时那句话（含补救）。 */
+  message?: string
+  /** 这个会话自己观察到的历史，动作之后的状态 —— 面板上的按钮亮不亮看它。 */
+  history: HistoryState
+}
+
+/**
+ * 一次缩放的结果。
+ *
+ * 每个字段都是**读回来的**，不是算出来的：`devicePixelRatio` 与视口尺寸都从页面自己那里取
+ * （面板上显示的东西必须来自独立读回，不能是面板自己的局部变量）。
+ */
+export interface ZoomResult {
+  /** 现在是多少（1 = 没有缩放）。 */
+  zoom: number
+  /** 缩放之后布局视口的宽度，来自页面自己的 `innerWidth`。 */
+  innerWidth: number
+  /** 缩放之后布局视口的高度，来自页面自己的 `innerHeight`。 */
+  innerHeight: number
+  /** 缩放之后页面自己读到的 `devicePixelRatio`。 */
+  devicePixelRatio: number
+  /** 没有缩放时视图本来的视口尺寸，由会话在第一次缩放时读下来。 */
+  source: { width: number; height: number }
+}
+
+/**
+ * 用得到的 CDP 会话（只需要 `send`）。
+ *
+ * 单独写成一个类型是为了让"这一票只用了 `Emulation.setDeviceMetricsOverride` 这一条命令"
+ * 这件事在类型上也看得见 —— 将来多一条命令就要多一个字段，改不动是看得出来的。
+ */
+interface MetricsTarget {
+  send(method: string, params?: Record<string, unknown>): Promise<unknown>
+}
+
+/**
+ * 面板要显示的那一整份状态（T13）。
+ *
+ * 每一个字段都注明它**从哪读来**，因为面板上显示的东西必须来自独立读回：
+ * `url` 读自视图自己，`devicePixelRatio` / 视口读自页面自己，历史读自会话的观察账本。
+ */
+export interface ViewDisplayState {
+  /** 视图现在的地址。 */
+  url: string
+  /** 当前页面的标题，读不到时是空串。 */
+  title: string
+  /** 会话记着的缩放值（1 = 100%）。 */
+  zoom: number
+  /** 页面自己读到的 `devicePixelRatio`；页面正在换文档时缺席。 */
+  devicePixelRatio?: number
+  /** 页面自己读到的视口宽度（CSS 像素）；同上。 */
+  innerWidth?: number
+  /** 页面自己读到的视口高度；同上。 */
+  innerHeight?: number
+  /** 这个会话观察到的历史。 */
+  history: HistoryState
+  /** 外壳握手发布的初始页；没有就缺席（「重新开始」会去空白页）。 */
+  initialUrl?: string
 }
 
 /**
@@ -1126,6 +1212,37 @@ export class AdoptedViewSession {
   private failedRequests: FailedRequestRecord[] = []
 
   /**
+   * 这个会话**自己看着视图走过**的那些页（T13）。
+   *
+   * 记它的理由是"能不能后退"这个问题在本引擎上没有只读答案：Playwright 的
+   * `goBack()` 是一个动作而不是一次查询，`history.length` 又跨源不可靠。所以面板上
+   * 那两颗按钮亮不亮由**观察到的历史**回答 —— 见 {@link ObservedHistory} 里那段
+   * "它可能低估、但不会撒谎"的说明。
+   */
+  private readonly history = new ObservedHistory()
+
+  /**
+   * 每个文档自己的 CDP 会话，按需建、随文档消失而作废。
+   *
+   * 缩放要用 `Emulation.setDeviceMetricsOverride`，它是**每个 target/frame 的**状态：
+   * 主文档换了（哪怕只是 iframe 导航）之后旧会话就作废，所以这里按 frame 存，
+   * 并在 `framenavigated` 上把非主框架的条目丢掉。
+   */
+  private readonly metricsSessions = new Map<Frame, Promise<MetricsTarget | undefined>>()
+
+  /**
+   * 视图**本来**的视口尺寸，第一次缩放时读下来（T13）。
+   *
+   * 不在这里猜它等于面板矩形：视口是视图自己的事实，读一次比推一次可靠，
+   * 而且"重置"要回到的就是它。只读一次是因为缩放之后读到的是**模拟过的**视口，
+   * 再读就会把缩放当成新的原点（每按一次 `+` 都从当前值重新出发，永远到不了头）。
+   */
+  private sourceViewport: { width: number; height: number } | undefined
+
+  /** 现在是多少（1 = 没缩放）。它与页面读到的 `devicePixelRatio` 不是一回事，见 {@link zoomTo}。 */
+  private currentZoom = 1
+
+  /**
    * What the injected cursor overlay is told to draw (T8).
    *
    * It is data, not behaviour: the page-side functions receive this object whole, so
@@ -1161,6 +1278,12 @@ export class AdoptedViewSession {
      * means `downloads()` has to say "there is nothing to ask" rather than "none" (T9).
      */
     private readonly downloadJournalFile: string | undefined,
+    /**
+     * 外壳在握手里说的**初始页**（`viewUrl`），「重新开始」用它（T13）。
+     *
+     * 它是一次快照，不是"视图现在在哪"：视图会导航走，而这个值说的是外壳当初把它放在哪。
+     */
+    private readonly initialUrl: string | undefined,
   ) {
     // A `ref` is an index into *this* document. When the view navigates on its own —
     // a link, a form submit, a redirect — the next element at that index is a
@@ -1183,6 +1306,15 @@ export class AdoptedViewSession {
     page.on('framenavigated', (frame) => {
       if (frame !== page.mainFrame()) return
       this.forgetPageObservations()
+      // 观察到的历史（T13）：一次导航等于"视图现在在这一页上"。地址相同的重复上报
+      // 由 {@link ObservedHistory.observe} 自己去重，所以这里不必再判一次。
+      //
+      // 但**自己发起**的那一次要让路（见 {@link pendingTravel}）：后退/前进也会报这个事件，
+      // 而把它当成"走了一段新路"会清掉前进那一侧 —— 那正是"后退一次之后前进就没了"的成因。
+      if (this.pendingTravel === 0) this.history.observe(page.url())
+      // 缩放（T13）：主文档换了之后，旧文档的 CDP 会话就作废了。新的那个会在下一次
+      // 需要缩放时按需建；这里只把作废的清掉，省得 `Map` 跟着导航无限长。
+      this.metricsSessions.clear()
       // The overlay lives in the document, so the next document needs its own. Two
       // mechanisms, both idempotent, because they cover different windows: the init
       // script gets the overlay in before the new document can paint anything, and this
@@ -1280,6 +1412,9 @@ export class AdoptedViewSession {
         maxElements,
         maxChars,
         options.downloadJournalFile,
+        // 「重新开始」要回到的那一页：**外壳在握手里说的**那句 `viewUrl`（T13）。
+        // 没给就没有初始页，`restart()` 会如实退到 `about:blank` 并说出来。
+        options.url,
       )
     } catch (error) {
       // A failed adoption must not leave a dangling connection behind.
@@ -1320,6 +1455,404 @@ export class AdoptedViewSession {
       'returns promptly. Deal with the page first (save, or drop the guard with browser_evaluate), then navigate.'
     )
   }
+
+  /**
+   * 这个会话正在等一次**自己发起**的后退/前进。
+   *
+   * 为什么需要它：`page.goBack()` 也会让主框架报一次 `framenavigated`，而那个监听器把
+   * "导航了"理解成"走了一段新路"（于是清掉前进那一侧）。两者对同一件事的解释不同，
+   * 结果就是**后退一次之后前进那一侧被自己抹掉**（实测：`back` 成功、`forward` 立刻说
+   * "没有可前进的一页"）。所以自己发起的那一次由 `travel` 记账，监听器让路。
+   */
+  private pendingTravel = 0
+
+  /**
+   * 视图自己观察到的历史：还能后退/前进几页（T13）。
+   *
+   * @returns 两个计数，面板上的两颗按钮看它。
+   */
+  historyState(): HistoryState {
+    return this.history.state()
+  }
+
+  /**
+   * 回到上一页（T13）。
+   *
+   * @returns 发生了就 `moved: true` 并带新地址；没发生就带**分类**（`no-history` /
+   *   `page-refused` / `timeout` / `failed`），不抛 —— 见 {@link HistoryActionResult}。
+   */
+  async goBack(): Promise<HistoryActionResult> {
+    return await this.travel('back')
+  }
+
+  /**
+   * 走到下一页（T13）。
+   *
+   * @returns 与 {@link goBack} 同一形状。
+   */
+  async goForward(): Promise<HistoryActionResult> {
+    return await this.travel('forward')
+  }
+
+  /**
+   * 重新加载当前页（T13）。
+   *
+   * 与后退/前进分开写，因为它的失败只有两类：页面自己的 `beforeunload` 拦住了（未保存的改动），
+   * 或者超时 —— "没有历史"对它没有意义，把它硬塞进同一个分类会让模型去查一件不存在的事。
+   *
+   * @returns 与 {@link goBack} 同一形状。
+   */
+  async reload(): Promise<HistoryActionResult> {
+    this.assertOpen()
+    // 重载会换文档，所以 ref 立即作废（与 `goto` 同一个理由）。
+    void this.forgetRefs()
+    const mark = this.activityMark()
+    try {
+      await this.page.reload({ waitUntil: 'load', timeout: this.timeoutMs })
+      this.history.observe(this.page.url())
+      return { url: this.page.url(), title: await this.titleQuietly(), moved: true, history: this.history.state() }
+    } catch (error) {
+      const guarded = this.activitySince(mark).dialogs.find((record) => record.type === 'beforeunload') !== undefined
+      const classified = classifyNavigationFailure(error, guarded)
+      return {
+        url: this.page.url(),
+        title: await this.titleQuietly(),
+        moved: false,
+        reason: classified.reason,
+        message: this.navigationFailureMessage('reload', classified.reason, error),
+        history: this.history.state(),
+      }
+    }
+  }
+
+  /**
+   * 后退或前进的共同实现。
+   *
+   * @param direction - 往哪边走。
+   * @returns 与 {@link goBack} 同一形状。
+   */
+  private async travel(direction: 'back' | 'forward'): Promise<HistoryActionResult> {
+    this.assertOpen()
+    void this.forgetRefs()
+    const mark = this.activityMark()
+    const before = this.page.url()
+    // 自己发起的这一次由这里记账，`framenavigated` 那个监听器让路（见 `pendingTravel`）。
+    this.pendingTravel += 1
+    try {
+      const response = direction === 'back' ? await this.page.goBack({ timeout: this.timeoutMs }) : await this.page.goForward({ timeout: this.timeoutMs })
+      // `goBack`/`goForward` 在**没有那一页**时返回 `null` 而**不抛**：这是本引擎上唯一
+      // 一个"没有历史"的正面信号，也是最该被抓住的那一个（抛错那条只在别的引擎上出现）。
+      if (response === null && this.page.url() === before) {
+        return {
+          url: this.page.url(),
+          title: await this.titleQuietly(),
+          moved: false,
+          reason: 'no-history',
+          message:
+            `browser-view: there is no page to go ${direction} to — the view stayed at ${before}. ` +
+            `The view had no ${direction} history entry when this action ran (a view that was just opened, ` +
+            `or one whose forward branch was dropped by navigating somewhere new). Use browser_navigate to ` +
+            'open a page, or browser_view action "state" to see how much history this session has observed.',
+          history: this.history.state(),
+        }
+      }
+      // 只有真的挪动了才记账：`move` 说挪不动时账本不动（那正是"没有那一页"的诚实样子）。
+      if (this.history.move(direction === 'back' ? -1 : 1)) {
+        return { url: this.page.url(), title: await this.titleQuietly(), moved: true, history: this.history.state() }
+      }
+      return {
+        url: this.page.url(),
+        title: await this.titleQuietly(),
+        moved: false,
+        reason: 'no-history',
+        message:
+          `browser-view: there is no page to go ${direction} to — the view stayed at ${before}. ` +
+          `The view had no ${direction} history entry when this action ran (a view that was just opened, ` +
+          `or one whose forward branch was dropped by navigating somewhere new). Use browser_navigate to ` +
+          'open a page, or browser_view action "state" to see how much history this session has observed.',
+        history: this.history.state(),
+      }
+    } catch (error) {
+      const guarded = this.activitySince(mark).dialogs.find((record) => record.type === 'beforeunload') !== undefined
+      const classified = classifyNavigationFailure(error, guarded)
+      return {
+        url: this.page.url(),
+        title: await this.titleQuietly(),
+        moved: false,
+        reason: classified.reason,
+        message: this.navigationFailureMessage(direction, classified.reason, error),
+        history: this.history.state(),
+      }
+    } finally {
+      // 自己发起的那一次结束了：`framenavigated` 重新开始记账。
+      this.pendingTravel = Math.max(0, this.pendingTravel - 1)
+    }
+  }
+
+  /** 失败那句话：分类 + 引擎原文 + 补救。分类是**值**，所以调用方不必解析这段散文。 */
+  private navigationFailureMessage(action: string, reason: NavigationFailureReason, error: unknown): string {
+    const raw = firstLine(error instanceof Error ? error.message : String(error))
+    const where = this.page.url()
+    if (reason === 'page-refused') return this.pageGuardMessage(where)
+    if (reason === 'no-history') {
+      return (
+        `browser-view: there is no page to go ${action} to — the view stayed at ${where}. The engine said: ${raw}. ` +
+        `The view had no ${action} history entry when this action ran. Use browser_navigate to open a page.`
+      )
+    }
+    if (reason === 'timeout') {
+      return (
+        `browser-view: ${action} did not finish within ${this.timeoutMs}ms — the view is at ${where} and may be ` +
+        `mid-navigation. The engine said: ${raw}. This one is worth retrying; a page that never finishes loading ` +
+        'is a different problem (see browser_diagnostics).'
+      )
+    }
+    return `browser-view: ${action} failed and the view is still at ${where}. The engine said: ${raw}.`
+  }
+
+  /** 标题，读不到就给空串（导航失败那一刻页面可能正在换文档，读标题本身会抛）。 */
+  private async titleQuietly(): Promise<string> {
+    try {
+      return await this.page.title()
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * 面板要显示的那一整份状态，**一次读完**（T13）。
+   *
+   * 为什么是一个方法而不是五六个 getter：票面要求"面板显示的东西必须来自独立读回"，
+   * 而"独立"要经得起一次读一半——分成六次调用的话，面板上那个 URL、缩放百分比与两个按钮
+   * 的可用性可能来自**不同的瞬间**（中间隔着一次用户按下的动作），于是面板显示的是一个
+   * 从未存在过的组合。一次读完，它们描述的是同一刻。
+   *
+   * @returns 读自视图自己与页面自己的事实；读不到的那些如实缺席，不编。
+   */
+  async displayState(): Promise<ViewDisplayState> {
+    this.assertOpen()
+    let innerWidth: number | undefined
+    let innerHeight: number | undefined
+    let devicePixelRatio: number | undefined
+    try {
+      const seen = await this.page.evaluate(() => ({
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+      }))
+      innerWidth = seen.innerWidth
+      innerHeight = seen.innerHeight
+      devicePixelRatio = seen.devicePixelRatio
+      // 顺便把源视口定下来：第一次读的时候就是没有缩放的时候，这个值后面一直用它。
+      // 放在这里而不是只放在 `zoomTo` 里，是因为值本身来自同一趟读回。
+      this.sourceViewport ??= { width: Math.max(1, Math.round(seen.innerWidth)), height: Math.max(1, Math.round(seen.innerHeight)) }
+    } catch {
+      // 页面正在换文档时读不到：如实缺席，面板那边显示"读不到"比显示一个旧值好。
+    }
+    return {
+      url: this.page.url(),
+      title: await this.titleQuietly(),
+      zoom: this.currentZoom,
+      ...(devicePixelRatio !== undefined ? { devicePixelRatio } : {}),
+      ...(innerWidth !== undefined ? { innerWidth } : {}),
+      ...(innerHeight !== undefined ? { innerHeight } : {}),
+      history: this.history.state(),
+      ...(this.initialUrl !== undefined && this.initialUrl !== '' ? { initialUrl: this.initialUrl } : {}),
+    }
+  }
+
+  /**
+   * 现在的缩放值（1 = 没有缩放）。它是**会话记的**，不是页面读的。
+   *
+   * 为什么不读页面：`window.devicePixelRatio` 在缩放前后都会变（我们按 zoom 拨它），
+   * 但它同时也受显示器与系统缩放影响（本机基线是 1.5），所以它证明不了"我们缩放了没有"。
+   * 真正被拨动的是**模拟视口**，而那个值由我们自己写、由会话记住。
+   */
+  zoomLevel(): number {
+    return this.currentZoom
+  }
+
+  /**
+   * 缩放到某个值（T13）。`1` 就是重置。
+   *
+   * ## 它到底做了什么，以及为什么是这两步
+   *
+   * 缩放的定义是**布局视口按比例变小**：`1200px` 宽的页面在 `zoom = 2` 时落在 `600` 个 CSS
+   * 像素里，于是屏幕上占的**物理**面积不变、能看到的内容翻倍 —— 这正是用户那句
+   * "能不能适应侧边栏的大小"要的东西。
+   *
+   * 实测（`docs/research/t13-zoom-four-roads-measured.md`）四条路之后只有一条真的会动布局视口：
+   *
+   *  1. `page.setViewportSize({ width: floor(源宽/zoom), height: floor(源高/zoom) })`
+   *     —— 布局视口真的变小，页面自己读到 `innerWidth` 变小，**跨导航保持**；
+   *  2. 补一条 `Emulation.setDeviceMetricsOverride`（同一个 CSS 尺寸 + `deviceScaleFactor: zoom`）
+   *     —— 只为了把**页面读到的** `devicePixelRatio` 拨到 zoom。少了它，面板说"200%"而页面
+   *     算出来仍是 1.5，两边对不上；而 `bounds` 与截图坐标换算都要用页面这个值。
+   *
+   * ## 截图语义（T5 那句话在这里被作废，是有意的）
+   *
+   * T5 钉住的是"截图 = 视口 × 屏幕 dpr"（本机 620×800 × 1.5 = 930×1200）。**那条只在
+   * `zoom = 1` 时成立。** 缩放之后截图尺寸是 `floor(源视口/zoom) × floor(源视口/zoom)`：
+   *
+   *   zoom=1.25 → 496×640    zoom=2 → 310×400    zoom=2.5 → 248×320
+   *
+   * 根因不是我们偷懒：Playwright 在 Electron 视图上截图时，`deviceScaleFactor` 取自它**自己**
+   * 记的 `_metricsOverride`（`playwright-core/lib/coreBundle.js:37196`），而它算出来是 1
+   * —— 画面由 Electron 的合成器给，模拟覆盖不改变交付图片的像素。**只要走 CDP，
+   * 截图尺寸就只能等于布局视口。** 试过先 `setViewportSize` 再发 `deviceScaleFactor = zoom`
+   * 的覆盖再 `setViewportSize` 一次，量到仍然 `shot=310x400`。要"塞进窄栏"又要"截图尺寸守恒"，
+   * 只能由外壳去 `webContents.setZoomFactor()` —— 插件够不到（ADR-0013 记了为什么本期不做）。
+   *
+   * @param zoom - 目标缩放值，必须在 `ZOOM_MIN`–`ZOOM_MAX` 之内（`src/navigation.ts`）。
+   * @returns 缩放之后**从页面读回来**的视口、dpr 与源视口。
+   * @throws RangeError 当 zoom 出界（悄悄夹到边界会让"100 倍"变成"5 倍"而不说一声）。
+   */
+  async zoomTo(zoom: number): Promise<ZoomResult> {
+    this.assertOpen()
+    const wanted = normalizeZoom(zoom)
+    const source = await this.sourceViewportSize()
+    const size = scaledViewport(source, wanted)
+    // 第一步：布局视口。这是**唯一**真的会动布局的那条路。
+    await this.page.setViewportSize(size)
+    // 第二步：把页面读到的 dpr 拨到 zoom。拿不到 CDP 会话时**不假装**缩放过：
+    // `devicePixelRatio` 会与面板上的数字对不上，那种"一半生效"比直接失败更难查。
+    const target = await this.metricsTarget()
+    if (target === undefined) {
+      throw new ViewActionError(
+        'failed',
+        'browser-view: the view cannot be zoomed — this session could not open a CDP session for the view\'s ' +
+          'main frame, so `Emulation.setDeviceMetricsOverride` could not be applied. The layout viewport was ' +
+          'already resized, so the view is at a zoomed layout with an unzoomed devicePixelRatio; ' +
+          'call browser_view action "zoom" with zoom 1 to put it back.',
+      )
+    }
+    await target.send('Emulation.setDeviceMetricsOverride', {
+      width: size.width,
+      height: size.height,
+      deviceScaleFactor: wanted,
+      mobile: false,
+    })
+    this.currentZoom = wanted
+    await this.settle()
+    return await this.zoomReading(wanted, source)
+  }
+
+  /**
+   * 缩放一档（`+` / `−`）。
+   *
+   * @param direction - `1` 放大，`-1` 缩小。
+   * @returns 与 {@link zoomTo} 同一形状。
+   * @throws RangeError 当已经到头 —— 到头是一个结果，不是"什么也没发生"。
+   */
+  async stepZoom(direction: 1 | -1): Promise<ZoomResult> {
+    return await this.zoomTo(nextZoomStep(this.currentZoom, direction))
+  }
+
+  /** 回到 100%（T13 的"重置"之一）。 */
+  async resetZoom(): Promise<ZoomResult> {
+    return await this.zoomTo(1)
+  }
+
+  /**
+   * 撤掉缩放留下的模拟覆盖，并把布局视口调回**源视口**（T13）。
+   *
+   * 与 `resetZoom()` 的差别是**有没有留下模拟**：`zoomTo(1)` 之后布局视口虽然回到 620×800，
+   * 但 `Emulation.setDeviceMetricsOverride` 还在生效（`deviceScaleFactor` 被拨到 1），
+   * 于是 Playwright 截图走的是"模拟过的"那条路，交付图片是 620×800 而不是 930×1200
+   * （`docs/adr/0013-*.md` 第 4 节）。这个方法把覆盖撤掉、并把视口显式调回源尺寸，
+   * 让视图回到"没有被模拟过"的状态。
+   *
+   * 产品路径**不用**它：用户要的"100%"就是 `zoom-reset`，而那个状态下的截图正是
+   * 缩放语义该有的样子。它是给测试用来把两种状态分开量的。
+   *
+   * `setViewportSize` 不接受 `null`（Playwright 只在 `emulatedSize` 为真时才发覆盖），
+   * 所以"撤掉"只能靠显式调回源尺寸 + `clearDeviceMetricsOverride` 两件事一起做。
+   *
+   * @returns 页面自己读回来的视口与 dpr（撤掉之后读的）。
+   */
+  async clearMetricsOverride(): Promise<{ innerWidth: number; innerHeight: number; devicePixelRatio: number }> {
+    this.assertOpen()
+    const source = await this.sourceViewportSize()
+    const target = await this.metricsTarget()
+    if (target !== undefined) await target.send('Emulation.clearDeviceMetricsOverride')
+    await this.page.setViewportSize(source)
+    this.metricsSessions.clear()
+    this.currentZoom = 1
+    return await this.page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+    }))
+  }
+
+  /**
+   * 把视图导航回**初始页**（T13 的「重新开始」）。
+   *
+   * 地址来自握手发布的那句 `viewUrl`（外壳说这一格一开始是什么），拿不到就退到 `about:blank`
+   * —— "没有初始页"是一个必须说出来的事实，而不是"什么也不做"（那看起来跟按钮坏了没区别）。
+   *
+   * 它**顺带把缩放也重置**：一次"重新开始"如果留着上一轮的 250%，那么"回到初始状态"
+   * 就只做了一半。
+   *
+   * @returns 落在哪一页，以及用的是什么地址。
+   */
+  async restart(): Promise<{ url: string; title: string; target: string; source: 'handshake' | 'blank' }> {
+    this.assertOpen()
+    const target = this.initialUrl !== undefined && this.initialUrl !== '' ? this.initialUrl : 'about:blank'
+    await this.resetZoom()
+    const landed = await this.goto(target)
+    // 重新开始是一段**新**的历史，不是接着旧账走：把账本清成"只有这一页"。
+    this.history.reset(landed.url)
+    return {
+      url: landed.url,
+      title: landed.title,
+      target,
+      source: this.initialUrl !== undefined && this.initialUrl !== '' ? 'handshake' : 'blank',
+    }
+  }
+
+  /** 视图本来的视口尺寸（第一次问的时候读下来，之后一直用它）。 */
+  private async sourceViewportSize(): Promise<{ width: number; height: number }> {
+    if (this.sourceViewport !== undefined) return this.sourceViewport
+    const size = await this.page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))
+    this.sourceViewport = { width: Math.max(1, Math.round(size.width)), height: Math.max(1, Math.round(size.height)) }
+    return this.sourceViewport
+  }
+
+  /** 从**页面自己**读回缩放之后的三件事。 */
+  private async zoomReading(zoom: number, source: { width: number; height: number }): Promise<ZoomResult> {
+    const seen = await this.page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+    }))
+    return {
+      zoom,
+      innerWidth: seen.innerWidth,
+      innerHeight: seen.innerHeight,
+      devicePixelRatio: seen.devicePixelRatio,
+      source,
+    }
+  }
+
+  /** 主框架的 CDP 会话（按文档缓存；`framenavigated` 会把它清掉）。 */
+  private metricsTarget(): Promise<MetricsTarget | undefined> {
+    const frame = this.page.mainFrame()
+    const existing = this.metricsSessions.get(frame)
+    if (existing !== undefined) return existing
+    const created = this.context
+      .newCDPSession(this.page)
+      .then((session) => session as unknown as MetricsTarget)
+      .catch(() => undefined)
+    this.metricsSessions.set(frame, created)
+    return created
+  }
+
+  /** 让一轮布局/绘制落定，好在同一个动作里把缩放读回来（读的是页面，不是我们写下去的值）。 */
+  private async settle(): Promise<void> {
+    await this.page.evaluate(() => new Promise<void>((done) => requestAnimationFrame(() => done())))
+  }
+
 
   /**
    * Project the current page into a snapshot: title, address, and the visible

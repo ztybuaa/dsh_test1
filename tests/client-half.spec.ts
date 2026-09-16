@@ -43,6 +43,8 @@ interface ClientHalfReport {
   plugin: { keys: string[]; applyType: string; inject: unknown }
   /** Whether the spliced panel measurement installed itself on the page global. */
   panelInstalled: boolean
+  /** Whether the spliced toolbar module installed itself on the page global (T13). */
+  toolbarInstalled: boolean
   /** The registered tab type, reduced to the facts a user-visible open depends on. */
   tabType: {
     id: string
@@ -97,6 +99,7 @@ describe('client half — the artifact the host loads', () => {
       const host = window as unknown as {
         __moduleEntries?: Array<{ id: string; factory: (require: (name: string) => unknown) => unknown }>
         DshPanelRect?: { measure?: unknown }
+        DshViewToolbar?: { isEnabled?: unknown }
       }
       const entries = host.__moduleEntries ?? []
       const entry = entries[0]
@@ -176,6 +179,7 @@ describe('client half — the artifact the host loads', () => {
         entryId: entry.id,
         plugin: { keys: Object.keys(plugin), applyType: typeof plugin.apply, inject: plugin.inject ?? null },
         panelInstalled: typeof host.DshPanelRect?.measure === 'function',
+        toolbarInstalled: typeof host.DshViewToolbar?.isEnabled === 'function',
         tabType:
           definition === undefined
             ? null
@@ -211,9 +215,16 @@ describe('client half — the artifact the host loads', () => {
     // This is the assertion that was missing when the real host rejected the bundle:
     // the splice used to hand back the panel API instead of the plugin object.
     expect(report.plugin.applyType).toBe('function')
-    expect(report.plugin.inject).toEqual(['slots', 'locale', 'sidebarRightTabs'])
+    // `connection` is T13's addition and it is load-bearing: cordis refuses to hand a service
+    // to a plugin that did not declare it ("cannot get property ... without inject"), and the
+    // panel's toolbar reaches the host through exactly that service. Measured both ways:
+    // without it the toolbar's `rpc.call` throws before it can leave the page.
+    expect(report.plugin.inject).toEqual(['slots', 'locale', 'sidebarRightTabs', 'connection'])
     // ...and both regions really ran: the measurement is installed on the page global.
     expect(report.panelInstalled).toBe(true)
+    // The toolbar's own region ran too (T13). It is spliced the same way the measurement is,
+    // so "the splice dropped it" is a failure mode this line catches.
+    expect(report.toolbarInstalled, 'the spliced toolbar module must install itself on the page global').toBe(true)
   })
 
   it('registers the tab type as a page type that claims no address', () => {

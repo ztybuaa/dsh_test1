@@ -13,6 +13,7 @@ import type {
   PageDiagnostics,
   PageSnapshot,
   UploadResult,
+  ZoomResult,
 } from './session.ts'
 import { cutText } from './session.ts'
 import type { SpaceAction, SpaceCommandOutcome } from './spaces.ts'
@@ -269,6 +270,95 @@ interface SpaceCommandValue {
       localStorageKeys: number
     }
   }>
+}
+
+/**
+ * Canonical output of `browser_view` —— 导航与缩放那两件事的合并返回值（T13）。
+ *
+ * 每一条都是**动作之后读回来的**：`url` 来自视图自己，`devicePixelRatio` 与视口来自页面自己。
+ * 失败不抛成异常之外的形状：`ok: false` 时 `reason` 说出是哪一类，`message` 是那句话。
+ */
+const viewSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    action: { type: 'string', required: true },
+    ok: { type: 'boolean', required: true },
+    url: { type: 'string', required: true },
+    title: { type: 'string', required: true },
+    message: { type: 'string', required: true },
+    /** 失败分类之一（没有历史 / 页面拒绝 / 超时 / 别的）。成功时缺席。 */
+    reason: { type: 'string' },
+    /** 缩放类动作的三个读数（含 `view` 的 `state`），来自页面自己。 */
+    zoom: { type: 'number' },
+    devicePixelRatio: { type: 'number' },
+    innerWidth: { type: 'number' },
+    innerHeight: { type: 'number' },
+    /** 没有缩放时视图本来的视口尺寸（缩放动作才有）。 */
+    sourceWidth: { type: 'number' },
+    sourceHeight: { type: 'number' },
+    /**
+     * 这个会话**观察到的**历史（面板上那两颗按钮亮不亮由它回答）。
+     *
+     * 说"观察到的"不是谦虚：引擎没有"能不能后退"这种只读 API，所以这个数是这个会话
+     * 看着视图走过多少页，而不是浏览器的真值（见 `src/navigation.ts` 的 {@link ObservedHistory}）。
+     */
+    canGoBack: { type: 'boolean' },
+    canGoForward: { type: 'boolean' },
+    /** 「重新开始」落在哪儿，以及那个地址是哪来的（握手说的初始页，还是空白页）。 */
+    restartTarget: { type: 'string' },
+    restartSource: { type: 'string' },
+  },
+} as const
+
+/** The schema-shaped value `browser_view` returns. */
+interface ViewCommandValue {
+  action: string
+  ok: boolean
+  url: string
+  title: string
+  message: string
+  reason?: string
+  zoom?: number
+  devicePixelRatio?: number
+  innerWidth?: number
+  innerHeight?: number
+  sourceWidth?: number
+  sourceHeight?: number
+  canGoBack?: boolean
+  canGoForward?: boolean
+  restartTarget?: string
+  restartSource?: string
+}
+
+/** Render one `browser_view` outcome as the lines the model reads. */
+function renderView(_args: unknown, value: ViewCommandValue): { type: 'text'; text: string }[] {
+  const lines = [value.message]
+  if (value.ok) {
+    if (value.zoom !== undefined) {
+      lines.push(
+        `zoom: ${Math.round(value.zoom * 100)}% — the view's layout viewport is now ` +
+          `${String(value.innerWidth)}x${String(value.innerHeight)} CSS px (unzoomed it was ` +
+          `${String(value.sourceWidth)}x${String(value.sourceHeight)}), and the page reads ` +
+          `devicePixelRatio ${String(value.devicePixelRatio)}. A browser_screenshot is taken at the ` +
+          'layout viewport size, so it is smaller than the unzoomed one while zoomed in.',
+      )
+      // 这一句是这张票里最要紧的一句实话：缩放**没有**把页面缩小，所以固定宽度的排版
+      // 仍然被裁切。不说出来，"200%" 会让模型以为整页都看得见了（见 ADR-0013 决定二）。
+      lines.push(
+        'Note: the page itself is not scaled down — a fixed-width layout is still clipped at the pane edge, ' +
+          'you just see more of it at once. Use browser_scroll to move across such a page.',
+      )
+    }
+    if (value.canGoBack !== undefined) {
+      lines.push(
+        `history this session has observed: ` +
+          `${value.canGoBack === true ? 'can' : 'cannot'} go back, ` +
+          `${value.canGoForward === true ? 'can' : 'cannot'} go forward`,
+      )
+    }
+  }
+  return [{ type: 'text', text: lines.join('\n') }]
 }
 
 /**
@@ -552,6 +642,65 @@ function renderSnapshot(_args: unknown, value: PageSnapshot): { type: 'text'; te
   return [{ type: 'text', text: lines.join('\n') }]
 }
 
+/** 把一次缩放读数收成工具结果里的那几个字段（值来自页面自己的读回，不是我们写下去的数）。 */
+function zoomFields(reading: ZoomResult): {
+  zoom: number
+  devicePixelRatio: number
+  innerWidth: number
+  innerHeight: number
+  sourceWidth: number
+  sourceHeight: number
+} {
+  return {
+    zoom: reading.zoom,
+    devicePixelRatio: reading.devicePixelRatio,
+    innerWidth: reading.innerWidth,
+    innerHeight: reading.innerHeight,
+    sourceWidth: reading.source.width,
+    sourceHeight: reading.source.height,
+  }
+}
+
+/** 会话自己观察到的历史，收成两个布尔。 */
+function historyFields(session: AdoptedViewSession): { canGoBack: boolean; canGoForward: boolean } {
+  const state = session.historyState()
+  return { canGoBack: state.back > 0, canGoForward: state.forward > 0 }
+}
+
+/** `action: "state"`：不改任何东西，把三件事读回来。 */
+function viewState(session: AdoptedViewSession, action: string, message: string): ViewCommandValue {
+  const state = session.historyState()
+  const zoom = session.zoomLevel()
+  return {
+    action,
+    ok: true,
+    url: session.url(),
+    title: '',
+    message: `${message} — ${session.url()} at ${Math.round(zoom * 100)}%`,
+    zoom,
+    canGoBack: state.back > 0,
+    canGoForward: state.forward > 0,
+  }
+}
+
+/**
+ * `action: "zoom"` 的那个参数。
+ *
+ * 缺了或不是数就**抛**，不默默当成 1：一个手滑的空参数变成"重置"会让模型以为缩放成功了。
+ *
+ * @param value - 调用方给的缩放值。
+ * @returns 那个数（越界由 `session.zoomTo` 里的 `normalizeZoom` 拒绝）。
+ */
+function requireZoomArgument(value: unknown): number {
+  if (typeof value !== 'number') {
+    throw new Error(
+      `browser-view: browser_view needs a numeric \`zoom\` with action "zoom" (got ${JSON.stringify(value)}); ` +
+        'use "zoom-in"/"zoom-out" to step through the fixed levels, or "zoom-reset" for 100%',
+    )
+  }
+  return value
+}
+
 /**
  * Build the tools of this plugin.
  *
@@ -589,6 +738,105 @@ export function desktopViewTools(
       async execute(args): Promise<NavigationResult> {
         const session = await adopt()
         return await session.goto(args.url)
+      },
+    }),
+    defineTool({
+      name: 'browser_view',
+      description:
+        'Drive the desktop browser view itself, the way a browser\'s own chrome does: go back, go forward, ' +
+        'reload, zoom in/out/reset, read where the view is, or start over at the view\'s initial page. Actions: ' +
+        '"back", "forward", "reload" navigate history; "zoom-in", "zoom-out", "zoom" (with `zoom`), "zoom-reset" ' +
+        'change the page scale; "state" changes nothing and reports the address, the zoom, and whether this ' +
+        'session has history to go back or forward to; "restart" navigates the view back to the initial page the ' +
+        'shell published (a blank page when there is none) and resets the zoom. A back/forward/reload that does ' +
+        'not happen says which kind of failure it was: no history entry, the page refused to leave, or a timeout. ' +
+        'Zooming shrinks the layout viewport, so more of a wide page fits on screen — but it does NOT scale the ' +
+        'page down: a page with a fixed-width layout is still clipped at the pane\'s edge, just at a wider scroll ' +
+        'position. Use browser_scroll to move around such a page.',
+      parameters: {
+        action: {
+          type: 'string',
+          required: true,
+          description:
+            'One of "back", "forward", "reload", "zoom-in", "zoom-out", "zoom", "zoom-reset", "state", "restart"',
+        },
+        zoom: {
+          type: 'number',
+          description:
+            'With action "zoom": the scale to apply, between 0.25 and 5. 1 means no zoom. A value outside that ' +
+            'range is refused rather than clamped.',
+        },
+      },
+      output: { schema: viewSchema, render: renderView },
+      async execute(args): Promise<ViewCommandValue> {
+        const session = await adopt()
+        const action = args.action
+        if (action === 'state') return viewState(session, 'state', 'the view is where it is; nothing was changed')
+
+        if (action === 'restart') {
+          const restarted = await session.restart()
+          // `restart()` 顺带把缩放重置了，所以这里再读一次页面 —— 报给模型的是重置**之后**的事实，
+          // 而不是"我调用过重置"。
+          const reading = await session.zoomTo(session.zoomLevel())
+          return {
+            action,
+            ok: true,
+            url: restarted.url,
+            title: restarted.title,
+            message:
+              `restarted the view at ${restarted.url} (the ${restarted.source === 'handshake' ? 'initial page the shell published' : 'blank page, because the shell published no initial URL'}), and reset the zoom to 100%`,
+            restartTarget: restarted.target,
+            restartSource: restarted.source,
+            ...zoomFields(reading),
+            ...historyFields(session),
+          }
+        }
+
+        if (action === 'zoom-in' || action === 'zoom-out' || action === 'zoom' || action === 'zoom-reset') {
+          const before = session.zoomLevel()
+          let result
+          if (action === 'zoom-reset') result = await session.resetZoom()
+          else if (action === 'zoom') result = await session.zoomTo(requireZoomArgument(args.zoom))
+          else result = await session.stepZoom(action === 'zoom-in' ? 1 : -1)
+          return {
+            action,
+            ok: true,
+            url: session.url(),
+            title: await session.title(),
+            message:
+              `zoom ${Math.round(before * 100)}% → ${Math.round(result.zoom * 100)}%: the layout viewport is now ` +
+              `${result.innerWidth}x${result.innerHeight} CSS px (it was ${result.source.width}x${result.source.height} ` +
+              `unzoomed) and the page reads devicePixelRatio ${result.devicePixelRatio}`,
+            zoom: result.zoom,
+            devicePixelRatio: result.devicePixelRatio,
+            innerWidth: result.innerWidth,
+            innerHeight: result.innerHeight,
+            sourceWidth: result.source.width,
+            sourceHeight: result.source.height,
+            ...historyFields(session),          }
+        }
+
+        if (action !== 'back' && action !== 'forward' && action !== 'reload') {
+          throw new Error(
+            `browser-view: browser_view needs action to be one of "back", "forward", "reload", "zoom-in", ` +
+              `"zoom-out", "zoom", "zoom-reset", "state", "restart" (got ${JSON.stringify(action)})`,
+          )
+        }
+        const result =
+          action === 'back' ? await session.goBack() : action === 'forward' ? await session.goForward() : await session.reload()
+        return {
+          action,
+          ok: result.moved,
+          url: result.url,
+          title: result.title,
+          message:
+            result.moved
+              ? `${action === 'reload' ? 'reloaded' : `went ${action} to`} ${result.url}${result.title === '' ? '' : ` — ${result.title}`}`
+              : (result.message ?? `${action} did not happen`),
+          ...(result.reason !== undefined ? { reason: result.reason } : {}),
+          canGoBack: result.history.back > 0,
+          canGoForward: result.history.forward > 0,
+        }
       },
     }),
     defineTool({
