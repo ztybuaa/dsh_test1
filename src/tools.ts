@@ -4,6 +4,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { basename, resolve } from 'node:path'
 import { describeDialog } from './dialogs.ts'
 import { describeDownload, renderDownloadList } from './downloads.ts'
+import { fallbackScreenshotsDir } from './screenshots.ts'
 import type {
   AdoptedViewSession,
   DownloadReading,
@@ -434,10 +435,24 @@ function renderScreenshot(_args: unknown, value: ScreenshotOutcome): ContentBloc
   ]
 }
 
-/** Resolve the requested screenshot path, defaulting under `screenshotDir`. */
-function screenshotPath(screenshotDir: string, requested?: string): string {
+/**
+ * Resolve the screenshot path, defaulting under the configured directory.
+ *
+ * A path the caller names is used as given. Otherwise the file goes into the directory this
+ * dependency names — a string, or a function asked *now* (the plugin passes one, because the
+ * default comes from what the shell published and the shell may publish it late) — and, with
+ * neither, into {@link fallbackScreenshotsDir}.
+ *
+ * `process.cwd()` is deliberately **not** in that chain (#16). The host process's cwd is
+ * wherever the user typed the command — for this repository's own `npm run shell`, the
+ * repository root, which is how two `browser-<timestamp>.png` files once landed in `git status`.
+ */
+function screenshotPath(deps: ToolDependencies, requested?: string): string {
   if (requested !== undefined && requested.trim() !== '') return resolve(requested)
-  return resolve(screenshotDir, `browser-${Date.now()}.png`)
+  const named = deps.screenshotDir
+  const dir = typeof named === 'function' ? named() : named
+  const chosen = dir === undefined || dir.trim() === '' ? fallbackScreenshotsDir() : dir
+  return resolve(chosen, `browser-${Date.now()}.png`)
 }
 
 /**
@@ -461,8 +476,18 @@ export type ImageAttachmentSink = Pick<AttachmentStore, 'saveImage'>
 export interface ToolDependencies {
   /** Durable image store the screenshot is published into. */
   attachments?: ImageAttachmentSink
-  /** Directory a screenshot lands in when the caller names no path. Defaults to the process cwd. */
-  screenshotDir?: string
+  /**
+   * Directory a screenshot lands in when the caller names no path.
+   *
+   * A string is that directory (a relative one resolves against the process cwd, like any
+   * relative path). A function is asked **each time** a default is needed — the plugin passes
+   * one, because the directory is read from what the shell published and the shell may publish
+   * it after this plugin was mounted.
+   *
+   * Absent means {@link fallbackScreenshotsDir}: the system temporary directory's own
+   * subdirectory. It is deliberately never the process cwd (#16).
+   */
+  screenshotDir?: string | (() => string)
   /**
    * The task spaces the shell is hosting. Absent when the plugin runs somewhere with no shell to
    * ask (a browser, a deployment with no space channel configured) — and then `browser_space`
@@ -848,7 +873,9 @@ export function desktopViewTools(
       parameters: {
         path: {
           type: 'string',
-          description: 'Optional file path for the PNG; defaults to browser-<timestamp>.png under the screenshot dir',
+          description:
+            'Optional file path for the PNG; defaults to browser-<timestamp>.png in the screenshot directory ' +
+            '(the shell profile directory, or the system temporary directory when there is no shell)',
         },
       },
       output: { schema: screenshotSchema, render: renderScreenshot },
@@ -862,7 +889,7 @@ export function desktopViewTools(
               'mount the plugin with the attachments service available (it is declared in `inject`).',
           )
         }
-        const path = screenshotPath(deps.screenshotDir ?? process.cwd(), args.path)
+        const path = screenshotPath(deps, args.path)
         const data = await session.screenshot(path)
         const ref = await attachments.saveImage({ data, mediaType: 'image/png', name: basename(path) })
         return {

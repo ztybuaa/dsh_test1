@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -13,6 +13,8 @@ import {
   resolveDshBinScript,
   shellRecord,
   startShell,
+  waitForProbe,
+  type ProbeReport,
   type ShellProcess,
   type TempDshHome,
 } from './shell-harness.ts'
@@ -458,57 +460,6 @@ describe('票 #12 · 不抢端口：两个外壳同时起，各自的 DSH 与视
     expect(titles).toEqual(['view-page', 'view-page'])
   }, 120_000)
 })
-
-/** 探针写出来的那一份报告（字段见 `tests/fixtures/dsh-probe/index.js`）。 */
-interface ProbeReport {
-  /** 探针看到的 `DSH_DESKTOP_VIEW_*`（外壳交给载体的那份身份）。 */
-  shellEnvironment: Record<string, string | null>
-  /** 按步骤记下的事实。 */
-  steps: Array<Record<string, unknown>>
-  /** 经宿主注册表执行的每一次工具调用。 */
-  toolCalls: Array<{
-    tool: string
-    isError?: boolean
-    error?: unknown
-    threw?: string
-    value?: unknown
-    content?: unknown
-  }>
-  /** 附件读回的结果。 */
-  attachment: Record<string, unknown> | null
-  /** 探针是否跑完了。 */
-  done: boolean
-  /** 探针自己炸了的话，原因在这里。 */
-  fatal?: string
-}
-
-/**
- * 等探针把 `done: true` 写出来。
- *
- * @param file - 探针的报告文件。
- * @param timeoutMs - 最多等多久。
- * @returns 解析好的报告。
- */
-async function waitForProbe(file: string, timeoutMs: number): Promise<ProbeReport> {
-  const deadline = Date.now() + timeoutMs
-  let last = ''
-  for (;;) {
-    try {
-      const raw = readFileSync(file, 'utf8')
-      last = raw
-      const parsed = JSON.parse(raw) as ProbeReport
-      if (parsed.done === true) return parsed
-      if (typeof parsed.fatal === 'string') throw new Error(`the probe failed: ${parsed.fatal}`)
-    } catch (error) {
-      if (error instanceof Error && error.message.startsWith('the probe failed')) throw error
-      // 文件还没出现，或者正读到一半：接着等。
-    }
-    if (Date.now() >= deadline) {
-      throw new Error(`the probe did not finish within ${timeoutMs}ms; last report was:\n${last}`)
-    }
-    await new Promise((settle) => setTimeout(settle, 250))
-  }
-}
 
 describe('票 #12 · 真宿主里：注册表本体、真的驱动那一格、截图进真实附件 store', () => {
   let home: TempDshHome

@@ -2,7 +2,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import z from '@deepseek-ai/schemastery'
 import { AdoptedViewSession, DEFAULT_MAX_CHARS, DEFAULT_MAX_ELEMENTS } from './session.ts'
-import { SpaceManager, spaceChannelFrom } from './spaces.ts'
+import { resolveScreenshotDir } from './screenshots.ts'
+import { SpaceManager, spaceChannelFrom, userDataDirFromSpaceState } from './spaces.ts'
 import { desktopViewTools } from './tools.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -39,8 +40,19 @@ export interface Config {
   maxElements: number
   /** Cap on the characters a text read returns; beyond it the text is cut and says so. */
   maxChars: number
-  /** Directory `browser_screenshot` writes to when the caller names no path. */
-  screenshotDir: string
+  /**
+   * Directory `browser_screenshot` writes to when the caller names no path.
+   *
+   * **Explicit configuration always wins.** Unset (the default) means
+   * `<userDataDir>/screenshots` — the profile directory the shell publishes, which is the same
+   * place its downloads go (ADR-0011) — and, when no shell published one, the system temporary
+   * directory's own `dsh-desktop-view-screenshots` subdirectory.
+   *
+   * It is deliberately **not** the host process's working directory (#16): that is "where the
+   * user happened to type the command" — for this repository's own `npm run shell`, the
+   * repository root, which is how screenshots ended up in `git status`.
+   */
+  screenshotDir?: string
 }
 
 /** Schemastery schema validating {@link Config}. */
@@ -51,7 +63,9 @@ export const Config: z<Config> = z.object({
   timeoutMs: z.number().default(30000),
   maxElements: z.number().default(DEFAULT_MAX_ELEMENTS),
   maxChars: z.number().default(DEFAULT_MAX_CHARS),
-  screenshotDir: z.string().default('.'),
+  // 没有 `.default('.')`：默认值取决于**外壳发布了什么**，不是一个能写死在 schema 里的常量。
+  // 见 apply() 里的 defaultScreenshotDir 与 src/screenshots.ts。
+  screenshotDir: z.string(),
 })
 
 /**
@@ -77,6 +91,26 @@ export function apply(ctx: Context, config: Config): void {
           maxElements: config.maxElements,
           maxChars: config.maxChars,
         })
+
+  /**
+   * Where a screenshot goes when the caller names no path.
+   *
+   * Answered **each time one is needed**, not once at load — for the same reason as the
+   * handshake above: the profile directory is a fact the *shell* publishes (in the space
+   * channel's `state.json`; the same fact its `downloadsDir` is derived from, ADR-0011), and
+   * a plugin may be mounted before the shell has written it. Answering too early and keeping
+   * that answer forever is exactly the "silently degraded" shape this ticket is about.
+   *
+   * The three-way priority (explicit config → the shell's profile → the temporary fallback)
+   * lives in `resolveScreenshotDir`, in one place, and each of the three is pinned by a test.
+   */
+  const defaultScreenshotDir = (): string => {
+    const published = userDataDirFromSpaceState(channel?.stateFile)
+    return resolveScreenshotDir({
+      ...(config.screenshotDir !== undefined ? { configured: config.screenshotDir } : {}),
+      ...(published !== undefined ? { userDataDir: published } : {}),
+    }).dir
+  }
 
   /**
    * Resolve the session every tool acts on.
@@ -130,7 +164,8 @@ export function apply(ctx: Context, config: Config): void {
   const attachments: AttachmentStore = ctx.attachments
   for (const tool of desktopViewTools(adopt, {
     attachments,
-    screenshotDir: config.screenshotDir,
+    // 一个**函数**，不是此刻算好的一个字符串：默认目录来自外壳发布的事实，现问现答（见上）。
+    screenshotDir: defaultScreenshotDir,
     ...(spaces !== undefined ? { spaces } : {}),
   })) {
     ctx.tools.register(tool)

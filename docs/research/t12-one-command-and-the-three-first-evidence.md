@@ -386,6 +386,9 @@ RUN 3  Test Files  13 passed (13)   Tests  135 passed (135)   Duration  223.55s
 8. **`browser_screenshot` 的默认落盘目录是宿主进程的 cwd**（`screenshotDir` 默认 `.`）。
    用 `npm run shell` 从仓库根起外壳时，Agent 不给路径的截图会落在**仓库根**。
    这是既有行为（不在本票范围），本次只在探针里显式指定路径避免污染仓库；**没有改它**。
+   > 后续：这一条已经在 **#16** 修掉 —— 默认值换成外壳档案目录下的 `screenshots\`，拿不到档案目录时
+   > 落系统临时目录下的专用子目录；证据与反证见 `docs/research/t16-screenshot-default-dir.md`。
+   > 本清单第 8 条保留原样，它是票 #12 当时的事实。
 9. **PRD 故事 6 的"后退/前进/刷新"、故事 30 的"缩放"今天不存在**（`browser_navigate` 只有 `url`；
    `src/session.ts` 里没有 `goBack`/`goForward`/`reload`，也没有任何缩放手段）。
    这是**范围内漏做的功能**，不是"本期不做"；已跟踪在 **#13**（导航与缩放：Agent 工具 + 面板控件）。

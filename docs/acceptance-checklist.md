@@ -92,6 +92,7 @@ npm run shell
 | 接口数据 | 「这个列表的数据来自哪个接口，内容是什么」→ 拿到页面**实收**的那份 JSON（4xx/5xx 不算数据） | ✅ `tests/observation.spec.ts` › *reads the JSON the page fetched, and it is the payload the page itself received* |
 | 控制台与失败请求 | 「这一页为什么是空的」→ 拿到页面自己的报错与失败请求（方法、URL、状态码、响应摘要） | ✅ `tests/observation.spec.ts` › *reads the console errors and the failed requests the page really produced* |
 | 截图作为附件 | 「截个图给我看看」→ **对话里出现一张图片**（不是一行路径） | ✅ 到"送进附件 store"为止：`tests/observation.spec.ts` › *delivers the screenshot as an image attachment of this view, at the viewport size*；**并且**在真宿主里用**部署自己的**附件 store 存进又读回（13999 字节、PNG 魔数、内容寻址引用）—— `tests/acceptance.spec.ts` › *截图交给的是真实附件 store…*<br>👤 **"模型真的看见了这张图"必须你和 Agent 对话来验**（§9.2） |
+| 截图**落在哪**（Agent 不给路径时） | 不给路径就截图 → 文件落在外壳**档案目录下的 `screenshots\`**，**不是**你敲命令的那个目录（以前是仓库根，会混进 `git status`） | ✅ `tests/screenshot-dir.spec.ts` › *前提：宿主自己的 cwd 就是那个临时目录，而它整轮一个文件都没多*、*截图落在外壳档案目录下的 screenshots，而不是 cwd，也不是本仓库*（把外壳的 cwd 指到一个临时目录起真外壳 + 真宿主，调一次**不带 `path`** 的 `browser_screenshot`，再分行读回）<br>🔬 原始输出、兜底与反证见 [`docs/research/t16-screenshot-default-dir.md`](research/t16-screenshot-default-dir.md) |
 
 ---
 
@@ -243,6 +244,7 @@ npm test -- tests/panel-placement.spec.ts  # 只看"视图跟随"
 | 任务空间隔离 | `tests/spaces.spec.ts` |
 | 对话框、上传、下载、iframe | `tests/longtail.spec.ts` |
 | 光标覆盖层 | `tests/overlay.spec.ts` |
+| 截图默认落在哪（不给路径时） | `tests/screenshot-dir.spec.ts` |
 | 没有外壳时的行为（面板文案、工具回答） | `tests/no-shell.spec.ts` |
 | 客户端半边（tab 类型、guide 入口） | `tests/client-half.spec.ts` |
 | 本清单背后的原始测量 | `docs/research/t12-one-command-and-the-three-first-evidence.md` |

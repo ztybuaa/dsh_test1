@@ -15,6 +15,9 @@
  * 三件事都发生在**外壳起着的真宿主**里：环境变量 `DSH_DESKTOP_VIEW_*` 由外壳交给它，
  * 探针只是把这些变量指的那块视图用起来。
  *
+ * 它还把**自己的 cwd** 报出来（`shellEnvironment.cwd`）：票 #16 要问的就是"宿主进程的 cwd 是哪个
+ * 目录、截图有没有落在它里面"，而这个问题只有进程自己回答得了。
+ *
  * 它绝不把异常抛回宿主：所有失败都写进报告文件（`DSH_T12_PROBE_OUT`），由用例读出来判定。
  * 让探针把宿主搞崩，等于把"被测对象没起来"伪装成"探针自己的 bug"。
  */
@@ -83,6 +86,13 @@ export function apply(ctx) {
       targetId: process.env.DSH_DESKTOP_VIEW_TARGET ?? null,
       viewUrl: process.env.DSH_DESKTOP_VIEW_URL ?? null,
       spacesDir: process.env.DSH_DESKTOP_VIEW_SPACES ?? null,
+      /**
+       * 宿主进程自己的工作目录 —— **由宿主自己报**，不是用例推算的。
+       *
+       * 票 #16 要问的正是这个值：截图以前默认落在它里面（`screenshotDir` 默认 `'.'`）。
+       * 把它读回来，"cwd 到底是哪个目录""那个目录里有没有多出文件"才是两句可以分开核对的话。
+       */
+      cwd: process.cwd(),
     },
     steps: [],
     toolCalls: [],
@@ -189,8 +199,10 @@ export function apply(ctx) {
       })
 
       // ── 4. 截图：图片真的进了部署自己的附件 store，而且读得回来 ──────────────
-      // 显式给路径：不给的话 `screenshotDir` 的默认值是 `.`，也就是**宿主进程的 cwd**
-      // （外壳起宿主时用的是仓库根），一次测试就会往仓库里丢一张 PNG。
+      // 路径**由调用方决定**：`DSH_T12_PROBE_SHOT` 给了就用它（票 #12 的用例要"落在它指定的
+      // 那一个"），没给就**不给 path** —— 那正是票 #16 要问的那条路：默认落盘目录是谁。
+      // 走默认的那一轮，用例把外壳的 cwd 指到一个临时目录，于是它落哪、cwd 里多没多出文件，
+      // 都是可以分开读回的两件事。
       const shotPath = process.env.DSH_T12_PROBE_SHOT
       const shot = await call(
         'browser_screenshot',

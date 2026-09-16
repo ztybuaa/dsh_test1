@@ -410,6 +410,14 @@ export interface StartShellOptions {
   /** Window size, e.g. `{width: 900, height: 600}`. Defaults to the shell's own. */
   windowSize?: { width: number; height: number }
   /**
+   * Working directory of the shell process. Defaults to the repository root.
+   *
+   * 票 #16 需要它：宿主 `dsh` 是外壳的**子进程**，它的 cwd 是继承来的。把外壳的 cwd 指到一个
+   * 临时目录，"宿主进程的 cwd 到底是什么、它里面会不会多出文件"就能被独立读回，
+   * 而且失败的那一次也不会往仓库里写任何东西。
+   */
+  cwd?: string
+  /**
    * Profile directory to use instead of the per-run temporary one.
    *
    * The caller owns it: it is **not** removed by {@link ShellProcess.stop}. That is what
@@ -501,7 +509,7 @@ export async function launchShellProcess(input: LaunchShellInput): Promise<Shell
     input.command,
     input.argv,
     {
-      cwd: REPO_ROOT,
+      cwd: options.cwd ?? REPO_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       ...(options.env === undefined ? {} : { env: { ...process.env, ...options.env } }),
@@ -746,4 +754,59 @@ export function forwardedHostOutput(stdout: string): string[] {
     }
   }
   return texts
+}
+
+/** 探针写出来的那一份报告（字段见 `tests/fixtures/dsh-probe/index.js`）。 */
+export interface ProbeReport {
+  /** 探针看到的 `DSH_DESKTOP_VIEW_*`（外壳交给载体的那份身份），加上它自己的 cwd。 */
+  shellEnvironment: Record<string, string | null>
+  /** 按步骤记下的事实。 */
+  steps: Array<Record<string, unknown>>
+  /** 经宿主注册表执行的每一次工具调用。 */
+  toolCalls: Array<{
+    tool: string
+    isError?: boolean
+    error?: unknown
+    threw?: string
+    value?: unknown
+    content?: unknown
+  }>
+  /** 附件读回的结果。 */
+  attachment: Record<string, unknown> | null
+  /** 探针是否跑完了。 */
+  done: boolean
+  /** 探针自己炸了的话，原因在这里。 */
+  fatal?: string
+}
+
+/**
+ * 等探针把 `done: true` 写出来。
+ *
+ * **放在这里，不放在某个 spec 里**：票 #12 与票 #16 各要起一次真宿主、各要读同一份报告，
+ * 两处各抄一遍的话，"报告还没写完"这件事迟早会有一处处理得不一样（本仓库为同一形状的复制
+ * 付过代价，见 {@link removeWhenFree}）。
+ *
+ * @param file - 探针的报告文件。
+ * @param timeoutMs - 最多等多久。
+ * @returns 解析好的报告。
+ */
+export async function waitForProbe(file: string, timeoutMs: number): Promise<ProbeReport> {
+  const deadline = Date.now() + timeoutMs
+  let last = ''
+  for (;;) {
+    try {
+      const raw = readFileSync(file, 'utf8')
+      last = raw
+      const parsed = JSON.parse(raw) as ProbeReport
+      if (parsed.done === true) return parsed
+      if (typeof parsed.fatal === 'string') throw new Error(`the probe failed: ${parsed.fatal}`)
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('the probe failed')) throw error
+      // 文件还没出现，或者正读到一半：接着等。
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`the probe did not finish within ${timeoutMs}ms; last report was:\n${last}`)
+    }
+    await new Promise((settle) => setTimeout(settle, 250))
+  }
 }

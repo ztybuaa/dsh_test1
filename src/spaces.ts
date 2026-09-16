@@ -289,6 +289,33 @@ export function parseSpaceState(raw: string): SpaceState | undefined {
   }
 }
 
+/**
+ * 外壳发布的**档案目录**（`state.json` 的 `userDataDir`）。
+ *
+ * 为什么从这里读，而不是从进程环境：外壳交给宿主的变量只有 CDP 端点、targetId、视图地址与
+ * **通道目录**四样，档案目录**不在**其中；而 `state.json` 里这个字段是外壳自己写下的那句话，
+ * 与"下载落在 `<userDataDir>/downloads`"用的是同一份事实（ADR-0011），所以不需要新增任何通道。
+ *
+ * 为什么用 {@link parseSpaceState} 而不是自己 `JSON.parse` 一遍：那个文件只有一个解释，
+ * 两处各读一遍迟早会有一处先漂。而整份文件读不动时返回 `undefined` —— "没有档案目录"是这一条
+ * 的**兜底**，不是"外壳不在"，所以它不抛异常（读得动与读不动的每一种形状都各有一条单测）。
+ *
+ * @param stateFile - 通道里的 `state.json`；这个部署没配通道时是 undefined。
+ * @returns 档案目录；读不到就是 undefined。
+ */
+export function userDataDirFromSpaceState(stateFile: string | undefined): string | undefined {
+  if (stateFile === undefined) return undefined
+  let raw: string
+  try {
+    raw = readFileSync(stateFile, 'utf8')
+  } catch {
+    return undefined
+  }
+  const state = parseSpaceState(raw)
+  if (state === undefined || state.userDataDir === '') return undefined
+  return state.userDataDir
+}
+
 /** 一条插件想要发出去的请求。 */
 export interface SpaceRequest {
   /** 单调递增：外壳处理到哪个 id 就把它写回 state，插件等它。 */

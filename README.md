@@ -290,7 +290,7 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 | `browser_extract` | 读页面渲染出来的正文(页面自己的 `innerText`) | 默认上限 20000 字符;超限就截断,并把 `truncated` 与 `totalChars` 作为数据一起返回,不用猜"是不是全的" |
 | `browser_evaluate` | 在页面里求值一条**只读**表达式并返回结果 | 用来读只活在 JS 里的状态;**不是**绕过 `ref` 的捷径 —— 要点击/输入/悬停仍用快照的 `ref`(ADR-0001) |
 | `browser_json` | 页面通过 `fetch`/XHR 加载到的 JSON(`[{url,status,body}]`) | 页面没渲染出来、数据只在响应里时用它;4xx/5xx **不算数据**,由 `browser_diagnostics` 带状态码报告 |
-| `browser_screenshot` | 截当前视图为 PNG,**把图片本身作为附件交付**(同时给出落盘路径) | 尺寸 = 视口 CSS 像素 × 显示器缩放(页面里的 `devicePixelRatio`);走 Playwright 截图 API,**没有** screencast |
+| `browser_screenshot` | 截当前视图为 PNG,**把图片本身作为附件交付**(同时给出落盘路径) | 尺寸 = 视口 CSS 像素 × 显示器缩放(页面里的 `devicePixelRatio`);走 Playwright 截图 API,**没有** screencast;不给 `path` 时落哪见下面那张表 |
 | `browser_diagnostics` | 页面自己报的**控制台消息**(含未捕获异常)与**失败请求**(方法、URL、状态码、响应摘要) | 页面空白/内容缺失/动作没反应时先看它 |
 
 `browser_navigate` 仍是注册表里的第 0 个工具;新增的观测工具只读,不改变元素定位方式。
@@ -298,6 +298,26 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 > 实测坑(记录在 `docs/research/cdp-screenshot-stall.md`):这块视图上**单发**一次截图常常**永远不返回**,
 > 而第二个请求会让两次都完成(并发发两个,两个都在 ~0.6s 内返回);`scale: 'css'` 在页面有滚动条时
 > 给出 439×799(视口是 440×800)。因此截图走**默认的 device 缩放**,并在超时时有界重试。
+
+#### 不带 `path` 的截图落在哪(票 #16)
+
+不给 `path` 时,PNG 落在一个**有明确归属**的目录里,显式永远优先:
+
+| 顺序 | 落在哪 | 什么时候走这条 |
+|---|---|---|
+| 1 | `screenshotDir` 显式配置的那个目录 | 配了就一定用它(相对路径照常按进程 cwd 解析) |
+| 2 | **`<外壳档案目录>/screenshots`** | 没配,而且外壳发布了档案目录 —— `npm run shell` 起的正常一轮 |
+| 3 | **`<系统临时目录>/dsh-desktop-view-screenshots`** | 既没配、也没有外壳发布档案目录(例如没跑外壳) |
+
+第 2 条与**下载**那条决定对称(下载落 `<档案目录>/downloads`,ADR-0011):档案目录是外壳自己在
+空间通道的 `state.json` 里发布的 `userDataDir`,插件照读即可,**不需要任何新通道**;截图因此与
+"这一格的档案"待在一起,人在自己家里也找得到。第 3 条是兜底,目录名自带归属,`%TEMP%` 里一眼能认出
+是谁放的。**`process.cwd()` 不在这条判断链里**。
+
+> 原来的默认值是 `'.'`,也就是**宿主 `dsh` 进程的 cwd**:从仓库根跑 `npm run shell` 时宿主继承的
+> 就是仓库根,于是 Agent 每截一张图,仓库根就多一个 `browser-<时间戳>.png` —— 实测发生过一次
+> (2026-09-16,仓库根留下两个未跟踪 PNG)。三条决定各自的证据、独立读回怎么做的、以及反证的原始
+> 输出在 [`docs/research/t16-screenshot-default-dir.md`](docs/research/t16-screenshot-default-dir.md)。
 
 ## 身份握手为什么这么做
 
@@ -324,6 +344,7 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 | `src/spaces.ts` | 插件侧的任务空间:期望状态怎么算(纯函数 `planRequest`)、原子写请求、等外壳处理完、按当前空间解析会话 |
 | `src/client-body.js` | 客户端半边:右栏 tab 类型(含 guide 入口)+ body + 面板组件,由构建脚本拼进 `client.js` |
 | `src/session.ts` | 领养模式会话:导航 / 快照 / 按 `ref` 的动作与失败原因定性,以及 T5 的观测(读正文、求值、抓 JSON 响应、控制台与失败请求、截图) |
+| `src/screenshots.ts` | 截图落盘位置的判断(**纯函数**,不 require electron,也不碰文件):显式配置 → 外壳档案目录下的 `screenshots` → 系统临时目录兜底(票 #16) |
 | `src/tools.ts` | 工具面:`browser_navigate`、`browser_snapshot`,T4 的 `browser_click` / `_type` / `_type_keys` / `_press_key` / `_hover` / `_select` / `_drag` / `_scroll` / `_wait`,T5 的 `browser_extract` / `_evaluate` / `_json` / `_screenshot` / `_diagnostics`,T7 的 `browser_space` |
 | `src/index.ts` | 插件入口:`name` / `inject`(`tools` + `attachments`) / `Config` / `apply`;`adopt()` 是唯一的会话缝,按**当前空间**解析 |
 | `scripts/build-client.mjs` | 把 `shell/panel-rect.js` + `src/client-body.js` 拼成 `client.js`(带 `--check`) |
@@ -336,8 +357,9 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 | `tests/identity.spec.ts` | T6 接缝测试:UA 与读回一致、两个页面的 `navigator.webdriver`、档案互不可见、优雅重启后登录态还在、代理两半(含真实日志代理) |
 | `tests/spaces.spec.ts` | T7 接缝测试:空间命名与请求的纯逻辑、创建/使用/关闭、页面与存储的释放(含重启后目录真的被删)、同站两空间互不影响、继承默认档案及其边界、工具只作用于当前空间 |
 | `tests/client-half.spec.ts` | 客户端半边:宿主加载契约、tab 类型 + guide 入口、body、生成物是否陈旧 |
-| `tests/shell-harness.ts` | 测试用外壳进程夹具(也能跑**任意一条会打印握手的命令**——票 #12 用它跑真的 `npm run shell`;`makeTempDshHome` 现搭一个临时 `DSH_HOME`,用户自己的 `.dsh` 一个字节都不碰) |
+| `tests/shell-harness.ts` | 测试用外壳进程夹具(也能跑**任意一条会打印握手的命令**——票 #12 用它跑真的 `npm run shell`;`makeTempDshHome` 现搭一个临时 `DSH_HOME`,用户自己的 `.dsh` 一个字节都不碰;`cwd` 可以把外壳的工作目录指到别处——票 #16 用它做"宿主 cwd 里没多出文件"的独立读回;探针报告的读法 `waitForProbe` 也在这里,票 #12 与 #16 共用一份) |
 | `tests/acceptance.spec.ts` | 票 #12 的验收:`npm run shell` 一条命令起完整外壳、不抢端口(两个外壳同时)、不打开系统浏览器、真宿主 `ctx.tools` 注册表本体、经注册表驱动那一格、截图进真附件 store 并读回 |
+| `tests/screenshot-dir.spec.ts` | 票 #16 的验收:默认截图目录的三选一(纯逻辑),以及**把外壳的 cwd 指到临时目录**起真外壳 + 真宿主,调一次**不带 `path`** 的 `browser_screenshot`,再分行读回"那个 cwd 没多出文件""图片在新默认位置""返回的路径就是落盘那个文件" |
 | `tests/cli-shape.spec.ts` | 票 #14 的守卫:**本文档里每一条外壳命令都是已证明安全的形状**,而且带 URL 的那条会被**原样跑一遍**;反证 = 旧形状必须秒退 `0xFFFFFFFF`(规则与原始测量见 [`docs/research/t14-cli-url-token-kills-electron.md`](docs/research/t14-cli-url-token-kills-electron.md)) |
 | `tests/fixtures/dsh-probe/` | 只读探针插件:装进临时 profile,在真宿主里读回注册表本体并驱动那一格(票 #12 用) |
 | `docs/acceptance-checklist.md` | 给用户看的验收清单(每条标明谁验的、以及本期不做什么) |
