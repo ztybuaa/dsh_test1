@@ -78,6 +78,16 @@ export interface SpaceRecord {
   }
 }
 
+/** 外壳发布的一条**读不动**的空间记录，连同它为什么读不动。 */
+export interface SkippedSpace {
+  /** 它在 `state.json` 的 `spaces` 数组里排第几个（0 起）——外壳没给名字时这是唯一的指代。 */
+  index: number
+  /** 能读出来的名字，读不出来就是 undefined。 */
+  name?: string
+  /** 这条记录为什么被跳过，逐字给模型看。 */
+  reason: string
+}
+
 /** 外壳发布的实际状态。 */
 export interface SpaceState {
   /** 控制通道的协议版本。 */
@@ -94,6 +104,13 @@ export interface SpaceState {
   cause?: string
   /** 每个空间一条记录。 */
   spaces: SpaceRecord[]
+  /**
+   * 外壳发布了、但**读不动**的那些记录。
+   *
+   * 它不是诊断信息，是**这个状态不完整**这件事本身：只有把它带到工具输出里，
+   * "某个空间不见了"才有一个说得清的原因，而不是让读的人以为它从来没存在过。
+   */
+  skipped: SkippedSpace[]
   /** 上一条请求真的做了什么，诊断用。 */
   lastRequest?: { id: number; create: string[]; close: string[]; activate: string; error: string | null }
 }
@@ -170,6 +187,23 @@ export function spaceChannelFrom(dir: string | undefined): SpaceChannel | undefi
  * 形状不对就返回 `undefined` —— 一个读不动或读了一半的状态文件不是"状态为空"，是"还没有状态"；
  * 把它当成空状态会让插件以为默认空间都不存在。
  *
+ * ## 文件级的校验与**记录级**的校验是两件事
+ *
+ * `requestId` / `active` / `protocol` / `spaces` 是**文件级**的：读不出来就说明这压根不是一份状态，
+ * 只能返回 `undefined`。而**一条记录**里少一个字段不是"整份状态不可读"，是"这一条不可用"：
+ *
+ *   `spaces: [{name, partition, destroyed: true, …}]` —— 视图被销毁的那条记录，没有
+ *   `storagePath`/`url`；以前这里 `return undefined`，意思是**整份状态都不可读**：
+ *   默认空间一起消失、所有工具都报"压根没有状态"，而那个错跟真实原因毫无关系。
+ *
+ * 现在的规矩：**跳过那一条**，把原因逐字记进 {@link SpaceState.skipped}（工具输出会带上它），
+ * 其余空间照常可用。这是本仓库已经有过一次的同一课 —— `mergeTargetIds` 存在的理由就是
+ * "**发布的表不许比它知道的更少**"（ADR-0010、`docs/research/space-table-target-id-gap.md`）：
+ * 一张表不能因为一个字段读不回来就整个变成"没有表"。
+ *
+ * 唯一仍然"整份不可读"的记录级条件是 `spaces` 里出现**不是对象**的东西：那不是一条记录，
+ * 是这个数组的形状坏了。
+ *
  * @param raw - 文件内容。
  * @returns 状态，或 undefined。
  */
@@ -186,15 +220,38 @@ export function parseSpaceState(raw: string): SpaceState | undefined {
   if (typeof record.active !== 'string' || typeof record.protocol !== 'number') return undefined
   if (!Array.isArray(record.spaces)) return undefined
   const spaces: SpaceRecord[] = []
-  for (const candidate of record.spaces) {
-    if (candidate === null || typeof candidate !== 'object') return undefined
+  const skipped: SkippedSpace[] = []
+  for (const [index, candidate] of record.spaces.entries()) {
+    if (candidate === null || typeof candidate !== 'object') {
+      return undefined
+    }
     const space = candidate as Record<string, unknown>
-    if (typeof space.name !== 'string' || typeof space.partition !== 'string') return undefined
-    if (typeof space.storagePath !== 'string' || typeof space.url !== 'string') return undefined
+    // 一条记录要能**用**，这四样必须是字符串：名字与 partition 是它的身份，`storagePath` 是
+    // "它到底在哪个罐子里"的唯一读回证据，`url` 是"它现在在哪"的唯一答案。少哪一样，
+    // 这条记录就没法被采用 —— 但**只跳过它**，不是把整份状态扔掉。
+    const missing = (['name', 'partition', 'storagePath', 'url'] as const).filter(
+      (field) => typeof space[field] !== 'string',
+    )
+    if (missing.length > 0) {
+      // 名字读不出来时也要能指代它：给出它在数组里的位置。外壳那条销毁记录是**有**名字的，
+      // 所以正常的那个场景里这一条消息能直接点名是哪个空间坏了。
+      skipped.push({
+        index,
+        ...(typeof space.name === 'string' ? { name: space.name } : {}),
+        reason:
+          `this space record is unusable: ${missing.join(', ')} ` +
+          `${missing.length === 1 ? 'is' : 'are'} not a string` +
+          (space.destroyed === true
+            ? ' (the shell published it for a view that has been destroyed, and a destroyed view publishes no ' +
+              'storage path or address — the shell now fills both in, so this record means an older shell)'
+            : ''),
+      })
+      continue
+    }
     spaces.push({
-      name: space.name,
-      partition: space.partition,
-      storagePath: space.storagePath,
+      name: space.name as string,
+      partition: space.partition as string,
+      storagePath: space.storagePath as string,
       persistent: space.persistent === true,
       ...(typeof space.targetId === 'string' && space.targetId !== '' ? { targetId: space.targetId } : {}),
       // 外壳对"这个 targetId 怎么来的"说的话要原样带过来：把它丢掉，下面的 adopt() 就只能说
@@ -206,7 +263,7 @@ export function parseSpaceState(raw: string): SpaceState | undefined {
       ...(typeof space.targetIdReason === 'string' && space.targetIdReason !== ''
         ? { targetIdReason: space.targetIdReason }
         : {}),
-      url: space.url,
+      url: space.url as string,
       visible: space.visible === true,
       webContentsId: typeof space.webContentsId === 'number' ? space.webContentsId : -1,
       active: space.active === true,
@@ -225,6 +282,7 @@ export function parseSpaceState(raw: string): SpaceState | undefined {
     userDataDir: typeof record.userDataDir === 'string' ? record.userDataDir : '',
     ...(typeof record.cause === 'string' ? { cause: record.cause } : {}),
     spaces,
+    skipped,
     ...(record.lastRequest !== undefined && record.lastRequest !== null
       ? { lastRequest: record.lastRequest as SpaceState['lastRequest'] }
       : {}),
@@ -306,6 +364,10 @@ export function planRequest(
 
 /**
  * 把状态渲染成给模型看的几行。
+ *
+ * 跳过的记录**在这里说**：一张少了一条的表如果不说明它少了一条，读的人只会以为那个空间
+ * 从来没存在过 —— 那正是"报出来的错跟真实原因毫无关系"的另一种写法。
+ *
  * @param state - 外壳发布的实际状态。
  * @returns 多行文本。
  */
@@ -322,6 +384,12 @@ export function describeSpaceTable(state: SpaceState): string {
         (space.targetId === undefined
           ? ` — no CDP target yet: ${space.targetIdReason ?? 'the shell did not say why'}`
           : ''),
+    )
+  }
+  for (const entry of state.skipped) {
+    lines.push(
+      `  ${entry.name ?? `<record ${entry.index}>`} — NOT USABLE, skipped: ${entry.reason}` +
+        ' (the other spaces are unaffected)',
     )
   }
   if (state.error !== null) lines.push(`Last request was refused: ${state.error}`)
@@ -399,9 +467,15 @@ export class SpaceManager {
     const state = this.requireState()
     const record = state.spaces.find((space) => space.name === state.active)
     if (record === undefined) {
+      // 当前空间不在表里时，"表里有哪些"还不够 —— 它可能是**被跳过的那一条**，
+      // 那种情况下真正的原因（它为什么读不动）才是模型要看的那句话。
+      const skippedActive = state.skipped.find((entry) => entry.name === state.active)
       throw new Error(
         `the desktop shell reports "${state.active}" as the active space but does not describe it ` +
-          `(it describes: ${state.spaces.map((space) => space.name).join(', ') || 'nothing'})`,
+          `(it describes: ${state.spaces.map((space) => space.name).join(', ') || 'nothing'})` +
+          (skippedActive === undefined
+            ? ''
+            : `; that space's own record was published but is not usable: ${skippedActive.reason}`),
       )
     }
     if (record.targetId === undefined) {

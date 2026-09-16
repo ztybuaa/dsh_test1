@@ -401,6 +401,8 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
         { name: 'default' } as never,
         { name: 'task-1' } as never,
       ],
+      // 这份字面量只喂给 `planRequest`（纯逻辑，不看 skipped）；字段是必填的，所以给一个空的。
+      skipped: [],
     } satisfies SpaceState
     const create = planRequest(state, { action: 'create', name: 'task-2' })
     const use = planRequest(state, { action: 'use', name: 'task-1' })
@@ -426,8 +428,26 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     expect(spaceChannelFrom('   ')).toBeUndefined()
     expect(parseSpaceState('{ not json')).toBeUndefined()
     expect(parseSpaceState('{}')).toBeUndefined()
-    expect(parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[{"name":1}]}')).toBeUndefined()
     expect(parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[]}')?.active).toBe('default')
+
+    /*
+     * 票 #15 改了这条断言，改的是**哪一层的失败**，不是"要不要严格"：
+     *
+     *  - `spaces` 里出现**不是对象**的东西 → 那不是一条记录，是这个数组的形状坏了 → 整份不可读；
+     *  - 一条记录**少字段** → 那是"这一条不可用"，跳过它并说明原因，其余空间照常可用。
+     *
+     * 原来这里钉的是后者也整份返回 undefined，也就是"一条坏记录能让默认空间一起消失"。
+     * 那是本票要消灭的单点失败，所以这条断言跟着新契约走（`docs/research/destroyed-space-record.md`）。
+     */
+    const notARecord = parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[1]}')
+    console.log('RAW a `spaces` array whose shape is broken: ' + JSON.stringify(notARecord))
+    expect(notARecord).toBeUndefined()
+    const oneBadRecord = parseSpaceState('{"requestId":1,"active":"default","protocol":1,"spaces":[{"name":1}]}')
+    console.log('RAW one bad record among the spaces: ' + JSON.stringify({ spaces: oneBadRecord?.spaces, skipped: oneBadRecord?.skipped }))
+    expect(oneBadRecord?.spaces).toEqual([])
+    expect(oneBadRecord?.skipped).toHaveLength(1)
+    expect(oneBadRecord?.skipped[0]?.index).toBe(0)
+    expect(oneBadRecord?.skipped[0]?.reason).toContain('name, partition, storagePath, url')
   })
 
   it('发布的表不许比它知道的更少：解析到的 > 记住的 > 显式说没有（纯逻辑）', () => {
@@ -998,4 +1018,195 @@ describe('T7 — 端点那一刻读不回来：发布的表不许比它知道的
     expect(refusal).toContain('flaky-always')
     expect(refusal).toContain('could not be listed')
   }, 120_000)
+})
+
+/**
+ * 票 #15 —— "一个空间坏了，别的空间连同默认空间都得还能用"。
+ *
+ * ## 先说清楚这条路径**真的是什么**（实测，别信推断）
+ *
+ * 票面假设的是"`describeSpaces` 走 `destroyed: true` 分支，发布一条缺 `storagePath`/`url`
+ * 的记录"。探针量下来**不是那样**（原始输出见 `docs/research/destroyed-space-record.md`）：
+ *
+ *  1. `webContents.isDestroyed()` **从没为真过**——渲染进程崩溃、`contents.close()`、页面自己
+ *     `window.close()` 三条途径都量过。一块被销毁的视图，`view.webContents` 直接变成
+ *     **undefined**，于是那个"读一下再看它销毁没销毁"的写法在这里是**抛**
+ *     （`TypeError: Cannot read properties of undefined (reading 'isDestroyed')`），
+ *     而不是走 `destroyed: true` 分支；
+ *  2. 抛了以后 `publishSpaces` 整份不写、`requestId` **永不前进**：插件一直等到超时，
+ *     报出来的错是"外壳没在规定时间内处理请求"，跟真实原因（某个空间的视图被销毁了）
+ *     毫无关系——正是本票要消灭的那类错误。
+ *
+ * 所以这一组钉住两件事，而且第 1 条**先断言故障真的发生了**（`Page.close` 事件真的到了、
+ * 那个空间的 `targetId` 之后真的没了），否则"绿"可能只是这条用例什么也没验到。
+ */
+describe('票 #15 — 一个空间的视图被销毁之后，外壳照常发布表，默认空间照常可用', () => {
+  /**
+   * 这个组里起过的每一块外壳都收进列表：一条用例一块，谁也不能漏停。
+   * （漏停的后果实测过：每跑一次套件在 %TEMP% 里留一个 156 个文件的档案目录，而且不声不响。）
+   */
+  const started: ShellProcess[] = []
+
+  afterAll(async () => {
+    for (const each of started) await each.stop()
+  })
+
+  it('一个空间自己关掉自己的视图：state.json 照常更新、那条记录字段齐全、默认空间仍能领养', async () => {
+    const shell = await startShell()
+    started.push(shell)
+    const manager = new SpaceManager({
+      dir: shell.handshake.spaceChannel.dir,
+      timeoutMs: 30_000,
+      maxElements: 200,
+      maxChars: 20_000,
+    })
+    const stateFile = shell.handshake.spaceChannel.stateFile
+
+    await manager.command('create', 'doomed')
+    const doomed = spaceOf(readState(shell), 'doomed')
+    console.log('RAW doomed before it closes itself: ' + JSON.stringify({ targetId: doomed?.targetId, url: doomed?.url }))
+    expect(doomed?.targetId).toBeDefined()
+
+    // 故障注入用**真的机制**：在那块视图里执行 `window.close()`。它的 webContents 会被真的销毁，
+    // 而外壳的表里那条 entry 还在——只有 `closeSpace` 会把 entry 摘掉，这条路上没人调用它。
+    const opened = await pageForTarget(shell.handshake.cdpUrl, doomed?.targetId ?? '')
+    let closed = 'no close event'
+    try {
+      const closing = opened.page.waitForEvent('close', { timeout: 15_000 }).then(
+        () => 'page closed',
+        (error: unknown) => `no close event: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      await opened.page.evaluate(() => window.close())
+      closed = await closing
+    } finally {
+      await opened.browser.close().catch(() => undefined)
+    }
+    console.log('RAW the doomed view closed itself: ' + JSON.stringify({ closed }))
+    // 故障**真的发生了**：不是"我们以为它关掉了"。
+    expect(closed).toBe('page closed')
+    // ……而且那个视图真的没了：端点上再也找不到它的目标。
+    const targets = await pageTargets(shell.handshake.cdpUrl)
+    expect(targets.some((target) => target.id === doomed?.targetId)).toBe(false)
+
+    // 触发一次发布（这就是崩掉的那一行所在的路径：处理空间请求 → describeSpaces → publishSpaces）。
+    await manager.command('use', 'default')
+
+    // 1) 表照常发布：state.json 真的被改写了、requestId 前进到 2。
+    //    **反证点**：修复前这一行写着 `TypeError: Cannot read properties of undefined (reading 'isDestroyed')`
+    //    (shell/main.js 的 describeSpaces)，state.json 停在 requestId=1，这条请求永远等不到答案。
+    const published = readState(shell)
+    console.log('RAW published after the view was gone: ' + JSON.stringify({ requestId: published.requestId, spaces: published.spaces }))
+    expect(published.requestId).toBe(2)
+    expect(published.spaces.map((space) => space.name).sort()).toEqual(['default', 'doomed'])
+    // 2) 那条记录**字段齐全**：视图没了不等于这个空间的档案位置与地址没了。
+    const after = spaceOf(published, 'doomed')
+    expect(after?.destroyed).toBe(true)
+    expect(after?.storagePath).toBe(shellSpaces.spaceStoragePath(shell.handshake.userDataDir, 'doomed'))
+    expect(after?.url).toBe(doomed?.url)
+    expect(after?.partition).toBe('persist:dsh-view-space-doomed')
+    expect(after?.webContentsId).toBe(-1)
+    expect(after?.targetIdSource).toBe('unavailable')
+    expect(after?.targetIdReason).toContain('destroyed')
+    // 3) **默认空间一点没受影响**：插件侧那份 state 还能读，而且真的能领养到会话。
+    const state = manager.readState()
+    console.log('RAW what the plugin read back: ' + JSON.stringify({ spaces: state?.spaces.map((space) => space.name), skipped: state?.skipped }))
+    expect(state?.spaces.map((space) => space.name).sort()).toEqual(['default', 'doomed'])
+    expect(state?.skipped).toEqual([])
+    const session = await manager.adopt(shell.handshake.cdpUrl)
+    try {
+      // 领养到的确实是默认空间那块视图：读它自己的标题。
+      expect(await session.title()).toBe('view-page')
+    } finally {
+      await session.close()
+    }
+    // 4) 外壳还把这件事**显式写在 stdout 上**（诊断用），而不是静默地少发一条。
+    const table = shellRecord<{ spaces: Array<{ name: string; destroyed?: boolean }> }>(shell.stdout(), 'SPACES')
+    expect(table?.spaces.find((space) => space.name === 'doomed')?.destroyed).toBe(true)
+  }, 180_000)
+
+  /**
+   * 插件侧那一条：**一条读不动的记录不许让整份状态不可读**。
+   *
+   * 输入是**外壳真会发布的那种形状**的 state.json（上面那条用例已经证明了外壳现在会补全字段；
+   * 这里用的是"旧的/坏的外壳"会写出来的形状——`destroyed: true` 而没有 `storagePath`/`url`，
+   * 也就是票面点名的那条记录）。整段不起外壳：这是纯解析 + 工具输出的读回。
+   */
+  it('一条 destroyed 记录缺 storagePath/url：跳过它并说明原因，默认空间照常可用（纯解析 + 真工具）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-skipped-'))
+    try {
+      const raw = JSON.stringify({
+        protocol: 1,
+        requestId: 9,
+        error: null,
+        active: 'default',
+        userDataDir: dir,
+        cause: 'request',
+        spaces: [
+          {
+            name: 'default',
+            partition: 'persist:dsh-view',
+            storagePath: join(dir, 'Partitions', 'dsh-view'),
+            persistent: true,
+            targetId: 'DEFAULT-TARGET',
+            targetIdSource: 'resolved',
+            url: 'http://127.0.0.1:1/view',
+            visible: true,
+            webContentsId: 2,
+            active: true,
+            isDefault: true,
+            cookieCount: 3,
+          },
+          // 票面那条记录，逐字：视图已销毁的空间，**没有** storagePath、**没有** url。
+          { name: 'ghost', partition: 'persist:dsh-view-space-ghost', destroyed: true, targetIdSource: 'unavailable', targetIdReason: 'this space\'s view has been destroyed, so it has no target any more' },
+        ],
+      })
+      writeFileSync(join(dir, 'state.json'), raw)
+      const manager = new SpaceManager({ dir, timeoutMs: 400, maxElements: 200, maxChars: 20_000 })
+      const state = manager.readState()
+      console.log('RAW parsed a state with one unusable record: ' + JSON.stringify({ spaces: state?.spaces.map((space) => space.name), skipped: state?.skipped }))
+      // 1) **整份状态可读**：默认空间还在，坏的那条被跳过并带着原因。
+      expect(state).toBeDefined()
+      expect(state?.spaces.map((space) => space.name)).toEqual(['default'])
+      expect(state?.skipped).toHaveLength(1)
+      expect(state?.skipped[0]?.name).toBe('ghost')
+      expect(state?.skipped[0]?.index).toBe(1)
+      expect(state?.skipped[0]?.reason).toContain('storagePath, url')
+      expect(state?.skipped[0]?.reason).toContain('destroyed')
+      // 2) 给模型看的表里也说了这件事（不是静默少一条）。
+      const table = describeSpaceTable(state as SpaceState)
+      console.log('RAW the table the model would read:\n' + table)
+      expect(table).toContain('Active space: default')
+      expect(table).toContain('ghost')
+      expect(table).toContain('NOT USABLE')
+      expect(table).toContain('storagePath, url')
+      // 3) **真的是工具的输出**，不只是这个函数：`browser_space` 也带着 skipped。
+      const tools = desktopViewTools(() => Promise.reject(new Error('adopt is not used by "list"')), { spaces: manager })
+      const space = tools.find((tool) => tool.name === 'browser_space')
+      const value = await space?.execute({ action: 'list' }, IGNORED_EXEC)
+      console.log('RAW browser_space output with one unusable record: ' + JSON.stringify(value))
+      expect(value?.spaces.map((entry) => entry.name)).toEqual(['default'])
+      expect(value?.skipped).toHaveLength(1)
+      expect(value?.skipped[0]?.reason).toContain('storagePath, url')
+      expect(value?.message).toContain('NOT USABLE')
+      // 4) 当前空间正好是**被跳过的那一条**时，报错必须点名它并带上原因，
+      //    而不是笼统地说"外壳没有描述当前空间"——那句话跟真实原因毫无关系。
+      const adoptDir = mkdtempSync(join(tmpdir(), 'dsh-desktop-shell-lost-'))
+      try {
+        writeFileSync(join(adoptDir, 'state.json'), JSON.stringify({ ...(JSON.parse(raw) as object), active: 'ghost' }))
+        const lonely = new SpaceManager({ dir: adoptDir, timeoutMs: 400, maxElements: 200, maxChars: 20_000 })
+        const refusal = await lonely.adopt('http://127.0.0.1:1').then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        )
+        console.log('RAW adopting a space whose record was skipped: ' + JSON.stringify(refusal))
+        expect(refusal).toContain('"ghost"')
+        expect(refusal).toContain('not usable')
+        expect(refusal).toContain('storagePath, url')
+      } finally {
+        removeWhenFree(adoptDir)
+      }
+    } finally {
+      removeWhenFree(dir)
+    }
+  })
 })

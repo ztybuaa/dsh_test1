@@ -257,6 +257,30 @@ function activeEntry() {
   return state.spaces.get(state.activeSpace) ?? state.spaces.get(spaces.DEFAULT_SPACE)
 }
 
+/**
+ * 一块视图还活着的 webContents，或者 undefined。
+ *
+ * **实测（Electron 44.3.0 / Windows 10.0.26200，见 docs/research/destroyed-space-record.md）**：
+ * 一块被销毁的视图，`view.webContents` 变成 **undefined**，而绝不是一个"销毁态的对象" ——
+ * `isDestroyed()` 在整条时间线上从没为真过（页面自己 `window.close()`、外壳 `contents.close()`、
+ * 渲染进程崩溃三条途径都量过）。所以"读一下再看它销毁没销毁"这种写法在这里会**炸**，
+ * 而不是走到一个 `destroyed: true` 分支：
+ *
+ *   `TypeError: Cannot read properties of undefined (reading 'isDestroyed')`
+ *   at describeSpaces (shell/main.js:842) → publishSpaces
+ *
+ * 一旦炸了，`state.json` 整份不写、`requestId` 永不前进，插件就一直等到超时 —— 这比"一条记录
+ * 不完整"严重得多。所以这里把两件事收进一个判据：**能读到的、还活着的**才算活着。
+ *
+ * @param {object} view - `WebContentsView`（或一个带 `view` 的 entry —— 调用点两种都有）。
+ * @returns {object | undefined} 活着的 webContents，或 undefined。
+ */
+function liveContents(view) {
+  const contents = (view.view ?? view).webContents
+  if (contents === undefined || contents === null) return undefined
+  return contents.isDestroyed() ? undefined : contents
+}
+
 /** The view that must occupy the panel rectangle right now, or undefined before any space exists. */
 function activeView() {
   return activeEntry()?.view
@@ -307,7 +331,9 @@ function applyPlacement(cause) {
     windowSize: windowSize(),
   })
   const view = activeView()
-  const live = view !== undefined && !view.webContents.isDestroyed()
+  // 生死判断统一走 {@link liveContents}：一块被销毁的视图 `view.webContents` 是 undefined（实测），
+  // 直接读 `.isDestroyed()` 会抛，而这里一抛就是整条放置记录没了。
+  const live = view !== undefined && liveContents(view) !== undefined
   if (live) {
     if (decision.visible && decision.bounds !== null) {
       view.setBounds(decision.bounds)
@@ -321,7 +347,7 @@ function applyPlacement(cause) {
     // 非当前空间**保留但不显示**：它们各自持有自己的页面与 partition，那正是"两个空间登录
     // 互不影响"成立的方式（ADR-0010 第 1 节）。切空间 = 换掉填这一格矩形的那块视图。
     for (const entry of state.spaces.values()) {
-      if (entry.view === view || entry.view.webContents.isDestroyed()) continue
+      if (entry.view === view || liveContents(entry) === undefined) continue
       entry.view.setVisible(false)
     }
   }
@@ -537,7 +563,19 @@ function createSpace(name) {
   // 记住这块视图的 target id：它是"发布出去的表永远不会比它知道的更少"里那个"知道的"。
   // 一块活着的视图，它的 target id 不会变；所以一次读不回来的列举只能让表**暂时**变成
   // `targetIdSource: 'remembered'`，不能让它变成"没有"。
-  const entry = { name, partition, session: viewSession, view, inherited: undefined, targetId: undefined }
+  const entry = {
+    name,
+    partition,
+    session: viewSession,
+    view,
+    inherited: undefined,
+    targetId: undefined,
+    // 最后一次**真的读到**的地址，以及"我们哪一刻发现这块视图的 webContents 已经没了"。
+    // 两个都是为了同一件事：视图没了之后，发布的记录不许因为"读不回来"而少掉插件要的字段
+    // （见 {@link describeSpaces}）。
+    url: undefined,
+    contentsGoneAt: undefined,
+  }
   state.spaces.set(name, entry)
   attachDownloadHandling(viewSession)
   return entry
@@ -728,9 +766,11 @@ async function closeSpace(name) {
   }
   state.spaces.delete(name)
   state.window.contentView.removeChildView(entry.view)
-  // 留一份引用再 close：`view.webContents` 在 close 之后变成 undefined（实测）。
-  const contents = entry.view.webContents
-  contents.close()
+  // 页面自己 `window.close()` 过之后，`view.webContents` 已经是 undefined（实测）：
+  // 那时没有东西可关，但后面的收尾（抹存储、记待删目录）照样要做，而且**不许抛** ——
+  // 这里一抛，整条请求就没人收尾了。
+  const contents = liveContents(entry)
+  if (contents !== undefined) contents.close()
   await entry.session.clearStorageData()
   const recorded = readJsonFile(state.spaceChannel.pendingDeletionFile)
   const pending = Array.isArray(recorded) ? recorded.filter((item) => typeof item === 'string') : []
@@ -809,6 +849,43 @@ async function awaitCreatedTargets(names) {
 }
 
 /**
+ * 发布一条空间记录。
+ *
+ * 这个函数存在的理由是**发布的表不许比它知道的更少**（ADR-0010、`spaces.mergeTargetIds` 的同一条
+ * 规矩）。插件侧的 `parseSpaceState` 曾经对"缺 `storagePath`/`url` 的记录"整份状态都不要，
+ * 于是**一条坏记录能让默认空间也一起消失**；现在插件会跳过那一条并说明原因，但外壳这一侧也不该
+ * 明知故犯地把读得回来的字段省掉 —— 视图没了不等于这个空间的档案位置没了：`entry.session`
+ * 仍然回答得出来，地址也仍然记在 `entry.url` 里（关闭后这两样都实测可读）。
+ *
+ * @param {object} entry - 一个空间的记录。
+ * @param {object | undefined} contents - 活着的 webContents，没有就是 undefined。
+ * @param {{targetId?: string, targetIdSource: string, targetIdReason?: string}} identity - target 那几个字段。
+ * @param {number} cookieCount - 这个 session 里现在有多少 cookie（读不回来时是 0）。
+ * @returns {object} 要发布的那条记录。
+ */
+function spaceRecord(entry, contents, identity, cookieCount) {
+  const live = contents !== undefined
+  return {
+    name: entry.name,
+    partition: entry.partition,
+    // 读回来的事实：session 与视图的生死无关，所以视图没了这两样照样是读回来的值。
+    storagePath: entry.session.getStoragePath(),
+    persistent: entry.session.isPersistent(),
+    ...identity,
+    url: live ? contents.getURL() : entry.url ?? '',
+    visible: live ? entry.view.getVisible() : false,
+    // -1 与插件侧"外壳没说"的默认值是同一个数（`parseSpaceState`），不再另立一个哨兵。
+    webContentsId: live ? contents.id : -1,
+    active: entry.name === state.activeSpace,
+    isDefault: entry.name === spaces.DEFAULT_SPACE,
+    cookieCount,
+    // 视图没了这件事**显式写明**，不静默省略：读表的人要能看见"这个空间现在动不了、为什么"。
+    ...(live ? {} : { destroyed: true, contentsGoneAt: entry.contentsGoneAt }),
+    ...(entry.inherited !== undefined ? { inherited: entry.inherited } : {}),
+  }
+}
+
+/**
  * Describe every space as it really is, every value read back from Electron.
  *
  * `storagePath` is the load-bearing one: Electron's `Session` exposes no `getPartition()`, so the
@@ -822,6 +899,11 @@ async function awaitCreatedTargets(names) {
  *      所以"这次没读到"不等于"没有"；
  *   2. 真的从没拿到过就**显式写明**（`targetIdSource: 'unavailable'` + `targetIdReason`），
  *      绝不静默省略：读表的人要能看见"这个空间还没准备好"，而不是去领养一个没有目标的会话。
+ *
+ * 这个循环**不许抛**：它一抛，`state.json` 整份不写、`requestId` 不前进，插件会一直等到超时，
+ * 而报出来的错跟真实原因毫无关系。视图没了（`view.webContents === undefined`，实测）是这里
+ * 唯一能抛的那件事，所以生死判断统一走 {@link liveContents}；记录的组装统一走
+ * {@link spaceRecord}，两条路都发布**同一组字段**。
  *
  * @returns {Promise<Array<object>>} one record per space, default first, then by name.
  */
@@ -838,15 +920,22 @@ async function describeSpaces() {
     // `cdp.targetIdForWebContents` asks *it* to map an id back to a WebContents. Shadowing the
     // module with a view's own webContents makes that lookup answer "unavailable" and the target id
     // silently come out undefined.
-    const contents = entry.view.webContents
-    if (contents.isDestroyed()) {
-      records.push({
-        name,
-        partition: entry.partition,
-        destroyed: true,
-        targetIdSource: 'unavailable',
-        targetIdReason: "this space's view has been destroyed, so it has no target any more",
-      })
+    const contents = liveContents(entry)
+    if (contents === undefined) {
+      // 这一条不再 throw，也不再发布一条"只有名字和 partition"的记录：表里少一个字段，
+      // 插件那边就是一次整份状态级的失败（T7 的诚实清单第 5 条）。
+      if (entry.contentsGoneAt === undefined) entry.contentsGoneAt = Date.now()
+      records.push(
+        spaceRecord(
+          entry,
+          undefined,
+          {
+            targetIdSource: 'unavailable',
+            targetIdReason: "this space's view has no webContents any more (it was destroyed), so it has no target",
+          },
+          0,
+        ),
+      )
       continue
     }
     // 这一次的答案，与这块视图**已知**的 id 合并：解析到的优先，其次沿用已知的，真没有就显式说没有。
@@ -857,20 +946,9 @@ async function describeSpaces() {
         : { ok: false, error: listing.error },
     )
     if (identity.targetIdSource === 'resolved') entry.targetId = identity.targetId
-    records.push({
-      name,
-      partition: entry.partition,
-      storagePath: entry.session.getStoragePath(),
-      persistent: entry.session.isPersistent(),
-      ...identity,
-      url: contents.getURL(),
-      visible: entry.view.getVisible(),
-      webContentsId: contents.id,
-      active: name === state.activeSpace,
-      isDefault: name === spaces.DEFAULT_SPACE,
-      cookieCount: (await entry.session.cookies.get({})).length,
-      ...(entry.inherited !== undefined ? { inherited: entry.inherited } : {}),
-    })
+    // 记住这一次真的读到的地址：视图没了以后，记录里那个 `url` 只能是这里留下的。
+    entry.url = contents.getURL()
+    records.push(spaceRecord(entry, contents, identity, (await entry.session.cookies.get({})).length))
   }
   return records
 }

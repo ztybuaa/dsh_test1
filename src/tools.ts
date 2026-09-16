@@ -146,6 +146,27 @@ function renderEvaluated(value: unknown): string {
 const textSchema = { type: 'string' } as const
 
 /**
+ * 外壳发布了、但插件**读不动**的那些空间记录。
+ *
+ * 它是 `browser_space` 输出的一部分，而不是诊断日志：一条读不动的记录被跳过之后，
+ * 工具输出里如果不说它为什么不在表里，读的人只会以为那个空间从来没存在过 ——
+ * 也就是"报出来的错跟真实原因毫无关系"的另一种写法。
+ */
+const skippedSchema = {
+  type: 'array',
+  required: true,
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      index: { type: 'number', required: true },
+      name: { type: 'string' },
+      reason: { type: 'string', required: true },
+    },
+  },
+} as const
+
+/**
  * Canonical output of `browser_space`.
  *
  * Every field is what the **shell** published after handling the request, read back from Electron —
@@ -159,6 +180,8 @@ const spaceSchema = {
     action: { type: 'string', required: true },
     active: { type: 'string', required: true },
     message: { type: 'string', required: true },
+    // 读不动的记录也要出现在这里（见 {@link skippedSchema}）：一张少了一条的表必须说明它少了一条。
+    skipped: skippedSchema,
     spaces: {
       type: 'array',
       required: true,
@@ -211,6 +234,12 @@ function renderSpace(_args: unknown, value: SpaceCommandValue): { type: 'text'; 
           : ''),
     )
   }
+  for (const entry of value.skipped) {
+    lines.push(
+      `  ${entry.name ?? `<record ${entry.index}>`} — NOT USABLE, skipped: ${entry.reason}` +
+        ' (the other spaces are unaffected)',
+    )
+  }
   return [{ type: 'text', text: lines.join('\n') }]
 }
 
@@ -219,6 +248,7 @@ interface SpaceCommandValue {
   action: string
   active: string
   message: string
+  skipped: Array<{ index: number; name?: string; reason: string }>
   spaces: Array<{
     name: string
     partition: string
@@ -1046,6 +1076,12 @@ export function desktopViewTools(
           action: outcome.action,
           active: outcome.state.active,
           message: outcome.message,
+          // 读不动的记录原样带出去（`parseSpaceState` 已经把它们连同原因收好了）。
+          skipped: outcome.state.skipped.map((entry) => ({
+            index: entry.index,
+            ...(entry.name !== undefined ? { name: entry.name } : {}),
+            reason: entry.reason,
+          })),
           spaces: outcome.state.spaces.map((space) => ({
             name: space.name,
             partition: space.partition,

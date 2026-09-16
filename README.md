@@ -246,6 +246,13 @@ DSH_SHELL PROXY {"partition":"persist:dsh-view","readings":{
 插件据此报一个点名那个空间的错误,而不是去领养一个没有目标的会话(成因与原始输出见
 `docs/research/space-table-target-id-gap.md`)。
 
+同一条规矩也管**一整条记录**:`state.json` 里有一条读不动的记录(比如外壳为一块**已被销毁**的视图
+发布的记录),插件**只跳过那一条**并把原因写进 `SpaceState.skipped` —— `browser_space` 的输出里带着它,
+被跳过的那一条会明确写出"NOT USABLE, skipped: 为什么",**其余空间照常可用**。外壳那一侧也不许因为
+一块视图没了就少发字段或整份不写:`storagePath` / `url` 照样发布,并显式写 `destroyed: true`。
+(一条坏记录让**整份状态**不可读曾是一个真的单点失败;三条销毁途径的原始测量、端到端复现与两处回证
+见 `docs/research/destroyed-space-record.md`,决定记在 `docs/adr/0010` 第 2.2 节。)
+
 ### 让 Agent 操作那一格(T4 交互面)
 
 `browser_snapshot` 给出带 `ref` 的可交互元素;下面这些工具**只按 `ref` 定位元素**,不让模型手写选择器:

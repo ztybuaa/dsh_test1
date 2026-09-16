@@ -73,6 +73,31 @@ id 抹掉（一块活着的视图，它的 target id 不会变）；确实没有
 时按"外壳没说"处理（不假装 `resolved`）。成因、确定性复现（外壳上的测试缝 `--fault-cdp-list`）
 与原始输出：`docs/research/space-table-target-id-gap.md`。
 
+### 2.2 一条记录读不动，不许让整份状态读不动（#15 之后补记）
+
+2.1 那条规矩管的是**一个字段**（`targetId` 暂时读不回来）。#15 把它推到**一整条记录**：
+"这张表不许比它知道的更少"从来不是"某个值时有时无"，它的反面是**单点失败**——
+一份状态文件里只要有一条记录读不动，读的人就不该得到"压根没有状态"。
+
+于是通道两侧各有一条硬规矩：
+
+- **外壳侧不许抛**：一块视图的 webContents 没了（页面自己 `window.close()` 就够，
+  实测见 `docs/research/destroyed-space-record.md`）时，记录照发，而且**字段照全**——
+  `storagePath` / `persistent` 从 `entry.session` 读（视图没了照样读得回来），
+  `url` 用这个空间最后一次真的读到的值，`webContentsId` 记 `-1`，并**显式**写
+  `destroyed: true`。`describeSpaces()` 里"读一下再看它销毁没销毁"那种写法在本机 Electron 上
+  是**抛**（`view.webContents` 是 `undefined`，不是一个销毁态对象），一抛就整份不写、
+  `requestId` 永不前进，插件只能超时——报出来的错跟真实原因毫无关系；
+- **插件侧只跳过那一条**：`parseSpaceState` 把**文件级**校验（`requestId`/`active`/`protocol`/
+  `spaces` 是不是数组、数组项是不是对象）与**记录级**校验（`name`/`partition`/`storagePath`/`url`
+  是不是字符串）分开。记录级不通过就跳过它、把原因逐字记进 `SpaceState.skipped`，
+  **其余空间照常可用**，而且原因会一路走到工具输出（`browser_space` 的输出里多了必填的
+  `skipped`），当前空间正好是被跳过的那一条时 `adopt()` 的报错也点名它。
+  这与 `mergeTargetIds` 是同一条思路：**一张表不能因为一个字段读不回来就整个变成"没有表"**。
+
+字段仍然是**加**上去的，`SPACE_PROTOCOL` 仍然是 `1`。成因、三条销毁途径的原始测量、
+端到端复现与两处回证：`docs/research/destroyed-space-record.md`。
+
 ### 3. 继承登录态：cookie 全量复制，localStorage 只覆盖"新空间真的访问到的 origin"
 
 | 形态 | 能不能继承 | 代价 |
