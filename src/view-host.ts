@@ -68,6 +68,7 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
       innerHeight: state.innerHeight ?? Number.NaN,
       canGoBack: state.history.back > 0,
       canGoForward: state.history.forward > 0,
+      historySource: state.historySource,
       restartTarget:
         state.initialUrl ?? '(no initial page: the shell published none, so this goes to a blank page)',
       ok,
@@ -120,6 +121,7 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
         innerHeight: Number.NaN,
         canGoBack: false,
         canGoForward: false,
+        historySource: 'observed',
         restartTarget: '',
         ok: false,
         message,

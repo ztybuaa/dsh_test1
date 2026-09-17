@@ -298,10 +298,10 @@ const viewSchema = {
     sourceWidth: { type: 'number' },
     sourceHeight: { type: 'number' },
     /**
-     * 这个会话**观察到的**历史（面板上那两颗按钮亮不亮由它回答）。
+     * 视图**真实**的历史：还能后退/前进吗（面板上那两颗按钮亮不亮由同一个数回答）。
      *
-     * 说"观察到的"不是谦虚：引擎没有"能不能后退"这种只读 API，所以这个数是这个会话
-     * 看着视图走过多少页，而不是浏览器的真值（见 `src/navigation.ts` 的 {@link ObservedHistory}）。
+     * 它来自引擎自己的导航历史（`Page.getNavigationHistory`，票 #18），不是这个会话的记忆：
+     * 一次被领养时就已经在某一页上的视图，它领养之前走过的那一段**算数**。
      */
     canGoBack: { type: 'boolean' },
     canGoForward: { type: 'boolean' },
@@ -352,7 +352,7 @@ function renderView(_args: unknown, value: ViewCommandValue): { type: 'text'; te
     }
     if (value.canGoBack !== undefined) {
       lines.push(
-        `history this session has observed: ` +
+        `navigation history: ` +
           `${value.canGoBack === true ? 'can' : 'cannot'} go back, ` +
           `${value.canGoForward === true ? 'can' : 'cannot'} go forward`,
       )
@@ -661,15 +661,23 @@ function zoomFields(reading: ZoomResult): {
   }
 }
 
-/** 会话自己观察到的历史，收成两个布尔。 */
-function historyFields(session: AdoptedViewSession): { canGoBack: boolean; canGoForward: boolean } {
-  const state = session.historyState()
+/**
+ * 这个视图的历史，收成两个布尔。
+ *
+ * 读数是**引擎自己的**历史（票 #18），`await` 是本质的：它真的去问一次视图，而不是读一个
+ * 可能过期的账本。
+ *
+ * @param session - 活动会话。
+ * @returns 两颗按钮亮不亮。
+ */
+async function historyFields(session: AdoptedViewSession): Promise<{ canGoBack: boolean; canGoForward: boolean }> {
+  const state = await session.historyState()
   return { canGoBack: state.back > 0, canGoForward: state.forward > 0 }
 }
 
 /** `action: "state"`：不改任何东西，把三件事读回来。 */
-function viewState(session: AdoptedViewSession, action: string, message: string): ViewCommandValue {
-  const state = session.historyState()
+async function viewState(session: AdoptedViewSession, action: string, message: string): Promise<ViewCommandValue> {
+  const state = await session.historyState()
   const zoom = session.zoomLevel()
   return {
     action,
@@ -772,7 +780,7 @@ export function desktopViewTools(
       async execute(args): Promise<ViewCommandValue> {
         const session = await adopt()
         const action = args.action
-        if (action === 'state') return viewState(session, 'state', 'the view is where it is; nothing was changed')
+        if (action === 'state') return await viewState(session, 'state', 'the view is where it is; nothing was changed')
 
         if (action === 'restart') {
           const restarted = await session.restart()
@@ -789,7 +797,7 @@ export function desktopViewTools(
             restartTarget: restarted.target,
             restartSource: restarted.source,
             ...zoomFields(reading),
-            ...historyFields(session),
+            ...(await historyFields(session)),
           }
         }
 
@@ -814,7 +822,8 @@ export function desktopViewTools(
             innerHeight: result.innerHeight,
             sourceWidth: result.source.width,
             sourceHeight: result.source.height,
-            ...historyFields(session),          }
+            ...(await historyFields(session)),
+          }
         }
 
         if (action !== 'back' && action !== 'forward' && action !== 'reload') {

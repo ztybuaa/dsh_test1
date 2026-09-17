@@ -819,7 +819,10 @@ window.__ModuleLoader__.load({
 	function Panel(props) {
 	  var react = require('react')
 	  var hasShell = DshPanelRect.hasShell()
-	  var hostRef = react.useRef(null)
+	  /** 外层容器（工具条 + 下面那块）。它**不是**被测量的那一个。 */
+	  var containerRef = react.useRef(null)
+	  /** 被测量的那一块（`data-dsh-desktop-view-panel` 那个 div）：原生画面就摆在这里。 */
+	  var bodyRef = react.useRef(null)
 	  var [report, setReport] = react.useState({ rect: null, state: 'detached' })
 	
 	  // The observer outlives every render, so it is created once and its `element` is
@@ -854,7 +857,8 @@ window.__ModuleLoader__.load({
 	    }
 	  }, [])
 	
-	  elementRef.current = hostRef.current
+	  // 被测量的那一块，不是外层容器 —— 见下面那段注释。
+	  elementRef.current = bodyRef.current
 	
 	  var caption = !hasShell
 	    ? copy().noShell
@@ -869,10 +873,17 @@ window.__ModuleLoader__.load({
 	  // over by the very view it drives. Reporting the rectangle below the strip is what makes
 	  // the buttons visible at all — and it keeps the strip in the panel, where it cannot reach
 	  // the page the agent snapshots.
+	  //
+	  // 票 #18 的第二处真机 bug 就出在这一句上：`elementRef.current` 曾经指向**外层容器**
+	  // （它同时装着工具条与这一块），于是上报的矩形 = 容器 = 工具条 + 面板，外壳把原生画面
+	  // 摆到整块上，**连工具条那一行一起盖住** —— 用户看到的是"那一格上面空空的，没有后退/前进"。
+	  // 注释一直写的是"被测量的是下面那一个"，代码写的是容器：注释对、代码错。
+	  // 现在两者一致，而 `tests/panel-toolbar-placement.spec.ts` 钉住"上报矩形的上边缘 ≥ 工具条
+	  // 的下边缘"这一条。
 	  var inner = react.createElement(
 	    'div',
 	    {
-	      ref: hostRef,
+	      ref: containerRef,
 	      style: {
 	        width: '100%',
 	        height: '100%',
@@ -880,17 +891,30 @@ window.__ModuleLoader__.load({
 	        display: 'flex',
 	        flexDirection: 'column',
 	        boxSizing: 'border-box',
+	        // 相对定位：被测量的那一块是它的孩子，`getBoundingClientRect()` 报的是视口坐标，
+	        // 宿主也是按视口坐标摆画面的（T2 量过两端同一套坐标）。
+	        position: 'relative',
 	      },
 	    },
 	    hasShell ? react.createElement(Toolbar, { ctx: clientContext, hasShell: hasShell }) : null,
 	    react.createElement(
 	      'div',
 	      {
+	        // 测量用的那个引用在这里就位：React 在 commit 时调它，早于任何 effect，
+	        // 所以 `observer.report()`（在 effect 里）读到的已经是这一块，不是容器。
+	        ref: function (node) {
+	          bodyRef.current = node
+	          elementRef.current = node
+	        },
 	        'data-dsh-desktop-view-panel': report.state,
 	        style: {
-	          position: 'relative',
+	          // 这一块**就是**上报出去的那个矩形，而它的上边缘必须紧接工具条的下边缘 ——
+	          // 它被测量、被上报，外壳把原生画面摆在它上面（ADR-0004）。所以它是**工具条下面
+	          // 那一格**（`flex: 1 1 auto` 把剩下的高度全拿走），不是整块。
 	          flex: '1 1 auto',
 	          minHeight: 0,
+	          // 相对定位：原生画面要摆在这个矩形上，而这里不做任何偏移。
+	          position: 'relative',
 	          overflow: 'hidden',
 	          display: 'flex',
 	          alignItems: 'center',
