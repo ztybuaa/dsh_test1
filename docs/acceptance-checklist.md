@@ -130,7 +130,7 @@ npm run shell
 | 做什么 | 应该看到什么 | 谁验的 |
 |---|---|---|
 | 你自己在那一格里直接用鼠标键盘：选中、复制、右键、输入法 | 就是一个普通浏览器的行为（因为它就是浏览器，不是画面） | 👤 **没有自动化**。构造上它是原生 `WebContentsView`（✅ 见 §2 第一行），但输入法没人真的试过 |
-| **缩放**（缩放按钮 / 自动适配） | 按 `−`/`+` 缩放，或者干脆不按 —— **栏宽一变,放不下的页面会自己缩到刚好塞下** | ✅ `tests/fit-to-pane.spec.ts`、`tests/fit-pixels.spec.ts`（真窗口像素）、`tests/toolbar.spec.ts`（按钮）；👤 **Ctrl+滚轮**那条路没人量过（要人手操作） |
+| **缩放**（缩放按钮 / 自动适配） | 按 `−`/`+` 缩放，或者干脆不按 —— **栏宽一变,放不下的页面会自己缩到刚好塞下**；**刚开外壳、还没碰过任何按钮的时候,这一格就是「自动」**（工具条上写 `自动 100%`,不是 `手动 100%`） | ✅ `tests/fit-to-pane.spec.ts`、`tests/fit-pixels.spec.ts`（真窗口像素）、`tests/toolbar.spec.ts`（按钮）、`tests/product-startup.spec.ts`（新开外壳就是 auto）；👤 **Ctrl+滚轮**那条路没人量过（要人手操作） |
 | Agent 操作时你**同时**操作那一格 | 两边**都能动**，不需要任何开关 | ⛔ **人机仲裁不在本期范围内**：PRD 明确不做"接管/交还"、不做"Agent 正在执行请勿操作"。**界面上没有这类开关，这是设计如此，不是你漏看了**（原 PRD 已否决） |
 | 让 Agent 点一下某个按钮，**盯着那一格看** | 页面上出现可见的**光标与涟漪**，你能看到它点了哪 | ✅ `tests/overlay.spec.ts` › *验收一：点击时页面上出现可见光标与涟漪*（像素差也是真的：332 个像素变了） |
 | 让 Agent 读一次页面 | 出现一圈**读取提示** | ✅ `tests/overlay.spec.ts` › *验收二：读页面时有可见提示* |
@@ -218,20 +218,27 @@ npm run shell
 | **缩放**(Agent 侧) | **有**:`zoom-in` / `zoom-out` / `zoom` / `zoom-reset` | ✅ `tests/view-actions.spec.ts`、`tests/fit-to-pane.spec.ts` |
 | **那一格顶部的工具条** | **有**:`← → ↻ − % + 重置 自动 重新开始`,全部经"面板 → 宿主"的内部通道驱动同一套会话能力 | ✅ `tests/panel-toolbar.spec.ts`、`tests/toolbar.spec.ts` |
 | **页面自己适应栏宽**(不用按任何按钮) | **有**:栏宽一变,放不下的页面**自动**缩到刚好塞下;能重排的页面**一步都不动** | ✅ `tests/fit-to-pane.spec.ts`、`tests/fit-pixels.spec.ts`(真窗口像素:整页真的可见)、`tests/fit-rule.spec.ts`(纯规则) |
+| **新开外壳就是「自动」**(不用按任何按钮) | **有**:真外壳 + 真插件装上之后,`zoom.json` / `state.json` / 工具条读数三处都是 `auto`,`requestId` 是 0(启动时没有任何人下过命令) | ✅ `tests/product-startup.spec.ts`(真外壳 + 真 dsh 宿主 + 真插件,探针在宿主进程里读回通道) |
 | **重新开始** | **有**:回到初始页并重置缩放 | ✅ `tests/view-actions.spec.ts` |
 
 **两条语义值得你知道**(都是定过的,不是漏的):
 
 - **你手动按过缩放之后,自动适配会让位** —— 工具条上会写 `自动 78%` 或 `手动 90%`,按「自动」可以交还给自动;
+  **只有那几种"指名要一个缩放值"的动作**会切到手动(面板的 `−`/`100%`/`+`、工具的 `zoom*`);
+  换页、读页面、开一次外壳都不会 —— 这正是 #19 重新打开时修的那一条,证据在
+  `tests/product-startup.spec.ts` 与 ADR-0014 §5;
 - **「重新开始」不会抹掉浏览器的历史** —— 因为"能不能后退"现在是问引擎的,而重启那一步本身也是一次导航。
+  而它**会**把这一格交给手动(它要重置缩放,那是一次"指名了一个值");这条今天的行为没变,
+  写在这里免得你按了「重新开始」之后以为自动适配坏了。
 
 ---
 
 ## 12. 自动化证据在哪、怎么重跑
 
 ```pwsh
-npm test                                   # 全部 25 个 spec 文件、212 条用例（约 6 分钟；起真 Electron 与真 dsh 宿主）
+npm test                                   # 全部 26 个 spec 文件、218 条用例（约 7 分钟；起真 Electron 与真 dsh 宿主）
 npm test -- tests/acceptance.spec.ts       # 只看本票新增的 10 条（约 40 秒，会起 4 个真 dsh 宿主）
+npm test -- tests/product-startup.spec.ts  # 只看"新开外壳就是自动"（约 20 秒，会起 1 个真 dsh 宿主）
 npm test -- tests/panel-placement.spec.ts  # 只看"视图跟随"
 ```
 
@@ -245,6 +252,7 @@ npm test -- tests/panel-placement.spec.ts  # 只看"视图跟随"
 | 读页面（正文/表达式/接口/截图/控制台） | `tests/observation.spec.ts` |
 | 登录态、UA、webdriver、代理 | `tests/identity.spec.ts` |
 | 任务空间隔离 | `tests/spaces.spec.ts` |
+| **新开外壳就是「自动」**（真实产品的启动序列） | `tests/product-startup.spec.ts` |
 | 对话框、上传、下载、iframe | `tests/longtail.spec.ts` |
 | 光标覆盖层 | `tests/overlay.spec.ts` |
 | 截图默认落在哪（不给路径时） | `tests/screenshot-dir.spec.ts` |

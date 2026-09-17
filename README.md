@@ -161,6 +161,8 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 - **响应式页面一步都不动**(它的宽度跟着视口走,从来没有溢出)—— 这是这条规则里最要紧的一半;
 - 栏拖宽回去时,它按同一条规则**回到 100%**;
 - **手动优先**:你按过 `−` / `100%` / `+` 之后,自动适配**让位**,拖栏宽不会改掉你调好的值;
+- **新开一次外壳就是这样**:启动时没有任何人下过命令,这一格从第一秒起是 `auto`
+  (真外壳 + 真插件量过:见 `tests/product-startup.spec.ts` 与 ADR-0014 §5);
 - 工具条右边那个读数说清现在是哪种模式:**`自动 78%`** 或 **`手动 90%`**;
 - 工具条上那颗 **`auto`** 把这一格**交回自动适配**(手动模式唯一的出路 —— 换页不丢缩放是
   #13 定下的语义,所以回到自动必须是一个说得出口的动作)。
@@ -176,6 +178,13 @@ DSH_SHELL FIT {"space":"default","cause":"trailing","ms":36,"changed":2,"steps":
 只在**真的改了缩放**、或判定"这一页的溢出缩放治不了"时打一行;
 `<userDataDir>\spaces\zoom.json` 是**最新的一份缩放读数**(每块视图缩放多少、谁在管、
 适配跑了几轮改了几次),面板上那个数读的就是它 —— 与 `state.json` 同方向、同目录。
+里面那个 `modeCause` 说的是**谁**把模式改成现在这样的:`boot`(外壳建这块视图时的缺省 ——
+**从来没有人碰过这一格**)、`zoom-request`(有人指名要了一个缩放值)、`auto-request`(按了「自动」)。
+
+**这条通道上"命令"与"状态"是分开说的**(T19 重新打开之后):`request.json` 里那一条缩放命令
+必须带 `kind: "zoom"` 标签,带了标签就必须自己说清 `mode` —— 因为**状态**记录长得与它一模一样,
+而"把读到的状态原样写回去"曾经足以在没人按按钮的情况下关掉自动适配。旧插件那个不带标签的
+形状照旧按命令解释(指名了缩放值 = `manual`),兼容语义没变。理由与取舍见 ADR-0014 §5。
 
 内置夹具里因此多了三张页面(都用 `npm run shell:fixture` 起,视图地址分别填
 `/fixed-width`、`/fluid`、`/unfixable`):一张 1200px 的固定宽度页、一张响应式页、
@@ -183,7 +192,9 @@ DSH_SHELL FIT {"space":"default","cause":"trailing","ms":36,"changed":2,"steps":
 
 取舍、三处与票面建议不同的地方、以及每一条的实测数字:
 [`docs/adr/0014-fit-to-pane-is-the-shells-job.md`](docs/adr/0014-fit-to-pane-is-the-shells-job.md)、
-[`docs/research/t19-fit-to-pane-measured.md`](docs/research/t19-fit-to-pane-measured.md)。
+[`docs/research/t19-fit-to-pane-measured.md`](docs/research/t19-fit-to-pane-measured.md);
+票重新打开那一轮(启动序列为什么必须是 `auto`、状态与命令怎么分开)在
+[`docs/research/t19-reopened-why-boot-mode-is-auto.md`](docs/research/t19-reopened-why-boot-mode-is-auto.md)。
 
 `--dsh` 时,同一份身份还会通过子进程环境变量交给载体无关的 DSH 进程:
 

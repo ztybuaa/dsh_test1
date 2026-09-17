@@ -22,7 +22,8 @@
  * 让探针把宿主搞崩，等于把"被测对象没起来"伪装成"探针自己的 bug"。
  */
 
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 export const name = 't12-probe'
 
@@ -97,6 +98,16 @@ export function apply(ctx) {
     steps: [],
     toolCalls: [],
     attachment: null,
+    /**
+     * 这一格**刚装上时**是什么模式，以及此后有没有人下过缩放命令（票 #19 重开）。
+     *
+     * 形状与 `channel` 那一步的字段一一对应，见 {@link observeChannel}：本插件自己的工具
+     * （`browser_view` 的 restart/zoom）走的就是这条通道，所以"探针自己动了这一格"也会
+     * 如实出现在这里，而不是被漏掉。
+     */
+    channel: null,
+    /** 走完整套工具调用（含 `browser_space list`）之后再读一次同一份读数。 */
+    channelAfter: null,
     done: false,
   }
   const save = () => {
@@ -111,6 +122,63 @@ export function apply(ctx) {
     save()
   }
   save()
+
+  /**
+   * 读一次空间通道：外壳发布的空间表与缩放读数，加上"插件有没有写过请求"。
+   *
+   * 票 #19 重新打开时要问的正是这几件事，而且**只有从宿主进程里问**才作数：真外壳 + 真插件
+   * 装上之后，这一格到底是 `auto` 还是 `manual`、`fitPasses` 是不是 0、有没有人在启动时
+   * 写过一条请求 —— 从前没有一条用例读过，于是"启动瞬间就是 manual"这个状态谁也没看见。
+   *
+   * @returns {object} 一份读数（读不到的字段是 null，并带上为什么）。
+   */
+  const observeChannel = () => {
+    const dir = process.env.DSH_DESKTOP_VIEW_SPACES
+    const read = (file) => {
+      if (typeof dir !== 'string' || dir === '') return { present: false, reason: 'no channel directory was handed to us' }
+      try {
+        return { present: true, text: readFileSync(join(dir, file), 'utf8') }
+      } catch (error) {
+        return { present: false, reason: error instanceof Error ? error.message : String(error) }
+      }
+    }
+    const parse = (file) => {
+      const raw = read(file)
+      if (raw.present !== true) return { present: false, reason: raw.reason }
+      try {
+        return { present: true, value: JSON.parse(raw.text) }
+      } catch (error) {
+        return { present: true, value: null, reason: `unreadable JSON: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+    const state = parse('state.json')
+    const zoom = parse('zoom.json')
+    const request = parse('request.json')
+    const active = state.value?.active ?? null
+    const record = (value) => {
+      const spaces = Array.isArray(value?.spaces) ? value.spaces : []
+      return spaces.find((entry) => entry?.name === active) ?? null
+    }
+    return {
+      atMs: Date.now() - Date.parse(report.startedAt),
+      /** 外壳发布的那张表里，**当前空间**那条记录（`zoom` 与 `zoomMode` 都在里面）。 */
+      stateRecord: record(state.value),
+      stateRequestId: typeof state.value?.requestId === 'number' ? state.value.requestId : null,
+      stateCause: typeof state.value?.cause === 'string' ? state.value.cause : null,
+      /** 最新读数（外壳每次缩放/模式/适配都改写它）：`mode`、`modeCause`、两个适配计数。 */
+      zoomReading: zoom.value?.spaces?.[active] ?? null,
+      zoomCause: typeof zoom.value?.cause === 'string' ? zoom.value.cause : null,
+      /** 插件写下去的那条请求，**原样**（有没有人在启动时写过命令，看这里）。 */
+      requestPresent: request.present,
+      request: request.value ?? null,
+      requestRaw: request.present === true ? read('request.json').text : null,
+    }
+  }
+
+  // 第一件事就把它读下来：此刻还没有任何工具被调用过，所以"启动时这一格是什么模式"问的
+  // 就是这一份。后面的步骤会再读一次，两次一比就知道有没有人在启动之后动过它。
+  report.channel = observeChannel()
+  note('channel-at-mount', report.channel)
 
   void (async () => {
     const abort = new AbortController()
@@ -240,6 +308,12 @@ export function apply(ctx) {
 
       // ── 5. 任务空间：外壳的文件通道在真宿主里同样说得清 ─────────────────────
       await call('browser_space', { action: 'list' })
+
+      // ── 6. 再读一次通道：驱动过这一格之后，模式与两个计数有没有被工具顺手改掉 ──
+      // `browser_space list` 只读，`browser_view state` 也在这份报告里 —— 这条读数是"没人碰过
+      // 缩放"的那一半证据（另一半是 mounting 那一刻那一份）。
+      report.channelAfter = observeChannel()
+      note('channel-after-tools', report.channelAfter)
 
       report.done = true
     } catch (error) {

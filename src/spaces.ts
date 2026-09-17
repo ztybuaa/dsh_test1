@@ -171,6 +171,25 @@ const REQUEST_FILE_NAME = 'request.json'
 const STATE_FILE_NAME = 'state.json'
 /** 缩放最新读数（票 #19）。与 `shell/spaces.js` 的 `ZOOM_FILE_NAME` 是同一个名字。 */
 const ZOOM_FILE_NAME = 'zoom.json'
+
+/**
+ * 「这一项是一条**缩放命令**」的那个标签（票 #19 重开）。
+ *
+ * 与 `shell/spaces.js` 的 `ZOOM_COMMAND_KIND` 是同一个字符串、同一份协议：**新客户端发缩放
+ * 命令时必须带它**，而带它就必须自己说清 `mode`。理由写给将来读这段的人：
+ *
+ * 这条通道上的**状态**与**命令**曾经长得一模一样 —— `{name, zoom: 1, mode: 'manual'}`
+ * 既可以读成"这是我的命令"，也可以读成"这是我读到的状态，原样还给你"。于是任何一次状态回显
+ * （照抄 `state.json` 的启动同步就是一次）都会在**没人碰过按钮**的情况下把自动适配关掉：
+ * 外壳收到一个指名了缩放值、而模式按缺省读作 `manual` 的请求。本票重新打开时的现象正是
+ * 那个 —— 启动瞬间就是 `manual`、`fitPasses` 一直是 0。
+ *
+ * 分开的办法不是新开一条通道（方向和文件本来就是分开的：插件写 `request.json`、
+ * 外壳写 `state.json`/`zoom.json`），而是**让命令自己带证据**：带了这个标签的项才是命令，
+ * 而命令不许靠缺省值表达模式。旧插件那个不带标签的形状照旧按命令解释（它的兼容语义一字不变），
+ * 那是**唯一**还允许走缺省的路。
+ */
+export const ZOOM_COMMAND_KIND = 'zoom'
 /** 空间的四个动作。 */
 export type SpaceAction = 'list' | 'create' | 'use' | 'close'
 
@@ -438,18 +457,20 @@ export interface SpaceRequest {
   /** 期望的当前空间。 */
   active: string
   /**
-   * 期望存在的空间。每一项可以只是一个名字，也可以带上**这块视图期望的缩放**
-   * （`{name, zoom}`，票 #13）与**谁管这个缩放**（`{name, mode}`，票 #19）。
+   * 期望存在的空间。每一项可以只是一个名字，也可以带上**这块视图的缩放命令**
+   * （`{name, kind, zoom?, mode}`，票 #13 起、#19 重开之后带标签）。
    *
    * 为什么缩放挂在空间这一层，而不是单开一条通道：缩放本来就是**每块视图自己的属性**，
    * 而"每空间一块视图"正是这张表已经在表达的事实；单开一条通道就是拿一条通道干两件事。
    * 为什么只有被改动的那个空间带 `zoom`：这条请求是**期望状态的快照**，把没打算动的空间
    * 也写上一个值，就等于"外壳按这个值把它改回去"，用户用 Ctrl+滚轮在别处调过的缩放会被抹掉。
    *
-   * `mode` 的出现理由与 `zoom` 一样：它是**这块视图自己**的状态。只有被指名的那一个空间带它，
-   * 所以"把这一格交回自动适配"不会顺手把别的空间也交回去。
+   * **`kind: 'zoom'` 是这条通道上"命令"与"状态"的分界**（见 {@link ZOOM_COMMAND_KIND} 的说明）：
+   * 只有带标签的那一项才是在下命令，而带标签就必须自己说清 `mode`。这条规矩存在，是因为
+   * 一张**状态**记录（`{name, zoom, mode}`）与一条**命令**曾经长得一模一样，于是任何一次
+   * "把读到的状态原样写回去"都会在没人按按钮的情况下关掉自动适配 —— 那正是本票重新打开的原因。
    */
-  spaces: Array<string | { name: string; zoom?: number; mode?: ZoomMode }>
+  spaces: Array<string | { name: string; kind: typeof ZOOM_COMMAND_KIND; zoom?: number; mode: ZoomMode }>
 }
 
 /**
@@ -522,6 +543,10 @@ export function planRequest(
  * "有哪些空间、当前是哪个"，而这条只管"这块视图的缩放该是多少、归谁管"。混进 `planRequest`
  * 会把 `browser_space` 的动作表也拖上一个 `zoom` 参数，那不是这张票要的形状。
  *
+ * 每一项都带 {@link ZOOM_COMMAND_KIND} 标签，而且**总是**带 `mode`：这条请求的每一项都是
+ * 一条命令，命令不许靠缺省值表达自己是什么意思（见那个常量的说明）。**没有"只改缩放、
+ * 模式随缘"这种调用** —— 指名一个值就是 `manual`，交回自动就是 `auto`，两个都是说得出口的动作。
+ *
  * 纯函数：不碰文件、不连外壳，所以"给不存在的空间设缩放"这类判断能不起外壳被单独读回。
  *
  * @param state - 最近一次读到的实际状态。
@@ -550,10 +575,10 @@ export function planZoom(
     request: {
       id: state.requestId + 1,
       active: state.active,
-      // 只有这一个空间带 `zoom`/`mode`，其余原样是名字（理由见 {@link SpaceRequest.spaces}）。
+      // 只有这一个空间带命令，其余原样是名字（理由见 {@link SpaceRequest.spaces}）。
       spaces: state.spaces.map((space) =>
         space.name === wanted
-          ? { name: space.name, ...(zoom !== undefined ? { zoom } : {}), mode }
+          ? { name: space.name, kind: ZOOM_COMMAND_KIND, ...(zoom !== undefined ? { zoom } : {}), mode }
           : space.name,
       ),
     },

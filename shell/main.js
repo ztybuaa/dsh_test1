@@ -648,6 +648,12 @@ function createSpace(name) {
      * "不用我按 −"。
      */
     zoomMode: 'auto',
+    /**
+     * 这个模式是**谁**改成现在这样的（票 #19 重开）。建视图时是 `boot`：那时没有任何人碰过
+     * 这一格，而这句话必须能在 `zoom.json` 里读回来 —— 否则"启动时就是 manual"与"用户按过
+     * 100%"在读数上一模一样，本票当初就是被这一点骗过去的。见 {@link writeZoomFile} 的说明。
+     */
+    modeCause: 'boot',
     /** 这块视图上跑过几轮自动适配（一轮 = 一次"读、算、可能改"的循环）。诊断与证据用。 */
     fitPasses: 0,
     /** 那几轮里一共改了几次缩放。响应式页面的断言就是"栏宽变了而这个是 0"。 */
@@ -1251,6 +1257,9 @@ function applyZoom(name, zoom) {
     entry.zoom = zoom
   }
   entry.zoomMode = 'manual'
+  // 谁改的，一并记下来（写进 `zoom.json` 的 `modeCause`）。这一条**只**能由"有人指名要了一个
+  // 缩放值"触发 —— 它从来不因为"外壳发布了一条状态"而发生（见 `shell/spaces.js` 的 `parseRequest`）。
+  entry.modeCause = 'zoom-request'
   // 正在跑的那一轮适配立刻作废：它是照着旧状态算的，照着它写下去就是把用户刚按的值抹掉。
   entry.zoomToken += 1
   writeZoomFile('zoom-request')
@@ -1283,6 +1292,8 @@ async function handBackToAuto(name, cause) {
     )
   }
   entry.zoomMode = 'auto'
+  // 谁改的，一并记下来（写进 `zoom.json` 的 `modeCause`）：交回自动只可能来自那颗「自动」。
+  entry.modeCause = 'auto-request'
   // "交回自动"是用户明确要的 ⇒ 之前那条"缩放治不了这一页"的结论与它的样样本一起作废，重新试一次。
   // 试还是治不了的话，下一轮会再判定一次（并且依旧放回 100%，不会留下任何缩小）。
   entry.fitDeclined = undefined
@@ -1317,6 +1328,12 @@ function writeZoomFile(cause) {
     readings[entry.name] = {
       zoom: contents.getZoomFactor(),
       mode: entry.zoomMode,
+      // **谁把它改成现在这个模式的**（票 #19 重开）。`mode` 只说"现在归谁管"，不说
+      // "谁让它归谁管" —— 而那个区别正是这张票重新打开时缺的那一条证据：一个 start 时就是
+      // `manual` 的读数，看起来与"用户按过 100%"一模一样，谁也答不出到底是哪一次动作干的。
+      // 现在它在文件里：`boot` = 外壳建这块视图时的缺省，`zoom-request` = 有人指名要了一个值，
+      // `auto-request` = 面板上那颗「自动」交回来的。看一行就知道这一格是不是**从来没人碰过**。
+      ...(entry.modeCause !== undefined ? { modeCause: entry.modeCause } : {}),
       fitPasses: entry.fitPasses,
       fitChanges: entry.fitChanges,
       // "缩放治不了这一页的溢出"这条结论**说出来**：它是"适配在管着、但它决定不动手"的

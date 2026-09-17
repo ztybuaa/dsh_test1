@@ -99,6 +99,25 @@ const PENDING_DELETION_FILE_NAME = 'pending-deletion.json'
 const SPACE_PROTOCOL = 2
 
 /**
+ * 「这一项是一条**缩放命令**」的那个标签（票 #19 重新打开之后加的）。
+ *
+ * 为什么需要它 —— 这正是那张票重新打开的根因。这条通道上的**状态**与**命令**长得很像，
+ * 于是同一种形状既可以读成"这是我的命令"，也可以读成"这是我读到的状态，原样还给你"：
+ *
+ *   `{name: "default", zoom: 1, mode: "manual"}`
+ *
+ * 在**命令**里它的意思是"从今往后我手动管这一格"，在**状态**里它的意思只是"这一格现在是
+ * 100%、手动"。谁把外壳发布的那条记录原样写回 `request.json`（一次状态回显、一个照抄
+ * `state.json` 的启动同步），谁就在**没有任何人碰过按钮**的情况下把自动适配关掉了 ——
+ * 这就是"启动瞬间变成 manual、`fitPasses` 一直是 0"的那个现象。
+ *
+ * 所以：**新客户端发缩放命令时必须带这个标签**，`zoom`/`mode` 只在标签下面才有"命令"的
+ * 含义。旧插件那个不带标签的形状**照旧按命令解释**（它写 request.json 从来只为了发命令，
+ * 见 {@link parseRequest} 里那条兼容路径），兼容语义一个字节都不变。
+ */
+const ZOOM_COMMAND_KIND = 'zoom'
+
+/**
  * 一个空间名是不是合法。
  * @param {unknown} name - 候选名字。
  * @returns {boolean} 合法为真。
@@ -181,15 +200,21 @@ function spaceChannel(userDataDir) {
  * 拒绝的理由都写清楚，因为这条消息会一路走到模型面前：含糊的"请求非法"没法修，
  * "空间名 `Task 1` 不合法：只允许小写字母、数字与连字符"能。
  *
- * 每一项可以只是一个名字，也可以带上这块视图期望的**缩放**（`{name, zoom}`，票 #13）、
- * 以及**谁来管这次缩放**（`{name, mode}`，票 #19 的自动适配）：
+ * 每一项可以只是一个名字，也可以带**这块视图的缩放命令**。命令有**两种写法**，而它们的
+ * 区别是这张票重新打开的原因：
  *
- *   - `{name, zoom: 0.9}`            —— 把缩放设成 0.9，并且**从此由人管**（manual）；
- *   - `{name, mode: 'auto'}`         —— 把这一格交回自动适配（缩放开到 100% 之后再按栏宽适配）；
- *   - `{name, zoom: 1, mode: 'auto'}`—— 两件事一起（本仓库没有调用方这么做，但形状允许）。
+ *  - **带标签**（新客户端，票 #19 重开之后）：
+ *      `{name, kind: 'zoom', zoom: 0.9, mode: 'manual'}` —— 把缩放设成 0.9，从此由人管；
+ *      `{name, kind: 'zoom', mode: 'auto'}`             —— 把这一格交回自动适配。
+ *    带标签 = "我明确知道这是一条命令"。**光有 `kind` 而没有 `mode` 是拒绝**，不是补一个
+ *    缺省：这条通道的整个麻烦就出在"没说的字段被悄悄补成 manual"上，新写法不许再走那条路。
  *
- * `mode` 缺省是 `manual`：一个**指名要某个缩放值**的请求，语义上就是"这个值我说了算"，
- * 而旧插件（不认识 `mode`）发的正是这一种 —— 于是缺省值让新旧两侧的行为完全一致。
+ *  - **不带标签**（旧插件，形状与 #13 时代逐字节相同）：`{name, zoom: 0.9}`
+ *    —— 照旧当成 `manual`。旧插件**没有任何别的用途**会写这个文件：它不认识 `mode`，
+ *    写 `zoom` 只可能是"我要这个值"。所以这个缺省不是猜，是那段历史的原义，不能动。
+ *
+ * `{name, mode: 'auto'}`（带 mode、不带 kind）也照旧接受：#19 第一次落地时的新插件发的就是
+ * 它，而现在发布出去的客户端还可能是那一版。
  *
  * 缩放只校验**形状**（有限正数）：合法范围是插件那边的策略（`src/navigation.ts` 的
  * `ZOOM_MIN`–`ZOOM_MAX`），在这里再写一份迟早会与它不一致 —— 与空间名的方向相反，
@@ -217,14 +242,39 @@ function parseRequest(raw) {
     }
     if (names.includes(name)) return { ok: false, error: `the space "${name}" is listed twice` }
     names.push(name)
-    const wanted = typeof candidate === 'string' ? undefined : candidate?.zoom
-    const askedMode = typeof candidate === 'string' ? undefined : candidate?.mode
+    const bare = typeof candidate === 'string'
+    const kind = bare ? undefined : candidate?.kind
+    const wanted = bare ? undefined : candidate?.zoom
+    const askedMode = bare ? undefined : candidate?.mode
+    // 认不出的标签一律拒绝：一个"悄悄当成旧形状"的实现会让新客户端以为自己在发命令，
+    // 而外壳按另一套读法执行 —— 那正是本票要消灭的那类错误。
+    if (kind !== undefined && kind !== null && kind !== ZOOM_COMMAND_KIND) {
+      return {
+        ok: false,
+        error:
+          `the space "${name}" carries a zoom command of kind ${JSON.stringify(kind)}, but this shell only ` +
+          `knows ${JSON.stringify(ZOOM_COMMAND_KIND)} (or no \`kind\` at all, which is the legacy form: ` +
+          'a request that names a zoom value and no mode means "I set this value by hand")',
+      }
+    }
     if (askedMode !== undefined && askedMode !== null && askedMode !== 'auto' && askedMode !== 'manual') {
       return {
         ok: false,
         error:
           `the zoom mode for the space "${name}" must be "auto" or "manual", got ${JSON.stringify(askedMode)}. ` +
           '"auto" means the shell fits the page to the pane; anything else is the plugin\'s business, not this channel\'s',
+      }
+    }
+    const labelled = kind === ZOOM_COMMAND_KIND
+    // 带标签的命令必须自己说清模式。不补缺省，是因为"补了 manual"正是本 bug 的来源：
+    // 一个把状态回显出来的客户端会因此把自动适配关掉，而它一个字都没打算说这件事。
+    if (labelled && askedMode !== 'auto' && askedMode !== 'manual') {
+      return {
+        ok: false,
+        error:
+          `the zoom command for the space "${name}" must say which mode it is: "auto" (fit the page to the ` +
+          `pane) or "manual" (this value is the user's). Without it there is no way to tell a command from a ` +
+          'state report being echoed back, and that ambiguity is what set the mode to "manual" on startup',
       }
     }
     const hasZoom = wanted !== undefined && wanted !== null
@@ -238,7 +288,7 @@ function parseRequest(raw) {
           'The range a person may pick (0.25-5) is the plugin\'s policy, not this channel\'s',
       }
     }
-    zooms.push({ name, ...(hasZoom ? { zoom: wanted } : {}), mode: hasMode ? askedMode : 'manual' })
+    zooms.push({ name, ...(hasZoom ? { zoom: wanted } : {}), mode: labelled || hasMode ? askedMode : 'manual' })
   }
   // 默认空间一直在：一条把它丢掉的请求不是"关闭默认空间"，是插件算错了，所以拒绝而不是照做。
   if (!names.includes(DEFAULT_SPACE)) {
@@ -328,6 +378,7 @@ module.exports = {
   SPACE_PROTOCOL,
   SPACES_DIR_NAME,
   STATE_FILE_NAME,
+  ZOOM_COMMAND_KIND,
   ZOOM_FILE_NAME,
   isValidSpaceName,
   mergeTargetIds,
