@@ -57,6 +57,8 @@ interface ClientHalfReport {
   } | null
   /** The registered tab body. */
   body: { name: string; key: string; locale: string | null } | null
+  /** 每一次座位注册（票 #20 起正文 + 标签标题两次）。 */
+  seats: Array<{ name: string; key: string; locale: string | null }>
   /** The registered copy namespace. */
   locale: { ns: string; languages: string[] } | null
 }
@@ -114,6 +116,8 @@ describe('client half — the artifact the host loads', () => {
       const calls: Array<Record<string, unknown>> = []
       const definitions: Array<Record<string, unknown>> = []
       let body: { name: string; key: string; locale: string | null } | null = null
+      /** 每一次座位注册（票 #20 起不止一次：正文 + 标签标题）。 */
+      const seats: Array<{ name: string; key: string; locale: string | null }> = []
 
       const ctx = {
         effect: (fn: () => unknown) => fn(),
@@ -149,8 +153,12 @@ describe('client half — the artifact the host loads', () => {
             return fn()
           },
           register: (definition: { name: string; key: string; locale?: string }) => {
-            body = { name: definition.name, key: definition.key, locale: definition.locale ?? null }
-            calls.push({ what: 'slots.register', ...body })
+            // 票 #20 起这个插件往**两个**座位注册（正文与标签标题），所以这里按座位名分开记：
+            // "最后一个注册上来的是什么"会让标签标题把正文顶掉，而那条断言量的是**正文**。
+            const registered = { name: definition.name, key: definition.key, locale: definition.locale ?? null }
+            if (definition.name === 'sidebar.right.pane.tab') body = registered
+            seats.push(registered)
+            calls.push({ what: 'slots.register', ...registered })
             return () => {}
           },
         },
@@ -193,6 +201,7 @@ describe('client half — the artifact the host loads', () => {
                 perLanguage,
               },
         body,
+        seats,
         locale:
           localeCall === undefined
             ? null
@@ -272,6 +281,21 @@ describe('client half — the artifact the host loads', () => {
     expect(report.body?.name).toBe('sidebar.right.pane.tab')
     expect(report.body?.key).toBe(report.tabType?.id)
     expect(report.locale?.languages).toEqual(['en', 'zh'])
+  })
+
+  it('票 #20 B：标签标题那个座位也注册上了，用的是同一个 id', () => {
+    // 宿主把 `sidebar.right.pane.tab.title` 上的注册按**类型 id** 分派
+    // （`entryKey: definition?.id ?? tab.kind`），所以这里的 key 与上面正文那个必须一致：
+    // 不一致的话正文换得掉、标签换不掉（或者反过来），而两处都是"看起来只是没生效"。
+    const title = report.seats.find((seat) => seat.name === 'sidebar.right.pane.tab.title')
+    console.log('RAW 座位注册: ' + JSON.stringify(report.seats))
+    expect(title, '标签标题必须注册上来 —— 没有它，标签永远写着开标签那一刻那句「浏览器」').toBeTruthy()
+    expect(title?.key).toBe(report.tabType?.id)
+    // 两个座位各注册一次，别的座位一个都没有（"顺手多注册一个"是这条要挡的）。
+    expect(report.seats.map((seat) => seat.name).sort()).toEqual([
+      'sidebar.right.pane.tab',
+      'sidebar.right.pane.tab.title',
+    ])
   })
 
   it('ships a client.js that is exactly its two sources', () => {

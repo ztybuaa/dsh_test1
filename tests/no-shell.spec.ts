@@ -342,14 +342,17 @@ describe('票 #11 · 那一格渲染的是说明文字，不是空白', () => {
 
       /** `apply()` 真正注册出来的那个 body 组件——这就是宿主会渲染的东西。 */
       let body: ((props: unknown) => HTMLElement) | null = null
+      /** 票 #20 起这个插件往两个座位注册（正文 + 标签标题），所以按座位名分开记。 */
+      const seats: Record<string, (props: unknown) => HTMLElement> = {}
       const ctx = {
         effect: (fn: () => unknown) => fn(),
         locale: { bind: () => (key: string) => key, register: () => () => {} },
         sidebarRightTabs: { register: () => () => {} },
         slots: {
           inject: (_seat: string, fn: () => unknown) => fn(),
-          register: (_definition: { key: string }, component: (props: unknown) => HTMLElement) => {
-            body = component
+          register: (definition: { name: string; key: string }, component: (props: unknown) => HTMLElement) => {
+            seats[definition.name] = component
+            if (definition.name === 'sidebar.right.pane.tab') body = component
             return () => {}
           },
         },
@@ -379,6 +382,8 @@ describe('票 #11 · 那一格渲染的是说明文字，不是空白', () => {
       host.__t11 = {
         requiredWhileLoading,
         render,
+        // 票 #20 B：标签标题那个座位也在（它由真宿主在标签条上渲染；这里只读回"注册上了"）。
+        titleSeat: typeof seats['sidebar.right.pane.tab.title'] === 'function',
       }
     })
   }, 180_000)

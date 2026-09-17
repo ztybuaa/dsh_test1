@@ -155,7 +155,13 @@ const RUNTIME = [
   '      try {',
   '        for (const child of childList(element.type({ ...element.props }))) mountTree(child, into)',
   '      } finally {',
-  '        for (const slot of mine.hooks) if (slot !== undefined) slot.touched = false',
+  '        // **不要在这里清 `touched`**（票 #20 改的）：`touched` 的含义是"这一轮渲染用到了',
+  '        // 这个槽位"，它由 `use()` 在渲染期间置 true、由 `clearTouched` 在**渲染之前**统一清零。',
+  '        // 旧版在这里把每个槽位都清成 false，于是下一轮开始时"所有槽位都没被用到" ⇒',
+  '        // `unmountUntouched` 把**每个** effect 都拆掉（跑清理、把 effect 置空），下一轮再重新',
+  '        // 注册并重跑一遍 —— 于是一个在 effect 里 setState 的组件每一轮都在跑 effect，',
+  '        // 一路撞上渲染闸，整棵树冻住（实测：`mini-react: 13 renders without settling`，',
+  '        // 页面上看起来只是"点了没反应"）。',
   '        current = previous',
   '      }',
   '      return',
@@ -165,24 +171,41 @@ const RUNTIME = [
   '    mountTree((element.props === undefined ? {} : element.props).children, dom)',
   '    into.appendChild(dom)',
   '  }',
-  '  /** 渲染之后跑掉**这一次新排下**的 effects（判据是 touched === false）。 */',
+  '  /**',
+  '   * 渲染之前把"这一轮用到了没有"统一清零。',
+  '   *',
+  '   * 渲染期间 `use()` 会把它置回 true；渲染之后仍是 false 的槽位就是**这一轮没被用到**的',
+  '   * （组件没了，或者 hook 变少了），由 {@link unmountUntouched} 收尾。',
+  '   */',
+  '  const clearTouched = () => {',
+  '    for (const entry of components) {',
+  '      for (const slot of entry.hooks) if (slot !== undefined) slot.touched = false',
+  '    }',
+  '  }',
+  '  /**',
+  '   * 渲染之后跑掉**这一次新排下**的 effects。',
+  '   *',
+  '   * 判据是 `pending`（票 #20 加的）：它只在 `useEffect` 真的（重新）注册一个 effect 时置 true，',
+  '   * 也就是"首次挂载"或"依赖变了"——与真 React 同一条规矩。',
+  '   */',
   '  const runEffects = () => {',
   '    for (const entry of components) {',
   '      for (const slot of entry.hooks) {',
-  '        if (slot === undefined || slot.touched !== false || slot.effect === undefined) continue',
-  '        slot.touched = true',
+  '        if (slot === undefined || slot.pending !== true || slot.effect === undefined) continue',
+  '        slot.pending = false',
   "        if (typeof slot.cleanup === 'function') slot.cleanup()",
   '        const cleanup = slot.effect()',
   '        slot.cleanup = typeof cleanup === \'function\' ? cleanup : undefined',
   '      }',
   '    }',
   '  }',
-  '  /** 这一段树里已经不在的那些组件，它们的 effect 清理该跑了。 */',
+  '  /** 这一段树里已经不在的那些组件，它们的 effect 清理该跑了（渲染之后才判得准）。 */',
   '  const unmountUntouched = () => {',
   '    for (const entry of components) {',
   '      for (const slot of entry.hooks) {',
   '        if (slot === undefined || slot.touched !== false) continue',
   '        slot.touched = undefined',
+  '        slot.pending = false',
   '        if (slot.cleanup !== undefined || slot.effect !== undefined) {',
   "          if (typeof slot.cleanup === 'function') slot.cleanup()",
   '          slot.cleanup = undefined',
@@ -207,7 +230,7 @@ const RUNTIME = [
   '    }',
   '    rendering = true',
   '    try {',
-  '      unmountUntouched()',
+  '      clearTouched()',
   '      const tree = container.current.__tree',
   '      current = null',
   '      container.current.replaceChildren()',
@@ -219,6 +242,8 @@ const RUNTIME = [
   '    // 这一批的 effects 跑完了：闸重新打开，下一次状态变化才能再渲染一轮（坑 4）。',
   '    scheduled = false',
   '    runEffects()',
+  '    // 收尾放在效果之后：这一轮没被碰到的槽位（组件没了 / hook 少了）现在才判得准。',
+  '    unmountUntouched()',
   '  }',
   '  const schedule = () => {',
   '    if (scheduled) return',
@@ -280,11 +305,15 @@ const RUNTIME = [
   '      return used.slot.value',
   '    },',
   '    useEffect(effect, deps) {',
-  '      const slot = use().slot',
+  '      const used = use()',
+  '      const slot = used.slot',
   '      if (slot.effect !== undefined && !depsChanged(slot.deps, deps)) return',
   '      slot.deps = deps',
   '      slot.effect = effect',
-  '      slot.touched = false',
+  '      // `pending` 才是"这个 effect 这一轮要跑"的判据（见 `runEffects`）。',
+  '      // **不要**在这里动 `touched`：它是"这一轮用到了没有"（`use()` 已经置 true），',
+  '      // 改它会让 `unmountUntouched` 把这个刚注册的 effect 当成"组件没了"拆掉。',
+  '      slot.pending = true',
   '    },',
   '    createRoot(node) {',
   '      container.current = node',
@@ -345,9 +374,16 @@ export async function installShipment(
       //
       // 这一条用例要的是"面板上报的那个矩形"，而 `observe()` 结尾**同步**报一次
       // （`report(true)`）就够了，所以把这两台发动机关掉：只有那一次上报。
-      delete (window as unknown as { requestAnimationFrame?: unknown }).requestAnimationFrame
-      delete (window as unknown as { cancelAnimationFrame?: unknown }).cancelAnimationFrame
-      delete (window as unknown as { ResizeObserver?: unknown }).ResizeObserver
+      //
+      // 票 #20：这里必须**定义成 undefined**，不能 `delete`。`requestAnimationFrame` 是
+      // `Window` 接口上的属性，不在 window 对象自己身上 —— `delete window.requestAnimationFrame`
+      // 对一个继承来的属性是**空操作**（还返回 true），于是 rAF 那台发动机其实一直在转。
+      // 后果实测过：`replaceChildren` 重画时被测量的那一块会在整数像素间抖一下，抖动喂给
+      // `onReport` ⇒ 几何计数一直涨 ⇒ 工具有一直重读 ⇒ 一路撞上 `mini-react` 的渲染闸，
+      // 整棵树冻住（页面上看起来只是"点了没反应"）。
+      for (const name of ['requestAnimationFrame', 'cancelAnimationFrame', 'ResizeObserver']) {
+        Object.defineProperty(window, name, { configurable: true, writable: true, value: undefined })
+      }
     })
   }
   // `client.js` 用**源码文本**注入，不用 `{ path }`：`path` 那条路让它以 `file://` 加载，
@@ -393,33 +429,51 @@ export async function installShipment(
  * 在页面里 `apply()` 一次交付物、把注册上来的面板组件渲染进一个新容器。
  *
  * 宿主那条 RPC 用 `rpcValue` 回答（真宿主那半条通道由 `tests/panel-toolbar.spec.ts` 对着
- * **真 dsh 宿主**量过；这里要量的是"宿主答 A ⇒ 页面上就是 A"）。
+ * **真 dsh 宿主**量过；这里要量的是"宿主答 A ⇒ 页面上就是 A"）。票 #20 起还可以给一个
+ * `rpcHandler`：地址栏与档位那两条动作的**参数**要跟着一起量，而"每次回答什么"也要能逐次变
+ * （比如"这一按之后地址变了 ⇒ 框里跟着变"）。
  *
  * @param page - 已经 {@link installShipment} 过的那一页。
  * @param options - 宿主对每一次 RPC 的回答，以及要挂进哪个元素。
- * @returns 页面里量到的几个框，以及那一格向宿主打过哪些调用。
+ * @returns 页面里量到的几个框、那一格向宿主打过哪些调用，以及两个座位各自注册上来的组件。
  */
 export async function mountShipment(
   page: Page,
   options: {
-    /** 宿主对每一次 `rpc.call` 的回答（`value` 那一段）。 */
-    rpcValue: Record<string, unknown>
+    /** 宿主对每一次 `rpc.call` 的回答（`value` 那一段），作为缺省答案。 */
+    rpcValue?: Record<string, unknown>
+    /**
+     * 按端点覆盖回答（票 #20）。
+     *
+     * 键是端点名（`desktop-view-navigate`、`desktop-view-state`、……），值是那一段 `value`。
+     * 有了它，"按一下之后地址变了 ⇒ 框里跟着变"这种事不需要一个会变的函数，
+     * 只需要**两次不同的调用**各自的答案不同。
+     */
+    rpcTable?: Record<string, Record<string, unknown>>
     /** 挂进哪个元素（CSS 选择器）；缺省挂到 `document.body` 下一层 440×600 的容器里。 */
     into?: string
     /** 诊断：把 `DshPanelRect.observe` 包一层，记下每一次上报时 `element` 是哪一块。 */
     traceObserve?: boolean
+    /** 把标签座位（`sidebar.right.pane.tab.title`）那个组件也渲染一次（票 #20 B）。 */
+    mountTitle?: boolean
   },
 ): Promise<{
   rpcCalls: string[]
+  rpcPayloads: Array<{ endpoint: string; payload: Record<string, unknown> }>
   observeTrace?: unknown[]
   parent: { top: number; bottom: number; left: number; right: number; width: number; height: number }
   container: { top: number; bottom: number; left: number; right: number; width: number; height: number }
+  /** 注册到 `sidebar.right.pane.tab.title` 上那个组件渲染出来的文字（没注册就是 null）。 */
+  titleText: string | null
+  /** 两个座位各自有没有注册上来（有 = 宿主那个位置会被我们取代）。 */
+  seats: { body: boolean; title: boolean }
 }> {
   return await page.evaluate(
     async (input: {
-      rpcValue: Record<string, unknown>
+      rpcTable: Record<string, Record<string, unknown>>
       into: string | null
       traceObserve: boolean
+      mountTitle: boolean
       globalName: string
       registryName: string
       resultName: string
@@ -466,33 +520,79 @@ export async function mountShipment(
       }) as { apply?: unknown }
 
       const rpcCalls: string[] = []
-      let shippedPanel: unknown
+      const rpcPayloads: Array<{ endpoint: string; payload: Record<string, unknown> }> = []
+      /** 每个座位注册上来的组件（票 #20 起有两个：正文与标签标题）。 */
+      const seats: Record<string, unknown> = {}
+      /**
+       * 宿主那份 locale 服务的替身（票 #20 修的）。
+       *
+       * 它**按插件自己注册的那份字典**回答 `bind(ns)(key)`，而不是把 key 原样返回：
+       * 标签标题的回落词就是从这条路上来的（`src/client-body.js` 的 `tabTitleFallback`），
+       * 一个"原样返回 key"的替身会让标签上写着 `type.label` —— 那不是被测代码的行为，
+       * 是这个替身不够用（第一版就是这么绿着的，直到 B 那条断言把它抓出来）。
+       */
+      const dictionaries: Record<string, Record<string, Record<string, string>>> = {}
+      const language = (): string => {
+        const raw = typeof navigator !== 'undefined' && navigator !== null ? navigator.language : ''
+        return typeof raw === 'string' && raw.slice(0, 2).toLowerCase() === 'zh' ? 'zh' : 'en'
+      }
       const ctx = {
         effect: (fn: () => unknown) => fn(),
-        locale: { bind: () => (key: string) => key, register: () => () => undefined },
+        locale: {
+          bind: (ns: string) => (key: string) => {
+            const table = dictionaries[ns]
+            const entry = table === undefined ? undefined : table[language()]
+            const word = entry === undefined ? undefined : entry[key]
+            return typeof word === 'string' ? word : key
+          },
+          register: (ns: string, table: Record<string, Record<string, string>>) => {
+            dictionaries[ns] = table
+            return () => undefined
+          },
+        },
         sidebarRightTabs: { register: () => () => undefined },
         slots: {
           inject: (_seat: string, fn: () => unknown) => fn(),
           // 座位那条 API 的形状照第一方用它的样子（`dsh-client-ui-sidebar-files/lib/client.js:701`）：
           // `register({name, key, locale}, Component)` —— 组件是**第二个参数**。
-          register: (_definition: unknown, component?: unknown) => {
-            shippedPanel = component
+          register: (definition: unknown, component?: unknown) => {
+            const name = (definition as { name?: unknown } | null)?.name
+            seats[typeof name === 'string' ? name : 'unknown'] = component
             return () => undefined
           },
         },
         connection: {
           rpc: {
-            call: async (_channel: string, endpoint: string, _payload: unknown) => {
+            call: async (_channel: string, endpoint: string, payload: unknown) => {
               rpcCalls.push(endpoint)
+              const sent = (payload ?? {}) as Record<string, unknown>
+              rpcPayloads.push({ endpoint, payload: sent })
+              // `rpcTable` 的键是端点名，`default` 是缺省答案 —— 页面这一侧只有一个查表动作，
+              // 没有"会变的函数"（函数过不了 `page.evaluate` 那道边界）。
+              const table = input.rpcTable
+              const next = table[endpoint] ?? table.default
+              // 票 #20：某一格可以要求"晚一点再答"（`__t20DelayMs`），用来量**在飞的那一段时间里**
+              // 页面长什么样（导航中的按钮锁与"加载中"）。它不是回答的一部分，所以取完就摘掉。
+              const wait = typeof next?.__t20DelayMs === 'number' ? next.__t20DelayMs : 0
+              const answer = { ...(next ?? {}) }
+              delete answer.__t20DelayMs
+              if (wait > 0) await new Promise((settle) => setTimeout(settle, wait))
               return {
                 ok: true,
-                value: { url: location.href, zoom: 1, message: 'nothing was changed', ok: true, ...input.rpcValue },
+                value: {
+                  url: location.href,
+                  zoom: 1,
+                  message: 'nothing was changed',
+                  ok: true,
+                  ...answer,
+                },
               }
             },
           },
         },
       }
       if (typeof plugin.apply === 'function') (plugin.apply as (c: unknown) => void)(ctx)
+      const shippedPanel = seats['sidebar.right.pane.tab']
       if (typeof shippedPanel !== 'function') throw new Error('applying the client half registered no panel component')
 
       const parent = input.into === null ? document.body : document.querySelector(input.into)
@@ -524,17 +624,158 @@ export async function mountShipment(
         const rect = element.getBoundingClientRect()
         return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width, height: rect.height }
       }
-      const summary = { rpcCalls, observeTrace, parent: box(parent), container: box(mount) }
+
+      // 票 #20 B：把标签座位那个组件也渲染一次，读回它写的字。
+      // 它挂在**另一个**容器里，因为真宿主也是分开渲染这两个座位的（标签在标签条上，正文在格里）。
+      let titleText: string | null = null
+      const titleComponent = seats['sidebar.right.pane.tab.title']
+      if (input.mountTitle && typeof titleComponent === 'function') {
+        const titleMount = document.createElement('div')
+        titleMount.id = 'dsh-view-shipped-title'
+        document.body.appendChild(titleMount)
+        react.createRoot(titleMount).render(react.createElement(titleComponent, {}))
+        const titleDeadline = Date.now() + 5_000
+        // 标签那棵树只有一个文本节点，等它非空就行（心跳/首读是异步的）。
+        while ((titleMount.textContent ?? '') === '' && Date.now() < titleDeadline) {
+          await new Promise((settle) => setTimeout(settle, 25))
+        }
+        titleText = titleMount.textContent ?? ''
+      }
+
+      const summary = {
+        rpcCalls,
+        rpcPayloads,
+        observeTrace,
+        parent: box(parent),
+        container: box(mount),
+        titleText,
+        seats: {
+          body: typeof seats['sidebar.right.pane.tab'] === 'function',
+          title: typeof seats['sidebar.right.pane.tab.title'] === 'function',
+        },
+      }
       host[input.resultName] = summary
       return summary
     },
     {
-      rpcValue: options.rpcValue,
+      rpcTable: { default: options.rpcValue ?? {}, ...(options.rpcTable ?? {}) },
       into: options.into ?? null,
       traceObserve: options.traceObserve === true,
+      mountTitle: options.mountTitle === true,
       globalName: GLOBAL,
       registryName: REGISTRY,
       resultName: MOUNT_RESULT,
     },
+  )
+}
+
+/**
+ * 在已经挂好的那一格上按一个键（票 #20 的地址栏用）。
+ *
+ * 真 React 把 `onChange` 接在 `input` 事件上，`mini-react` 也是按名字接的 `addEventListener`；
+ * 两者都认 `onInput`。所以这里**先改 DOM 的值、再派发 `input`**，然后派发 `keydown` ——
+ * 那条顺序与真浏览器里"用户打了字再按回车"是同一条。
+ *
+ * @param page - 已经 {@link mountShipment} 过的那一页。
+ * @param selector - 要操作的元素。
+ * @param value - 要打进输入框的字（不给就不打字，只按键）。
+ * @param key - 要按的键（`KeyboardEvent.key`）。
+ * @returns 页面里那一刻读到的元素事实。
+ */
+export async function typeInto(
+  page: Page,
+  selector: string,
+  value: string | undefined,
+  key: string,
+): Promise<{ value: string; calls: string[]; payloads: Array<{ endpoint: string; payload: Record<string, unknown> }> }> {
+  return await page.evaluate(
+    async (input: { selector: string; value: string | null; key: string; resultName: string }) => {
+      const host = window as unknown as Record<string, unknown>
+      const find = (): HTMLInputElement => {
+        const element = document.querySelector(input.selector) as HTMLInputElement | null
+        if (element === null) throw new Error(`no element matched ${input.selector}`)
+        return element
+      }
+      if (input.value !== null) {
+        const element = find()
+        element.value = input.value
+        element.dispatchEvent(new Event('input', { bubbles: true }))
+        // **让出一个宏任务再按下一个键**：真正的用户是"打完字、再按回车"，中间隔着一次重画；
+        // 两次事件在同一个同步块里连着发，读到的会是同一个渲染里那份还没更新的状态 ——
+        // 那是这个量具的时序，不是被测代码的行为。
+        await new Promise((settle) => setTimeout(settle, 50))
+      }
+      find().dispatchEvent(new KeyboardEvent('keydown', { key: input.key, bubbles: true }))
+      // 状态更新 → 重画 → RPC 都是异步的，等一下再读。
+      await new Promise((settle) => setTimeout(settle, 300))
+      const summary = host[input.resultName] as {
+        rpcCalls: string[]
+        rpcPayloads: Array<{ endpoint: string; payload: Record<string, unknown> }>
+      }
+      // **读回时重新取一次元素**：一次重画会把整棵树换掉，手里那个节点已经不在页面上了，
+      // 它的 `value` 停在旧值上（第一版就是这么被骗过去的）。
+      return { value: find().value, calls: summary.rpcCalls, payloads: summary.rpcPayloads }
+    },
+    { selector, value: value ?? null, key, resultName: MOUNT_RESULT },
+  )
+}
+
+/**
+ * 在已经挂好的那一格上点一个元素（票 #20 的档位菜单用）。
+ *
+ * @param page - 已经 {@link mountShipment} 过的那一页。
+ * @param selector - 要点的元素。
+ * @returns 页面里那一刻读到的调用表。
+ */
+export async function clickIn(
+  page: Page,
+  selector: string,
+): Promise<{ calls: string[]; payloads: Array<{ endpoint: string; payload: Record<string, unknown> }> }> {
+  return await page.evaluate(
+    async (input: { selector: string; resultName: string }) => {
+      const host = window as unknown as Record<string, unknown>
+      const element = document.querySelector(input.selector) as HTMLElement | null
+      if (element === null) throw new Error(`no element matched ${input.selector}`)
+      element.click()
+      await new Promise((settle) => setTimeout(settle, 300))
+      const summary = host[input.resultName] as {
+        rpcCalls: string[]
+        rpcPayloads: Array<{ endpoint: string; payload: Record<string, unknown> }>
+      }
+      return { calls: summary.rpcCalls, payloads: summary.rpcPayloads }
+    },
+    { selector, resultName: MOUNT_RESULT },
+  )
+}
+
+/**
+ * 页面里那一刻某个元素的属性（票 #20 的读回口）。
+ *
+ * @param page - 已经 {@link mountShipment} 过的那一页。
+ * @param selector - 要读的元素。
+ * @param attribute - 属性名。
+ * @returns 属性值，元素不在就是 null。
+ */
+export async function attributeOf(page: Page, selector: string, attribute: string): Promise<string | null> {
+  return await page.evaluate(
+    (input: { selector: string; attribute: string }) =>
+      document.querySelector(input.selector)?.getAttribute(input.attribute) ?? null,
+    { selector, attribute },
+  )
+}
+
+/**
+ * 页面里那一刻所有匹配元素的某个属性（票 #20 的档位表用）。
+ *
+ * @param page - 已经 {@link mountShipment} 过的那一页。
+ * @param selector - 要读的那一组元素。
+ * @param attribute - 属性名。
+ * @returns 每一匹配项的属性值（按文档顺序）。
+ */
+export async function attributesOf(page: Page, selector: string, attribute: string): Promise<Array<string | null>> {
+  return await page.evaluate(
+    (input: { selector: string; attribute: string }) =>
+      Array.from(document.querySelectorAll(input.selector)).map((element) => element.getAttribute(input.attribute)),
+    { selector, attribute },
   )
 }

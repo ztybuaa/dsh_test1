@@ -223,8 +223,60 @@ export function parseEngineHistory(raw: unknown): HistoryState | undefined {
 }
 
 /**
- * 观察到的历史：两个计数，加一条"看到新文档了"的规矩。
+ * 引擎历史里**相邻的那一页**（票 #20 F 的第二条）。
  *
+ * 悬停在后退/前进上要能说出"会退到哪一页"，而"哪一页"只有引擎知道 ——
+ * `Page.getNavigationHistory` 的 `entries[]` 每条都带自己的 `title` 与 `url`，
+ * 当前索引 ∓ 1 就是答案。
+ */
+export interface HistoryNeighbour {
+  /** 引擎记下的那一页标题；它没给就是空串（**不编**）。 */
+  title: string
+  /** 引擎记下的那一页地址。 */
+  url: string
+}
+
+/** 两个方向各自的目标，读不到的那一侧**缺席**（不是给一个空对象）。 */
+export interface EngineHistoryNeighbours {
+  /** 后退会去的那一页。 */
+  back?: HistoryNeighbour
+  /** 前进会去的那一页。 */
+  forward?: HistoryNeighbour
+}
+
+/**
+ * 从同一份引擎历史里读两个相邻页。
+ *
+ * 与 {@link parseEngineHistory} 分开是为了让"能不能退"照旧只依赖那两个计数：一条新的读法
+ * 不该让旧判断多一个失败点。两份读的是**同一个** `raw`，所以不会互相矛盾。
+ *
+ * 索引落在表外、条目不是对象、字段不是字符串 —— 一律**缺席**，绝不编一个标题：
+ * 悬停提示说"会退到 X"而 X 是编的，比什么都不说更坏。
+ *
+ * @param raw - 引擎返回的那个对象（或任何东西）。
+ * @returns 两个方向的目标（各自可能缺席）。
+ */
+export function parseEngineNeighbours(raw: unknown): EngineHistoryNeighbours {
+  if (typeof raw !== 'object' || raw === null) return {}
+  const { currentIndex, entries } = raw as RawEngineHistory
+  if (typeof currentIndex !== 'number' || !Number.isInteger(currentIndex) || currentIndex < 0) return {}
+  if (!Array.isArray(entries)) return {}
+  const at = (index: number): HistoryNeighbour | undefined => {
+    if (index < 0 || index >= entries.length) return undefined
+    const entry = entries[index] as { title?: unknown; url?: unknown } | null
+    if (typeof entry !== 'object' || entry === null) return undefined
+    const title = typeof entry.title === 'string' ? entry.title : ''
+    const url = typeof entry.url === 'string' ? entry.url : ''
+    if (title === '' && url === '') return undefined
+    return { title, url }
+  }
+  const back = at(currentIndex - 1)
+  const forward = at(currentIndex + 1)
+  return { ...(back !== undefined ? { back } : {}), ...(forward !== undefined ? { forward } : {}) }
+}
+
+/**
+ * 观察到的历史：两个计数，加一条"看到新文档了"的规矩。 *
  * 它是**可变的记账本**，但规矩只有一条，所以整个类就是那个规矩本身：
  * 新文档一来，前进侧清空（浏览器就是这么做的：走新路会把旧的前进分支丢掉）。
  *

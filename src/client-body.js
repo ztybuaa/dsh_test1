@@ -71,6 +71,25 @@ var COPY = {
     // 否则"自动适配没动"与"自动适配不在管"在界面上长得一模一样。
     zoomAuto: '自动',
     zoomManual: '手动',
+    // 票 #20 A：地址栏。
+    //
+    // `addressHelp` 是那条**补协议**的规则本身，写在输入框的 title 上：规则要说得出口，
+    // 而不是让人试出来（票面原话："定一条规则并说明"）。它与 `src/toolbar.js` 的
+    // `parseAddress` 是同一句话的两种写法，所以两者挨着改。
+    addressPlaceholder: '输入网址，回车打开',
+    addressHelp: '只写主机名时补 https://（例：example.com → https://example.com）；本机地址补 http://（例：localhost:3000）；也可以直接写 http:// / https:// / file:// / about:',
+    addressSend: '打开',
+    addressEmpty: '先输一个网址。',
+    addressSpaces: '网址里不能有空格 —— 这一格不会把一句话变成搜索。',
+    addressHost: '这个地址里没有主机名。',
+    addressScheme: '这一格只开 http / https / file / about 开头的地址。',
+    // 票 #20 D：档位菜单。
+    zoomMenuTitle: '选一个标准档位',
+    // 票 #20 F 的第一条：页面还在加载。
+    loading: '加载中',
+    // 票 #20 F 的第二条：悬停在后退/前进上时那个"会去哪一页"。
+    backTo: '后退到',
+    forwardTo: '前进到',
   },
   en: {
     noShell:
@@ -81,7 +100,42 @@ var COPY = {
     missing: 'This pane reports no rectangle (collapsed or switched away).',
     zoomAuto: 'auto',
     zoomManual: 'manual',
+    addressPlaceholder: 'Type an address, press Enter',
+    addressHelp: 'A bare host gets https:// (example.com → https://example.com); a loopback host gets http:// (localhost:3000); http://, https://, file:// and about: are used as typed.',
+    addressSend: 'open',
+    addressEmpty: 'Type an address first.',
+    addressSpaces: 'An address cannot contain spaces — this pane does not turn a sentence into a search.',
+    addressHost: 'That address has no host name.',
+    addressScheme: 'This pane opens http, https, file and about addresses only.',
+    zoomMenuTitle: 'pick a standard zoom step',
+    loading: 'loading',
+    backTo: 'back to',
+    forwardTo: 'forward to',
   },
+}
+
+/** 提交地址被拒时那几个原因码（`src/toolbar.js` 的 `parseAddress`）对应的句子。 */
+var ADDRESS_REASONS = {
+  empty: 'addressEmpty',
+  spaces: 'addressSpaces',
+  host: 'addressHost',
+  scheme: 'addressScheme',
+}
+
+/**
+ * 把 `parseAddress` 给的原因码翻成一句人话。
+ *
+ * 认不出来的原因码**照样说点什么**（`addressScheme` 那句"只开这几种"是最接近事实的兜底），
+ * 而不是把 `undefined` 显示到用户眼前：一条说不清的拒绝比一句略宽的说明更让人无从下手。
+ *
+ * @param {string} reason - 原因码。
+ * @returns {string} 那句话。
+ */
+function addressErrorText(reason) {
+  var key = ADDRESS_REASONS[reason];
+  var table = copy();
+  var sentence = key === undefined ? undefined : table[key];
+  return typeof sentence === 'string' ? sentence : table.addressScheme;
 }
 
 /** @returns {string} the two-letter language code to copy in. */
@@ -94,6 +148,28 @@ function language() {
 function copy() {
   var table = COPY[language()]
   return table !== undefined ? table : COPY.en
+}
+
+/**
+ * `ctx.locale.bind(NS)` 出来的那个翻译函数（票 #20 B）。
+ *
+ * 标签标题的回落词住在**类型自己的字典**里（`DICTIONARIES` 的 `type.label`，与
+ * `apply()` 里注册给宿主的那句 `title()` 是同一个词），**不是**面板那份文案表 ——
+ * 后者是给那一格内部用的，里面没有 `type.label`。第一版把它读成了 `copy()['type.label']`，
+ * 于是回落拿到 `undefined`：页面标题读得到时看不出问题，读不到时标签就**空了**
+ * （`tests/toolbar-panel.spec.ts` 的 B 那一条抓到的就是这个）。
+ */
+var localeText = null
+
+/**
+ * 读不到页面标题时标签上写什么。
+ *
+ * @returns {string} 那个词（"浏览器" / "Browser"）。
+ */
+function tabTitleFallback() {
+  if (localeText !== null) return localeText('type.label')
+  var table = DICTIONARIES[language()]
+  return (table !== undefined ? table : DICTIONARIES.en)['type.label']
 }
 
 /**
@@ -143,12 +219,15 @@ function endpointFor(action) {
  *
  * @param {object} ctx - the plugin context, carrying `connection`.
  * @param {string} action - the action name.
+ * @param {{url?: string, zoom?: number}} [extra] - 那两条带参数的动作的参数（票 #20）。
+ *   地址栏与档位菜单各用其中一个；别的动作一个都不带（宿主那边也只认这两个动作带参数）。
  * @returns {Promise<{ok: boolean, url: string, zoom: unknown, canGoBack: boolean,
  *   canGoForward: boolean, message: string}>} the host's answer, or a local failure value.
  */
-async function callView(ctx, action) {
+async function callView(ctx, action, extra) {
   try {
-    var answer = await ctx.connection.rpc.call(RPC_CHANNEL, endpointFor(action), { nonce: String(Date.now()) })
+    var payload = Object.assign({ nonce: String(Date.now()) }, extra !== undefined ? extra : {})
+    var answer = await ctx.connection.rpc.call(RPC_CHANNEL, endpointFor(action), payload)
     if (answer === null || answer === undefined || answer.ok !== true) {
       var failure = answer !== null && answer !== undefined && answer.error !== undefined ? answer.error : undefined
       return {
@@ -179,6 +258,86 @@ async function callView(ctx, action) {
 }
 
 /**
+ * 页面标题那一份**共享读数**（票 #20 B）。
+ *
+ * ## 为什么是一份共享的东西
+ *
+ * 侧边栏那个标签（`sidebar.right.pane.tab.title` 座位）与面板工具条是**两个**组件：宿主分别
+ * 渲染它们，它们之间没有 props 通道。而它们要说的是同一件事 —— "这一格里现在是哪一页"。
+ * 所以读回来的那一份只有一个地方放（这个模块作用域的对象），两边都从它读：
+ * 工具条每次读回都往里写，标签订阅它。
+ *
+ * ## 为什么要有个心跳
+ *
+ * 标签要跟着页面走，而页面**不必**经过这个面板才会换（Agent 走的是另一条路：它直接驱动
+ * 同一个视图）。所以只要标签还在屏幕上，就每隔 {@link TITLE_WATCH_MS} 问一次"现在是什么标题"。
+ * 心跳**只在有标签订阅时**跑：没人看那个标签的时候，一次多余的读回都不发。
+ *
+ * 读回来的东西原样存着；拿不到就存空串，由 {@link DshViewToolbar.titleForTab} 回落到
+ * 标签类型自己的名字（"浏览器"）—— 回落发生在显示的那一刻，不是一个存下来的默认值。
+ */
+var pageTitle = {
+  /** 最近一次从视图读回来的标题；没读过就是空串。 */
+  value: '',
+  /** 订阅者（标签组件）。 */
+  listeners: [],
+  /** 心跳的定时器句柄；0 = 没在跑。 */
+  timer: 0,
+  /** 心跳要用的上下文（`apply` 时给的）。 */
+  ctx: null,
+}
+
+/** 标签每次问一次"现在标题是什么"的间隔。2 秒：跟得上换页，又不至于把宿主刷满。 */
+var TITLE_WATCH_MS = 2000
+
+/**
+ * 记下一次读回来的标题，并告诉所有订阅者。
+ *
+ * @param {unknown} title - 外壳读回来的标题。
+ * @returns {void}
+ */
+function rememberPageTitle(title) {
+  var next = typeof title === 'string' ? title : ''
+  if (next === pageTitle.value) return
+  pageTitle.value = next
+  for (var index = 0; index < pageTitle.listeners.length; index++) pageTitle.listeners[index](next)
+}
+
+/**
+ * 订阅标题的变化。
+ *
+ * @param {(title: string) => void} listener - 新标题来了叫它。
+ * @returns {() => void} 退订。
+ */
+function subscribePageTitle(listener) {
+  pageTitle.listeners.push(listener)
+  return function () {
+    var at = pageTitle.listeners.indexOf(listener)
+    if (at !== -1) pageTitle.listeners.splice(at, 1)
+  }
+}
+
+/** 有标签在看的时候才开心跳（见 {@link pageTitle} 的说明）。 */
+function startPageTitleWatch(ctx) {
+  pageTitle.ctx = ctx
+  if (pageTitle.timer !== 0) return
+  pageTitle.timer = setInterval(function () {
+    if (pageTitle.ctx === null) return
+    void callView(pageTitle.ctx, 'state').then(function (next) {
+      if (next.ok === true) rememberPageTitle(next.title)
+    })
+  }, TITLE_WATCH_MS)
+}
+
+/** 没有标签在看了：心跳停掉，一次多余的读回都不发。 */
+function stopPageTitleWatch() {
+  if (pageTitle.listeners.length > 0) return
+  if (pageTitle.timer !== 0) clearInterval(pageTitle.timer)
+  pageTitle.timer = 0
+  pageTitle.ctx = null
+}
+
+/**
  * The toolbar strip above the browser view.
  *
  * It is **in the panel, not in the view**: the native view parks on the rectangle this
@@ -202,18 +361,86 @@ function Toolbar(props) {
     url: '',
     zoom: undefined,
     zoomMode: undefined,
+    loading: undefined,
     canGoBack: false,
     canGoForward: false,
+    backTarget: undefined,
+    forwardTarget: undefined,
     message: '',
     busy: false,
+    /** 票 #20 F：面板刚请求了一次导航，还没听到回答 —— "加载中"的第一半。 */
+    navigating: false,
   })
+  /**
+   * 输入框里那串字（票 #20 A）。
+   *
+   * 它与 `state.url` 是**两样东西**，而且必须分开：`state.url` 是"视图现在在哪"（读回来的
+   * 事实），这里是"框里显示着什么"。用户正在打字的时候，一次读回把他打的字冲掉是最讨厌的
+   * 那种 bug；而用户没在打字的时候，框里必须跟着页面走 —— 票面原话："跳转后框里的地址要
+   * 跟着页面走（读回来，不是自己记）"。
+   */
+  var [address, setAddress] = react.useState('')
+  /** 上一次提交被拒的那句话。空串 = 没有出错。 */
+  var [addressError, setAddressError] = react.useState('')
+  /** 档位菜单开着没有（票 #20 D）。 */
+  var [menuOpen, setMenuOpen] = react.useState(false)
+  /** 光标在地址栏里吗（决定读回要不要覆盖框里的字）。 */
+  var editing = react.useRef(false)
 
-  /** 读一次"外壳现在说什么"，并把结果落到那一行上。 */
-  var refresh = react.useCallback(function () {
+  /**
+   * 把一次回答落到面板上 —— **所有**读回都从这里进。
+   *
+   * 三件事必须一起做，散在各处就会有两处不一致：
+   *  1. 状态合并（失败的回答没有读回任何东西，不许把上一次读到的地址与缩放宽抹成空白）；
+   *  2. 页面标题进共享读数（票 #20 B 的标签要它）；
+   *  3. 地址栏跟着页面走（除非用户正在打字）。
+   *
+   * @param {object} next - 外壳答的那一份（或本地造的那份失败值）。
+   * @param {{keepAddress?: boolean, quiet?: boolean}} [options] - `keepAddress`：这一按被拒了，
+   *   框里留着用户打的字；`quiet`：这只是一次**顺手读回来的**（导航途中的轮询），
+   *   **不是**某一次动作的回答 —— 那么它不许解开那把按钮锁（见下面那段）。
+   */
+  var applyAnswer = react.useCallback(function (next, options) {
+    var settings = options !== undefined ? options : {}
+    var keep = settings.keepAddress === true
+    var quiet = settings.quiet === true
+    setState(function (previous) {
+      var merged = Object.assign({}, previous, next)
+      // 只有**动作的回答**才解开"忙"与"导航中"这两把锁。顺手读回来的那份读数解开它们，
+      // 就等于"导航还在飞的时候按钮又亮了" —— 那正是 `isEnabled` 里 `busy` 要挡的那种
+      // 两次动作叠在一起（票 #20 写 F 那条轮询时踩到的）。
+      if (quiet !== true) {
+        merged.busy = false
+        merged.navigating = false
+      }
+      if (next.ok === false && (next.url === '' || next.url === undefined)) {
+        // 一次失败的调用**没有读回任何东西**："读不到"不等于"地址是空的、缩放是未知的"。
+        merged.url = previous.url
+        merged.zoom = previous.zoom
+        merged.zoomMode = previous.zoomMode
+        merged.loading = previous.loading
+        merged.backTarget = previous.backTarget
+        merged.forwardTarget = previous.forwardTarget
+      }
+      return merged
+    })
+    rememberPageTitle(next.title)
+    // 一次**成功**的读回把上一次"地址被拒"那句话收掉：那句话说的是那一按，不是永久状态。
+    if (next.ok === true) setAddressError('')
+    if (keep !== true && editing.current !== true && typeof next.url === 'string' && next.url !== '') {
+      setAddress(next.url)
+    }
+  }, [])
+
+  /**
+   * 读一次"外壳现在说什么"，并把结果落到那一行上。
+   *
+   * @param {{quiet?: boolean}} [options] - `quiet` 见 {@link applyAnswer}（导航途中的轮询用它）。
+   */
+  var refresh = react.useCallback(function (options) {
+    var settings = options !== undefined ? options : {}
     void callView(props.ctx, 'state').then(function (next) {
-      setState(function (previous) {
-        return Object.assign({}, previous, next, { busy: false })
-      })
+      applyAnswer(next, { quiet: settings.quiet === true })
     })
   }, [])
 
@@ -223,26 +450,68 @@ function Toolbar(props) {
    * The read-back is the point: the host answers with the post-action state, so the zoom
    * label and the two history buttons come from the view rather than from a local guess
    * that could drift the moment anything else drives the view (the agent does).
+   *
+   * @param {string} action - 动作名。
+   * @param {{payload?: object, navigating?: boolean, keepAddress?: boolean}} [options]
+   *   `payload` 是那两条带参数的动作的参数；`navigating` = 这是一次导航（面板要显示"加载中"）；
+   *   `keepAddress` = 这一按被拒时框里留着用户打的字。
    */
-  var run = react.useCallback(
-    function (action) {
-      setState(function (previous) {
-        return Object.assign({}, previous, { busy: true })
-      })
-      void callView(props.ctx, action).then(function (next) {
-        setState(function (previous) {
-          return Object.assign({}, previous, next, { busy: false })
-        })
-      })
-    },
-    [],
-  )
+  var run = react.useCallback(function (action, options) {
+    var settings = options !== undefined ? options : {}
+    setState(function (previous) {
+      return Object.assign({}, previous, { busy: true, navigating: settings.navigating === true })
+    })
+    void callView(props.ctx, action, settings.payload).then(function (next) {
+      applyAnswer(next, { keepAddress: settings.keepAddress === true })
+    })
+  }, [])
+
+  /**
+   * 地址栏回车（票 #20 A）。
+   *
+   * **规范化在提交的那一刻做，不在打字的时候做**：一边打字一边往框里补 `https://` 会让人
+   * 没法输入（补上去的那几个字符会跟着光标跑）。规则本身是纯判断，住在 `src/toolbar.js`；
+   * 这里只负责把它的拒绝显示出来。
+   */
+  var submitAddress = react.useCallback(function () {
+    var parsed = toolbar.parseAddress(address)
+    if (parsed.ok !== true) {
+      setAddressError(addressErrorText(parsed.reason))
+      return
+    }
+    setAddressError('')
+    setAddress(parsed.url)
+    run('navigate', { payload: { url: parsed.url }, navigating: true, keepAddress: true })
+  }, [address])
 
   // The first read happens once the strip is on screen. It is deliberately not part of a
   // render: a render that started a request would start one per re-render.
   react.useEffect(function () {
     refresh()
   }, [])
+
+  /**
+   * 导航在飞的时候，隔一会儿问一次"那一页自己说它还在加载吗"（票 #20 F 的第一条）。
+   *
+   * 为什么不能只靠"请求还没回来"：那说的是**面板**在等，不是**页面**在加载。而页面自己
+   * 会用 `document.readyState` 回答这件事（宿主那次读回里带着 `loading`）。所以这里一边等
+   * 回答、一边把页面自己的读数刷新过来 —— 提示说的因此是页面的事实，不是面板的心情。
+   *
+   * 间隔与 {@link PANEL_REFRESH_MIN_MS} 同源：既不把宿主刷满，又跟得上一次换页。
+   */
+  react.useEffect(
+    function () {
+      if (state.navigating !== true) return undefined
+      var timer = setInterval(function () {
+        // `quiet`：这一读**不解锁**（见 `applyAnswer`）—— 导航还在飞的时候按钮必须一直是灰的。
+        refresh({ quiet: true })
+      }, PANEL_REFRESH_MIN_MS)
+      return function () {
+        clearInterval(timer)
+      }
+    },
+    [state.navigating],
+  )
 
   /**
    * 栏宽变了 ⇒ 那个读数要重读（票 #19）。
@@ -303,6 +572,7 @@ function Toolbar(props) {
     }
   }, [])
 
+  var words = copy()
   var children = []
   for (var index = 0; index < toolbar.BUTTONS.length; index++) {
     var button = toolbar.BUTTONS[index]
@@ -312,6 +582,16 @@ function Toolbar(props) {
       busy: state.busy,
       hasShell: props.hasShell,
     })
+    // 票 #20 F 的第二条：悬停在后退/前进上要能看出"会退到哪一页"。
+    // 目标来自**引擎自己的导航历史**（宿主那次读回里的 `backTarget` / `forwardTarget`），
+    // 读不到时 `travelHint` 返回 undefined ⇒ tooltip 退回按钮自己那个词（"back"），
+    // 而不是给一个空 tooltip 假装知道。
+    var travel =
+      button.action === 'back'
+        ? toolbar.travelHint(state.backTarget, words.backTo)
+        : button.action === 'forward'
+          ? toolbar.travelHint(state.forwardTarget, words.forwardTo)
+          : undefined
     children.push(
       react.createElement(
         'button',
@@ -319,7 +599,7 @@ function Toolbar(props) {
           key: button.action,
           type: 'button',
           'data-dsh-view-action': button.action,
-          title: button.title,
+          title: travel !== undefined ? travel : button.title,
           disabled: !enabled,
           onClick: (function (action) {
             return function () {
@@ -337,6 +617,7 @@ function Toolbar(props) {
             color: 'inherit',
             cursor: enabled ? 'pointer' : 'not-allowed',
             opacity: enabled ? 1 : 0.45,
+            flex: '0 0 auto',
           },
         },
         button.label,
@@ -344,22 +625,212 @@ function Toolbar(props) {
     )
   }
 
-  // 票 #19：那个读数带上"谁在管"（自动 / 手动）。词来自本文件前面那张文案表 ——
-  // `src/toolbar.js` 一行文案都不带，它只回答"该怎么拼"。
-  var zoomText = toolbar.zoomReading(state.zoom, state.zoomMode, {
-    auto: copy().zoomAuto,
-    manual: copy().zoomManual,
+  /**
+   * 地址栏（票 #20 A）。
+   *
+   * 它在**面板里**（不在被驱动的那一页），所以它不可能进快照 —— `tests/panel-toolbar.spec.ts`
+   * 有一条"工具条存在时视图快照逐项不变"的断言从视图那一侧读回这件事。而它驱动视图走的仍然是
+   * **既有的那条 RPC**（`desktop-view-navigate`），`shell/preload.js` 那条"除矩形外什么都不许
+   * 过境"的边界一个字节都没动：这条输入框够不到 Electron，也够不到视图。
+   */
+  var addressField = react.createElement('input', {
+    key: 'address',
+    type: 'text',
+    'data-dsh-view-address': 'ready',
+    value: address,
+    placeholder: words.addressPlaceholder,
+    title: words.addressHelp,
+    spellCheck: false,
+    autoComplete: 'off',
+    disabled: props.hasShell !== true,
+    onInput: function (event) {
+      setAddress(event.target.value)
+      setAddressError('')
+    },
+    onFocus: function () {
+      editing.current = true
+    },
+    onBlur: function () {
+      editing.current = false
+      // 松手之后框里回到"页面现在在哪"（用户打了一半又走开时，框里不该留着一段没人要的字）。
+      setAddress(state.url)
+      setAddressError('')
+    },
+    onKeyDown: function (event) {
+      if (event.key !== 'Enter') return
+      event.preventDefault()
+      submitAddress()
+    },
+    style: {
+      flex: '1 1 60px',
+      minWidth: '60px',
+      height: '22px',
+      padding: '0 6px',
+      boxSizing: 'border-box',
+      font: '12px/1 system-ui',
+      border: '1px solid ' + (addressError === '' ? 'var(--dsh-color-border, #d0d7de)' : 'var(--dsh-color-danger, #b42318)'),
+      borderRadius: '4px',
+      background: 'var(--dsh-color-surface, #fff)',
+      color: 'inherit',
+      textOverflow: 'ellipsis',
+    },
   })
+
+  // 票 #19 + #20 C：读数只留用户要的信息（模式 + 百分比），必要时加"加载中"（F）与
+  // "为什么这一按没成"。宿主那些诊断话术一个字都没删 —— 它们在同一次渲染的
+  // `data-dsh-view-diagnostic` 与 tooltip 上（另一个通道，仍然读得到）。
+  var readingState = Object.assign({}, state, { message: addressError !== '' ? addressError : state.message })
+  if (addressError !== '') readingState.ok = false
+  var reading = toolbar.readingText(readingState, {
+    auto: words.zoomAuto,
+    manual: words.zoomManual,
+    loading: words.loading,
+  })
+  var diagnostic = toolbar.diagnosticText(readingState)
+
+  // 票 #20 D：那颗百分比现在是一颗**菜单按钮**。菜单展开时工具条长高一行（于是被测量的那一块
+  // 自动变矮，外壳跟着把原生画面摆到新的矩形上）—— 不用浮层，因为浮层会被原生画面盖住。
+  var currentPreset = toolbar.currentPreset(state.zoom)
+  var presetItems = []
+  for (var presetIndex = 0; presetIndex < toolbar.ZOOM_PRESETS.length; presetIndex++) {
+    var percent = toolbar.ZOOM_PRESETS[presetIndex]
+    presetItems.push(
+      react.createElement(
+        'button',
+        {
+          key: 'preset-' + String(percent),
+          type: 'button',
+          'data-dsh-view-zoom-preset': String(percent),
+          'data-dsh-view-zoom-current': percent === currentPreset ? 'yes' : 'no',
+          disabled: state.busy === true || props.hasShell !== true,
+          onClick: (function (value) {
+            return function () {
+              setMenuOpen(false)
+              run('zoom-to', { payload: { zoom: value / 100 } })
+            }
+          })(percent),
+          style: {
+            font: '11px/1 system-ui',
+            minWidth: '40px',
+            height: '20px',
+            padding: '0 4px',
+            border: '1px solid ' + (percent === currentPreset ? 'var(--dsh-color-accent, #0969da)' : 'var(--dsh-color-border, #d0d7de)'),
+            borderRadius: '4px',
+            background: 'var(--dsh-color-surface, #fff)',
+            color: 'inherit',
+            cursor: 'pointer',
+            flex: '0 0 auto',
+          },
+        },
+        String(percent) + '%',
+      ),
+    )
+  }
+
+  var zoomControl = react.createElement(
+    'button',
+    {
+      key: 'zoom-menu',
+      type: 'button',
+      'data-dsh-view-zoom-menu': menuOpen ? 'open' : 'closed',
+      title: words.zoomMenuTitle,
+      disabled: props.hasShell !== true,
+      onClick: function () {
+        setMenuOpen(function (open) {
+          return open !== true
+        })
+      },
+      style: {
+        font: '11px/1 system-ui',
+        height: '22px',
+        padding: '0 6px',
+        border: '1px solid var(--dsh-color-border, #d0d7de)',
+        borderRadius: '4px',
+        background: 'var(--dsh-color-surface, #fff)',
+        color: 'inherit',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+        flex: '0 0 auto',
+      },
+    },
+    reading,
+  )
+
+  // 那一行读数：菜单关着时它既是读数也是菜单按钮（真浏览器也是点百分比选档位）。
+  var readingSpan = react.createElement(
+    'span',
+    {
+      // `zoomLabel` 自己就把"读不到"渲染成 `—`（票 #19 的规矩），所以这里不再判一次。
+      'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
+      'data-dsh-view-reading': reading,
+      'data-dsh-view-diagnostic': diagnostic,
+      style: {
+        font: '11px/1.3 system-ui',
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        flex: '0 1 auto',
+        opacity: state.ok === false || addressError !== '' ? 1 : 0.75,
+        color: state.ok === false || addressError !== '' ? 'var(--dsh-color-danger, #b42318)' : 'inherit',
+      },
+      title: diagnostic,
+    },
+    reading,
+  )
+
+  // 行一：导航按钮 + 地址栏。行二（只在菜单展开时存在）：那一排标准档位。
+  var row = react.createElement(
+    'div',
+    {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '4px',
+        width: '100%',
+        height: toolbar.TOOLBAR_HEIGHT_PX + 'px',
+        flex: '0 0 auto',
+      },
+    },
+    children,
+    addressField,
+    zoomControl,
+    readingSpan,
+  )
+
+  var rows = [row]
+  if (menuOpen) {
+    rows.push(
+      react.createElement(
+        'div',
+        {
+          'data-dsh-view-zoom-presets': 'open',
+          style: {
+            display: 'flex',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            gap: '4px',
+            width: '100%',
+            padding: '2px 0 4px',
+            flex: '0 0 auto',
+          },
+        },
+        presetItems,
+      ),
+    )
+  }
 
   return react.createElement(
     'div',
     {
       'data-dsh-view-toolbar': 'ready',
       style: {
-        height: toolbar.TOOLBAR_HEIGHT_PX + 'px',
+        // 菜单展开时长高一行（`height: auto` 让内容决定），于是被测量的那一块自动变矮 ——
+        // 原生画面跟着让出那一行，菜单因此**不会**被它盖住（浮层一定会）。
+        height: menuOpen ? 'auto' : toolbar.TOOLBAR_HEIGHT_PX + 'px',
+        minHeight: toolbar.TOOLBAR_HEIGHT_PX + 'px',
         display: 'flex',
-        alignItems: 'center',
-        gap: '4px',
+        flexDirection: 'column',
+        alignItems: 'stretch',
         padding: '0 6px',
         boxSizing: 'border-box',
         borderBottom: '1px solid var(--dsh-color-border, #d0d7de)',
@@ -368,27 +839,43 @@ function Toolbar(props) {
         flex: '0 0 auto',
       },
     },
-    children,
-    react.createElement(
-      'span',
-      {
-        'data-dsh-view-zoom': zoomText,
-        style: {
-          marginLeft: 'auto',
-          font: '11px/1.3 system-ui',
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          maxWidth: '45%',
-          textAlign: 'right',
-          opacity: state.ok === false ? 1 : 0.75,
-          color: state.ok === false ? 'var(--dsh-color-danger, #b42318)' : 'inherit',
-        },
-        title: toolbar.statusText(state),
-      },
-      zoomText + ' \u00b7 ' + toolbar.statusText(state),
-    ),
+    rows,
   )
+}
+
+/**
+ * 侧边栏那个标签上的字（票 #20 B）。
+ *
+ * 它注册在 `sidebar.right.pane.tab.title` 座位上（key = 本插件的 `id`），于是**取代**宿主在
+ * 开标签时抓到的那句 `title(address)` —— 那句话是**开标签那一刻**的，永远不会变，而这里要的是
+ * "这一格现在装的是哪一页"。
+ *
+ * 它读的是 {@link pageTitle} 那份共享读数（工具条每次读回都往里写），并在这段时间里开着心跳
+ * （见 {@link startPageTitleWatch}）—— 因为换页不必经过这个面板（Agent 直接驱动那个视图）。
+ *
+ * 读不到就回落到"浏览器"（{@link DshViewToolbar.titleForTab}）：一个空标签比一个说得不准的
+ * 名字更坏，因为空标签让人看不出那一格里是什么。
+ *
+ * @returns {string} 标签上那串字。
+ */
+function TabTitle() {
+  var react = require('react')
+  var [title, setTitle] = react.useState(pageTitle.value)
+  react.useEffect(function () {
+    var unsubscribe = subscribePageTitle(setTitle)
+    startPageTitleWatch(clientContext)
+    // 挂上来的这一刻先读一次：标签可能比工具条先出现（比如切到别的标签之后再展开侧边栏）。
+    if (pageTitle.value === '' && clientContext !== null) {
+      void callView(clientContext, 'state').then(function (next) {
+        if (next.ok === true) rememberPageTitle(next.title)
+      })
+    }
+    return function () {
+      unsubscribe()
+      stopPageTitleWatch()
+    }
+  }, [])
+  return DshViewToolbar.titleForTab(title, tabTitleFallback())
 }
 
 /**
@@ -539,6 +1026,8 @@ function apply(ctx) {
   var t = typeof ctx.locale?.bind === 'function' ? ctx.locale.bind(NS) : function () { return 'Browser' }
   // The toolbar reads this on render; see the note on the variable itself.
   clientContext = ctx
+  // 标签标题的回落词也从这里出（同一个词，同一份字典）：见 `localeText` 的说明。
+  localeText = t
 
   // Stage one: what the type IS.
   ctx.effect(function () {
@@ -590,6 +1079,23 @@ function apply(ctx) {
       return ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TYPE_ID, locale: NS }, Panel)
     })
   }, 'desktop-view: tab body')
+
+  // Stage three（票 #20 B）：标签上那串字。
+  //
+  // 这一个座位是**为"会变的标题"存在的**，而且这不是猜的：宿主的类型声明把它写成了
+  // 一句话 —— *"A tab's title as its chip shows it… A type with a live title — a terminal
+  // named after its shell, a chat after its first line — registers here and reads its own
+  // store; one without registers nothing and the chip shows the registry's `title(address)`
+  // text captured at open time."*（`dsh-client-ui-sidebar-right/lib/types/client/contract/
+  // slots.d.ts` 的 `sidebar.right.pane.tab.title`）。产品自己那个 Files 插件就是这么做的
+  // （`dsh-client-ui-sidebar-files/lib/client.js` 的 FilesTitle）。
+  //
+  // 所以我们**不需要**任何"改标签标题"的运行时 API：座位本身就是那条路。
+  ctx.effect(function () {
+    return ctx.slots.inject('sidebar.right.pane.tab.title', function () {
+      return ctx.slots.register({ name: 'sidebar.right.pane.tab.title', key: TYPE_ID }, TabTitle)
+    })
+  }, 'desktop-view: tab title')
 }
 
 exports.apply = apply
