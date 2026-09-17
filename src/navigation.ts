@@ -135,22 +135,75 @@ export function classifyNavigationFailure(
 }
 
 /**
- * 面板上那颗按钮该不该亮。
+ * 面板上那颗按钮该不该亮：还能后退/前进几页。
  *
- * **为什么是"观察到的历史"而不是"问引擎"**：Playwright 没有"能不能后退"这种只读 API
- * （`goBack`/`goForward` 是动作，不是查询），而 `history.length` 在同源内是对的、跨源就不可靠。
- * 所以这里回答的是**这个会话自己看着它走过的那些页**：每挂上一个新文档就记一笔，
- * 从 A 走到 B 再走到 C 就有两笔可后退；后退之后前进那一侧又有了一笔。
- *
- * 它因此**可能低估**（会话领养之前走过的路不在账上），也**不可能凭空乐观**
- * （它不会说"可以后退"而实际退不动）。低估的代价是按钮一开始是灰的，而用户按一次
- * 真正的动作就会把它点亮；高估的代价是用户按了一颗撒谎的按钮 —— 后者更糟。
+ * 从票 #18 起，**首选答案是引擎自己的历史**（`Page.getNavigationHistory`），账本只在
+ * 拿不到引擎读数时兜底（见 {@link HistorySource}）。
  */
 export interface HistoryState {
-  /** 还能后退几页（会话自己观察到的）。 */
+  /** 还能后退几页。 */
   back: number
-  /** 还能前进几页（会话自己观察到的）。 */
+  /** 还能前进几页。 */
   forward: number
+}
+
+/**
+ * 这份 {@link HistoryState} 是从哪读来的（票 #18）。
+ *
+ * 它是**面板与模型都要看见的一个字段**，不是内部细节：同一个 `{back: 0}` 在两种来源下
+ * 是两句不同的话 —— "引擎说退不动"与"我们只是没看见它走过路"。把两者合成一个数
+ * 正是票 #18 的成因，所以来源必须跟着数字一起传出去。
+ */
+export type HistorySource =
+  /** 引擎答的（`Page.getNavigationHistory`）：就是这个视图真实的历史。 */
+  | 'engine'
+  /** 引擎答不上来，退回本会话观察到的账本：可能低估。 */
+  | 'observed'
+
+/**
+ * 一次历史读数：两个计数，**加上这份数是从哪来的**。
+ *
+ * `HistoryState` 是它的形状（凡是只要两个数的地方照旧收 `HistoryState`），这一层多出来的
+ * 只有来源与失败原因。
+ */
+export interface EngineHistoryReading extends HistoryState {
+  /** 这份读数从哪来，见 {@link HistorySource}。 */
+  source: HistorySource
+  /** 引擎答不上来时它说的那句话（`source` 为 `observed` 时有）。绝不静默丢掉。 */
+  reason?: string
+}
+
+/**
+ * 引擎的 `Page.getNavigationHistory` 原生返回里我们用到的那两个字段。
+ *
+ * 只声明用到的：**缺失的那两个字段由 {@link parseEngineHistory} 判成"没读到"**，
+ * 而不是当成某个默认值（一个缺字段的回答被当成 `{0, 0}` 会让"读不到"长得像"不能后退"）。
+ */
+export interface RawEngineHistory {
+  currentIndex?: unknown
+  entries?: unknown
+}
+
+/**
+ * 把引擎那份历史收成 {@link HistoryState}。
+ *
+ * 它是**纯判断**：不碰 CDP、不碰 electron，所以"领养时已经在的那一页算不算一笔""前进分支
+ * 有几笔"这些规矩可以在没有浏览器的用例里逐条钉住。
+ *
+ * 计数是**从索引算出来的**，不是另数一遍：`back = currentIndex`、`forward = 条目数 - 1 - currentIndex`。
+ * 这与 {@link ObservedHistory.state} 是同一个算法 —— 同一个问题只许有一个答案的形状。
+ *
+ * @param raw - 引擎返回的那个对象（或任何东西）。
+ * @returns 两个计数，读不动时 `undefined`。
+ */
+export function parseEngineHistory(raw: unknown): HistoryState | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const { currentIndex, entries } = raw as RawEngineHistory
+  if (typeof currentIndex !== 'number' || !Number.isInteger(currentIndex) || currentIndex < 0) return undefined
+  if (!Array.isArray(entries)) return undefined
+  // 索引落在表外时整份读数作废：夹一下会得到一个"引擎没说过"的数。
+  if (currentIndex >= entries.length) return undefined
+  return { back: currentIndex, forward: entries.length - 1 - currentIndex }
 }
 
 /**
@@ -158,6 +211,19 @@ export interface HistoryState {
  *
  * 它是**可变的记账本**，但规矩只有一条，所以整个类就是那个规矩本身：
  * 新文档一来，前进侧清空（浏览器就是这么做的：走新路会把旧的前进分支丢掉）。
+ *
+ * ## 它从票 #18 起的身份：**兜底**，不是权威
+ *
+ * 权威是引擎的 `Page.getNavigationHistory`（见 {@link parseEngineHistory}）—— 那条路天然包含
+ * "领养时视图已经在的那一页"，也不怕会话被重建。账本只在**引擎答不上来**时被读（CDP 会话
+ * 建不起来、或者那台引擎不认这个域），因为它的答案有一道已知的裂缝：
+ *
+ * - 它**可能低估**：会话领养之前走过的路不在账上（票 #18 的症状就是这个 —— 引擎里明明有一格
+ *   可以退，而账本说没有，于是工具条上的后退被灰掉）；
+ * - 它**不会凭空乐观**：它不会说"可以后退"而实际退不动。
+ *
+ * 所以读到账本时，{@link HistorySource} 会说 `observed`。**一个数单独出现是不够的**：
+ * "引擎说退不动"和"我们只是没看见它走过路"必须是两句不同的话。
  */
 export class ObservedHistory {
   private visited: string[] = []

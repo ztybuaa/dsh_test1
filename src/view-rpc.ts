@@ -74,7 +74,8 @@ export interface ViewRequest {
  * 面板读到的那份状态 —— **每一项都来自宿主的一次独立读回**，没有一项是面板自己的局部变量。
  *
  * 这是票面明写的："面板显示的东西必须来自独立读回"。所以连"能不能后退"也是宿主那边
- * 观察到的历史算出来的（见 `src/navigation.ts` 的 `ObservedHistory`），而不是面板记的。
+ * **问引擎**得到的（`Page.getNavigationHistory`，票 #18；引擎答不上来才退回会话观察到的
+ * 账本，见 `src/navigation.ts`），而不是面板记的。
  */
 export interface ViewState {
   /** 视图现在的地址，读自视图自己。 */
@@ -89,10 +90,18 @@ export interface ViewState {
   innerWidth: number
   /** 页面自己读到的视口高度。 */
   innerHeight: number
-  /** 这个会话观察到的历史里还有没有可后退的一页。 */
+  /** 视图的历史里还有没有可后退的一页（引擎自己的历史，不是谁记的）。 */
   canGoBack: boolean
   /** 还有没有可前进的一页。 */
   canGoForward: boolean
+  /**
+   * 上面那两个数是**从哪里读来**的（票 #18）：`engine` 是引擎自己的历史，`observed` 是
+   * 引擎答不上来时退回本会话观察到的账本。
+   *
+   * 面板暂时不显示它（不多长一颗灯），但它是宿主那一侧的一件事实，放在同一份读回里
+   * 才不会与那两个数各说各话。
+   */
+  historySource: 'engine' | 'observed'
   /** 「重新开始」会去哪一页（外壳握手发布的那句）。 */
   restartTarget: string
   /** 那次动作成不成。 */

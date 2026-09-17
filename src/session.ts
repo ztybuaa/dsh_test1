@@ -3,6 +3,7 @@ import { basename, resolve } from 'node:path'
 import type {
   Browser,
   BrowserContext,
+  CDPSession,
   Dialog,
   ElementHandle,
   FileChooser,
@@ -41,7 +42,10 @@ import {
   ObservedHistory,
   classifyNavigationFailure,
   normalizeZoom,
+  parseEngineHistory,
   stepZoom as nextZoomStep,
+  type EngineHistoryReading,
+  type HistorySource,
   type HistoryState,
   type NavigationFailureReason,
 } from './navigation.ts'
@@ -153,8 +157,13 @@ export interface HistoryActionResult {
   reason?: NavigationFailureReason
   /** 没发生时那句话（含补救）。 */
   message?: string
-  /** 这个会话自己观察到的历史，动作之后的状态 —— 面板上的按钮亮不亮看它。 */
-  history: HistoryState
+  /**
+   * 历史，动作**之后**的状态 —— 面板上的按钮亮不亮、`browser_view` 报不报得成看它。
+   *
+   * 票 #18 起它是**引擎的**读数（`Page.getNavigationHistory`），只有在引擎答不上来时才退回
+   * 本会话观察到的账本 —— 哪一种由 {@link HistorySource} 说清楚。
+   */
+  history: EngineHistoryReading
 }
 
 /**
@@ -186,8 +195,8 @@ export interface ZoomResult {
  * 面板要显示的那一整份状态（T13）。
  *
  * 每一个字段都注明它**从哪读来**，因为面板上显示的东西必须来自独立读回：
- * `url` 读自视图自己，`devicePixelRatio` / 视口读自页面自己，历史读自会话的观察账本，
- * `zoom` 读自外壳（`getZoomFactor()`）。
+ * `url` 读自视图自己，`devicePixelRatio` / 视口读自页面自己，历史读自**引擎自己的历史**
+ * （拿不到时退回会话的观察账本，由 `historySource` 说清是哪种），`zoom` 读自外壳（`getZoomFactor()`）。
  */
 export interface ViewDisplayState {
   /** 视图现在的地址。 */
@@ -202,8 +211,10 @@ export interface ViewDisplayState {
   innerWidth?: number
   /** 页面自己读到的视口高度；同上。 */
   innerHeight?: number
-  /** 这个会话观察到的历史。 */
+  /** 还能后退/前进几页（引擎答的，或引擎答不上来时账本答的）。 */
   history: HistoryState
+  /** 那份历史是从哪读来的（票 #18）：`engine` 或 `observed`。 */
+  historySource: HistorySource
   /** 外壳握手发布的初始页；没有就缺席（「重新开始」会去空白页）。 */
   initialUrl?: string
 }
@@ -1134,6 +1145,153 @@ interface Candidate {
 }
 
 /**
+ * 开一条**留在手里**的 CDP 会话（票 #18）。
+ *
+ * 与 {@link probeTargetId} 的分工是"读一次身份就关掉"与"留着问历史"：身份是一次性的问题，
+ * 而"这个视图能退几格"要在会话的整个生命里反复问（领养时、每次导航之后、每次判断之前），
+ * 所以这条会话不能像探针那样查完就 detach。
+ *
+ * 建不起来**不抛**：会话的其余能力（快照、点击、导航、缩放）都不依赖它，为一个历史读数
+ * 让整个领养失败是把代价搞反了。代价是那时只剩账本兜底，而 `historyState` 会如实说
+ * `source: 'observed'` —— 一句"读不到"必须说得出来，但不能变成"不能后退"。
+ *
+ * @param context - 拥有这块视图的 context。
+ * @param page - 被领养的那块视图。
+ * @returns 那条会话，或建不起来时的原因。
+ */
+async function openEngineChannel(
+  context: BrowserContext,
+  page: Page,
+): Promise<{ session?: CDPSession; error?: string }> {
+  try {
+    return { session: await context.newCDPSession(page) }
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * 这个视图的历史**到底**是什么：问引擎，问不到才退回账本（票 #18）。
+ *
+ * ## 为什么它存在
+ *
+ * 票 #18 的根因是"账本从来没记下**领养时视图已经在的那一页**"：`ObservedHistory` 只在
+ * `framenavigated` 与 `reload()` 里记一笔，而领养那一刻视图**早就在某一页上了**。于是
+ * 用户在真实外壳里的序列（视图先在内置测试页 → 只导航一次）得到账本 `[12306]`、`back = 0`，
+ * 后退按钮被灰掉 —— 而引擎用**同一条 CDP 连接**答的是 `{currentIndex: 1, entryCount: 2}`：
+ * 明明有一格可以退。
+ *
+ * 所以权威改成引擎的 `Page.getNavigationHistory`。它不是"多记一笔"的补丁：那个答案天然包含
+ * 领养前就在的那一页、前进分支、以及**会话被重建**（切任务空间导致新的 targetId ⇒ 新会话）
+ * 之后的历史 —— 账本在最后那种情形下会永远说"没有历史"，而引擎每次都重新答。
+ *
+ * 账本没有删，是因为它还有一件事可做：**引擎答不上来时**（CDP 会话建不起来、或那台引擎不认
+ * 这个域）给一个可能低估的答案 —— 那时 {@link EngineHistoryReading.source} 会说 `observed`，
+ * 让"引擎说退不动"与"我们只是没看见"是两句不同的话。
+ *
+ * ## 缓存的是"最近一次读到的"，而不是"引擎现在一定还是这样"
+ *
+ * 每次刷新都与引擎对一次话（一次 CDP 往返，不是轮询），而**每一次判断之前都会重新读一次**
+ * （`browser_view` 的每个动作、面板的每次读回都读一遍）。所以一份过期的读数不会变成一次错的
+ * 判断：判断用的一定是刚读到的那一份。
+ */
+class HistoryReader {
+  /** 最近一次从引擎读到的历史；没读到过时缺席。 */
+  private cached: EngineHistoryReading | undefined
+
+  /** 上一次引擎答不上来时的原因；下一条把账本当读数的地方会把它带出去。 */
+  private lastEngineError: string | undefined
+
+  /**
+   * @param session - 这个视图那条 CDP 会话；建不起来时缺席（那就只剩账本）。
+   * @param ledger - 观察账本，兜底用。
+   */
+  constructor(
+    private readonly session: CDPSession | undefined,
+    private readonly ledger: ObservedHistory,
+  ) {}
+
+  /**
+   * 问一次引擎，并把它答的记下来。
+   *
+   * @returns 引擎答的历史，答不上来时 {@link read} 会退到账本。
+   */
+  async refresh(): Promise<void> {
+    if (this.session === undefined) {
+      this.lastEngineError = 'this session holds no CDP channel to the engine'
+      return
+    }
+    try {
+      const raw = await this.session.send('Page.getNavigationHistory')
+      const parsed = parseEngineHistory(raw)
+      if (parsed === undefined) {
+        this.lastEngineError = `Page.getNavigationHistory answered without a usable index and entry list: ${JSON.stringify(raw)}`
+        this.cached = undefined
+        return
+      }
+      this.cached = { ...parsed, source: 'engine' }
+      this.lastEngineError = undefined
+    } catch (error) {
+      // 读不到就**如实退到账本**，并把上一次那份读数丢掉：一份"曾经对过"的读数继续当权威，
+      // 就是拿一个可能过期的数去回答"现在能不能退"（票 #18 的教训正是读数与事实对不上）。
+      // 退到账本的代价是**可能低估**（按钮灰得多一点），而高估是让用户按一颗撒谎的按钮。
+      this.lastEngineError = error instanceof Error ? error.message : String(error)
+      this.cached = undefined
+    }
+  }
+
+  /**
+   * 现在这一份历史：引擎优先，账本次之。
+   *
+   * @returns 两个计数 + 它们是哪来的；引擎答不上来时带上引擎说的那句话。
+   */
+  read(): EngineHistoryReading {
+    if (this.cached !== undefined) return this.cached
+    const fromLedger = this.ledger.state()
+    return {
+      ...fromLedger,
+      source: 'observed',
+      ...(this.lastEngineError !== undefined ? { reason: this.lastEngineError } : {}),
+    }
+  }
+
+  /**
+   * 视图现在在这一页上。
+   *
+   * 引擎能答时**以引擎为准重读一次**：那是唯一一个分得清"走了一段新路"（前进分支要清掉）
+   * 与"后退了一步"（前进分支要冒出来）的地方，而 `framenavigated` 对这两件事报的是同一个事件。
+   * 引擎答不上来时才走账本那条老规矩（同地址去重、新地址清前进分支）。
+   *
+   * 它是异步的、且 `framenavigated` 那条路**不 await**（事件监听器不许把一个页面事件变成一次
+   * 等待）：晚一拍变新没有代价 —— 每一个判断之前都会再问一次引擎（{@link refreshHistory}）。
+   *
+   * @param url - 引擎报的新文档地址；**给 `undefined` 就只问引擎、账本一个字不记**。
+   *   只有"本会话自己发起的那一次"会这么调：自己发起的后退/前进不是"走了一段新路"，
+   *   而账本那条兜底路分不清这两件事 —— 它的老规矩正是"看到新文档就清掉前进分支"
+   *   （实测过后果：`back` 成功、`forward` 立刻说"没有可前进的一页"）。
+   */
+  async observe(url: string | undefined): Promise<void> {
+    await this.refresh()
+    if (this.cached !== undefined || url === undefined) return
+    this.ledger.observe(url)
+  }
+
+  /**
+   * 一次**自己发起**的导航落定之后。
+   *
+   * 引擎答不上来时要自己把这一步记进账本（那时才是账本的活儿）：`framenavigated` 那条路
+   * 被 `pendingTravel` 拦住了，它一个字都不会记。
+   *
+   * @param url - 动作之后视图的地址。
+   */
+  async recordTravel(url: string): Promise<void> {
+    await this.refresh()
+    if (this.cached !== undefined) return
+    this.ledger.observe(url)
+  }
+}
+
+/**
  * Find the page that corresponds to the requested view.
  *
  * Primary identity is the target id the shell published. The URL is a secondary
@@ -1247,10 +1405,20 @@ export class AdoptedViewSession {
    *
    * 记它的理由是"能不能后退"这个问题在本引擎上没有只读答案：Playwright 的
    * `goBack()` 是一个动作而不是一次查询，`history.length` 又跨源不可靠。所以面板上
-   * 那两颗按钮亮不亮由**观察到的历史**回答 —— 见 {@link ObservedHistory} 里那段
-   * "它可能低估、但不会撒谎"的说明。
+   * 那两颗按钮亮不亮由 {@link HistoryReader} 回答：**引擎的**历史优先，这份账本兜底 ——
+   * 见 {@link ObservedHistory} 里那段"它可能低估、但不会撒谎"的说明。
    */
   private readonly history = new ObservedHistory()
+
+  /**
+   * 这个视图**真实**的历史（票 #18）：引擎优先，账本兜底。
+   *
+   * 记它的理由是"能不能后退"这个问题在 Playwright 那一层没有只读答案（`goBack`/`goForward`
+   * 是动作而不是查询），但**引擎自己有**：`Page.getNavigationHistory` 就在同一条 CDP 连接上
+   * （`context.newCDPSession(page)` —— T1 用它读身份，这条连接早已存在，不是新通道）。
+   * 见 {@link HistoryReader} 里那段"票 #18 的根因"。
+   */
+  private readonly historyReader: HistoryReader
 
   /**
    * 谁来真的改这块视图的缩放，以及外壳上次读回来的那个数（T13）。
@@ -1320,8 +1488,15 @@ export class AdoptedViewSession {
      * 那表示"不知道"，而面板上显示 `100%` 与"没缩放过"在这个部署里是同一个状态。
      */
     zoom: number,
+    /**
+     * 这个视图**真实**的历史从哪读（票 #18）：拿在手里的那条 CDP 会话。
+     *
+     * 它缺席时（建不起来）会话只剩账本那条兜底路，{@link historyState} 会如实说 `observed`。
+     */
+    private readonly cdp: CDPSession | undefined,
   ) {
     this.currentZoom = zoom
+    this.historyReader = new HistoryReader(cdp, this.history)
     // A `ref` is an index into *this* document. When the view navigates on its own —
     // a link, a form submit, a redirect — the next element at that index is a
     // different element, and resolving the old index against it would act on
@@ -1343,12 +1518,14 @@ export class AdoptedViewSession {
     page.on('framenavigated', (frame) => {
       if (frame !== page.mainFrame()) return
       this.forgetPageObservations()
-      // 观察到的历史（T13）：一次导航等于"视图现在在这一页上"。地址相同的重复上报
-      // 由 {@link ObservedHistory.observe} 自己去重，所以这里不必再判一次。
+      // 历史（T13 / 票 #18）：一次导航等于"视图现在在这一页上"。交给 {@link HistoryReader}：
+      // 引擎答得上就以引擎为准**重读一次**（只有它分得清"走了一段新路"与"后退了一步"——
+      // 前者要清掉前进分支，后者要让它冒出来，而 `framenavigated` 对两件事报的是同一个事件）；
+      // 引擎答不上来才走账本那条老规矩（同地址由 {@link ObservedHistory.observe} 去重）。
       //
-      // 但**自己发起**的那一次要让路（见 {@link pendingTravel}）：后退/前进也会报这个事件，
-      // 而把它当成"走了一段新路"会清掉前进那一侧 —— 那正是"后退一次之后前进就没了"的成因。
-      if (this.pendingTravel === 0) this.history.observe(page.url())
+      // 不 await：这是页面事件，不许让一个事件变成一次等待。晚一拍变新没有代价 ——
+      // 每一个判断之前都会重新问一次引擎（见 {@link historyState} 与 {@link travel}）。
+      void this.observeNavigation(page.url())
       // The overlay lives in the document, so the next document needs its own. Two
       // mechanisms, both idempotent, because they cover different windows: the init
       // script gets the overlay in before the new document can paint anything, and this
@@ -1437,6 +1614,9 @@ export class AdoptedViewSession {
       if (probe.targetId === undefined) {
         throw new Error(`the adopted view's target id could not be read: ${probe.error}`)
       }
+      // 历史那条路（票 #18）：**同一条** CDP 连接上的一个会话，留在手里反复问
+      // `Page.getNavigationHistory`。不需要任何新通道 —— T1 读身份用的就是它。
+      const engine = await openEngineChannel(match.context, match.page)
       return new AdoptedViewSession(
         browser,
         match.context,
@@ -1453,6 +1633,7 @@ export class AdoptedViewSession {
         // 是同一件事的两半；少了口子，`zoomTo` 会如实说不能缩放。
         options.zoomPort,
         options.zoom ?? 1,
+        engine.session,
       )
     } catch (error) {
       // A failed adoption must not leave a dangling connection behind.
@@ -1497,20 +1678,54 @@ export class AdoptedViewSession {
   /**
    * 这个会话正在等一次**自己发起**的后退/前进。
    *
-   * 为什么需要它：`page.goBack()` 也会让主框架报一次 `framenavigated`，而那个监听器把
-   * "导航了"理解成"走了一段新路"（于是清掉前进那一侧）。两者对同一件事的解释不同，
-   * 结果就是**后退一次之后前进那一侧被自己抹掉**（实测：`back` 成功、`forward` 立刻说
-   * "没有可前进的一页"）。所以自己发起的那一次由 `travel` 记账，监听器让路。
+   * 它只剩一个用处：**账本那条兜底路**（引擎答不上来时）不许把"后退了一步"记成"走了一段新路"
+   * —— 后者会清掉前进那一侧，实测过它的后果（`back` 成功、`forward` 立刻说"没有可前进的一页"）。
+   * 引擎那条路上它没有意义：{@link HistoryReader} 读的是引擎自己的历史，而引擎本来就分得清
+   * 那两件事。
+   *
+   * 记账的入口是 {@link travel}（自己发起）与 `framenavigated`（别的来源），这里只说明为什么
+   * 前者要拦一下 {@link HistoryReader.observe}。
    */
   private pendingTravel = 0
 
   /**
-   * 视图自己观察到的历史：还能后退/前进几页（T13）。
+   * 一次导航上报的处理（`framenavigated` 与 `reload()` 都走它）。
    *
-   * @returns 两个计数，面板上的两颗按钮看它。
+   * 引擎答得上时它只是"以引擎为准重读一次"：引擎本来就分得清"走了一段新路"与"后退了一步"，
+   * 所以**自己发起的那一次不需要特殊对待**。引擎答不上来时它落到账本上，而那条规矩
+   * （自己发起的那一次让路）由调用方先拦住 —— 见 {@link pendingTravel}。
+   *
+   * @param url - 引擎报的新文档地址。
    */
-  historyState(): HistoryState {
-    return this.history.state()
+  private async observeNavigation(url: string): Promise<void> {
+    // 自己发起的那一次（`pendingTravel > 0`）在**引擎答不上来**时不许喂账本：那一步是后退/前进，
+    // 不是"走了一段新路"。引擎答得上时这条判断不生效（读数来自引擎，账本不参与）。
+    await this.historyReader.observe(this.pendingTravel > 0 ? undefined : url)
+  }
+
+  /**
+   * 重新问一次引擎（票 #18），并让账本跟着走。
+   *
+   * 每一个判断之前都调它：一张过期的读数会变成一次错的判断，而一次 CDP 往返换一句"这是引擎
+   * 刚说的"是划算的。
+   */
+  private async refreshHistory(): Promise<void> {
+    await this.historyReader.observe(this.page.url())
+  }
+
+  /**
+   * 这个视图的历史：还能后退/前进几页，**以及这份数是从哪来的**（T13 / 票 #18）。
+   *
+   * 它是异步的，因为它每次都**真的去问一次引擎**，而不是读一个可能过期的缓存：票 #18 的
+   * 全部教训就是"面板上/工具里那个数必须来自一次真的读回"。引擎答不上来时退到账本，
+   * 读数里的 `source` 会说 `observed`、`reason` 会带上引擎说的那句话。
+   *
+   * @returns 两个计数 + 来源，面板上的两颗按钮与 `browser_view` 的 `canGoBack` 都看它。
+   */
+  async historyState(): Promise<EngineHistoryReading> {
+    if (this.closed) return this.historyReader.read()
+    await this.refreshHistory()
+    return this.historyReader.read()
   }
 
   /**
@@ -1547,8 +1762,13 @@ export class AdoptedViewSession {
     const mark = this.activityMark()
     try {
       await this.page.reload({ waitUntil: 'load', timeout: this.timeoutMs })
-      this.history.observe(this.page.url())
-      return { url: this.page.url(), title: await this.titleQuietly(), moved: true, history: this.history.state() }
+      await this.observeNavigation(this.page.url())
+      return {
+        url: this.page.url(),
+        title: await this.titleQuietly(),
+        moved: true,
+        history: await this.historyState(),
+      }
     } catch (error) {
       const guarded = this.activitySince(mark).dialogs.find((record) => record.type === 'beforeunload') !== undefined
       const classified = classifyNavigationFailure(error, guarded)
@@ -1557,14 +1777,31 @@ export class AdoptedViewSession {
         title: await this.titleQuietly(),
         moved: false,
         reason: classified.reason,
-        message: this.navigationFailureMessage('reload', classified.reason, error),
-        history: this.history.state(),
+        message: await this.navigationFailureMessage('reload', classified.reason, error),
+        history: await this.historyState(),
       }
     }
   }
 
   /**
    * 后退或前进的共同实现。
+   *
+   * ## 票 #18：先问引擎，再动手 —— 判断与动作必须是同一份事实
+   *
+   * 这张脸的旧写法是"引擎先真的退一步，再看账本 `move()` 成不成"，而账本可能压根不知道有
+   * 那一格（领养时视图已经在的那一页从来没进过账本）。于是**页面真的动了，模型却被告知没动**
+   * —— 工具报 `moved: false` / `no-history`，而那一步已经走掉了。
+   *
+   * 现在反过来：动手之前先问一次引擎（`Page.getNavigationHistory`）。**引擎说**没有那一格就
+   * **不碰页面**，如实报 `no-history`；引擎说有（或者引擎答不上来 —— 见下）就动作，而 `moved`
+   * 是**页面自己说的**（地址真的变了没有），不是账本推断的。两句话因此不可能再打架：
+   *
+   * - 引擎答"没有" ⇒ 页面一动不动 + `moved: false`，两者一致；
+   * - 引擎答"有" ⇒ 动作 + `moved: true`，两者一致；
+   * - **引擎答不上来**（`source: 'observed'`）⇒ 照样动作，让引擎自己去试。这一条是要害：
+   *   账本说"没有"时**不许**因此拒绝动手 —— 那正是票 #18 的第二张脸（账本说没有、引擎其实能退，
+   *   于是页面动了而模型被告知没动）。引擎这条路上"能不能"由动作本身回答：`goBack()` 在没有
+   *   那一页时返回 `null` 且地址不变，那才是"真的没有"。
    *
    * @param direction - 往哪边走。
    * @returns 与 {@link goBack} 同一形状。
@@ -1574,52 +1811,48 @@ export class AdoptedViewSession {
     void this.forgetRefs()
     const mark = this.activityMark()
     const before = this.page.url()
-    // 自己发起的这一次由这里记账，`framenavigated` 那个监听器让路（见 `pendingTravel`）。
+    // 自己发起的那一次：`framenavigated` 那条账本路让路（见 `pendingTravel`），
+    // 落定之后由下面那句 `historyReader.recordTravel` 记账。
     this.pendingTravel += 1
     try {
-      const response = direction === 'back' ? await this.page.goBack({ timeout: this.timeoutMs }) : await this.page.goForward({ timeout: this.timeoutMs })
-      // `goBack`/`goForward` 在**没有那一页**时返回 `null` 而**不抛**：这是本引擎上唯一
-      // 一个"没有历史"的正面信号，也是最该被抓住的那一个（抛错那条只在别的引擎上出现）。
-      if (response === null && this.page.url() === before) {
+      // 动手之前那一次读数：它是"有没有那一格"的唯一依据，也是 `no-history` 那句话写什么
+      // 的依据（`source` 为 `observed` 时那句话必须说清"我们读到的是账本"，而不是断言引擎）。
+      const reading = await this.historyState()
+      const available = direction === 'back' ? reading.back > 0 : reading.forward > 0
+      if (!available && reading.source === 'engine') {
         return {
-          url: this.page.url(),
+          url: before,
           title: await this.titleQuietly(),
           moved: false,
           reason: 'no-history',
-          message:
-            `browser-view: there is no page to go ${direction} to — the view stayed at ${before}. ` +
-            `The view had no ${direction} history entry when this action ran (a view that was just opened, ` +
-            `or one whose forward branch was dropped by navigating somewhere new). Use browser_navigate to ` +
-            'open a page, or browser_view action "state" to see how much history this session has observed.',
-          history: this.history.state(),
+          message: this.noHistoryMessage(direction, before, reading),
+          history: reading,
         }
       }
-      // 只有真的挪动了才记账：`move` 说挪不动时账本不动（那正是"没有那一页"的诚实样子）。
-      if (this.history.move(direction === 'back' ? -1 : 1)) {
-        return { url: this.page.url(), title: await this.titleQuietly(), moved: true, history: this.history.state() }
-      }
+      const response = direction === 'back' ? await this.page.goBack({ timeout: this.timeoutMs }) : await this.page.goForward({ timeout: this.timeoutMs })
+      const after = this.page.url()
+      const moved = response !== null || after !== before
+      await this.historyReader.recordTravel(after)
+      const settled = this.historyReader.read()
       return {
-        url: this.page.url(),
+        url: after,
         title: await this.titleQuietly(),
-        moved: false,
-        reason: 'no-history',
-        message:
-          `browser-view: there is no page to go ${direction} to — the view stayed at ${before}. ` +
-          `The view had no ${direction} history entry when this action ran (a view that was just opened, ` +
-          `or one whose forward branch was dropped by navigating somewhere new). Use browser_navigate to ` +
-          'open a page, or browser_view action "state" to see how much history this session has observed.',
-        history: this.history.state(),
+        moved,
+        ...(moved ? {} : { reason: 'no-history' as const, message: this.noHistoryMessage(direction, before, settled) }),
+        history: settled,
       }
     } catch (error) {
       const guarded = this.activitySince(mark).dialogs.find((record) => record.type === 'beforeunload') !== undefined
       const classified = classifyNavigationFailure(error, guarded)
+      // "没有那一页"那句话要用**刚读到**的那一份，所以先刷新再写：一次失败的导航之后立刻
+      // 报一份旧读数，正好会复现票 #18 那种"说的与做的不一致"。
       return {
         url: this.page.url(),
         title: await this.titleQuietly(),
         moved: false,
         reason: classified.reason,
-        message: this.navigationFailureMessage(direction, classified.reason, error),
-        history: this.history.state(),
+        message: await this.navigationFailureMessage(direction, classified.reason, error),
+        history: this.historyReader.read(),
       }
     } finally {
       // 自己发起的那一次结束了：`framenavigated` 重新开始记账。
@@ -1627,15 +1860,52 @@ export class AdoptedViewSession {
     }
   }
 
+  /**
+   * "没有那一页"那句话（T13 / 票 #18）。
+   *
+   * 它必须分得清两种情形，因为补救不同 —— 而把两者说成一句正是票 #18 的成因：
+   * 引擎答"退不动"时那是一句事实；只有账本可读时那只是**没看见**，用户按一次真的后退
+   * 说不定就成了（旧写法在这里让模型去查一件不存在的事）。
+   *
+   * @param direction - 走哪个方向。
+   * @param where - 视图现在在哪。
+   * @param reading - 判断用的那份读数（含它从哪来）。
+   * @returns 那句人话。
+   */
+  private noHistoryMessage(direction: 'back' | 'forward', where: string, reading: EngineHistoryReading): string {
+    if (reading.source === 'engine') {
+      return (
+        `browser-view: there is no page to go ${direction} to — the view stayed at ${where}. The engine's own ` +
+        `navigation history says so (currentIndex ${reading.back}, ${reading.back + reading.forward + 1} entries), ` +
+        `so this is a fact about the view, not a guess. Use browser_navigate to open a page first.`
+      )
+    }
+    return (
+      `browser-view: no page to go ${direction} to could be found — the view stayed at ${where}. This is **not** a ` +
+      `statement about the view: the engine could not be asked for its navigation history ` +
+      `(${reading.reason ?? 'no reason reported'}), so all this session has is the history it watched itself, and ` +
+      `that ledger does not contain a page to go ${direction} to. A page the view was already on before this ` +
+      'session adopted it is not in that ledger. Try the action anyway, or use browser_navigate.'
+    )
+  }
+
   /** 失败那句话：分类 + 引擎原文 + 补救。分类是**值**，所以调用方不必解析这段散文。 */
-  private navigationFailureMessage(action: string, reason: NavigationFailureReason, error: unknown): string {
+  private async navigationFailureMessage(
+    action: string,
+    reason: NavigationFailureReason,
+    error: unknown,
+  ): Promise<string> {
     const raw = firstLine(error instanceof Error ? error.message : String(error))
     const where = this.page.url()
     if (reason === 'page-refused') return this.pageGuardMessage(where)
     if (reason === 'no-history') {
+      // 走这条路说明**引擎真的抛了**"没有那一页"（`goBack` 在别的引擎上抛，本引擎返回
+      // `null`），所以那句话以引擎的原话为准；状态先刷新一次，好让紧随其后的那份读数是刚读到的。
+      await this.refreshHistory()
       return (
-        `browser-view: there is no page to go ${action} to — the view stayed at ${where}. The engine said: ${raw}. ` +
-        `The view had no ${action} history entry when this action ran. Use browser_navigate to open a page.`
+        `browser-view: there is no page to go ${action} to — the view stayed at ${where}. The engine itself said: ` +
+        `${raw}. This is a fact about the view, not a guess (see its own navigation history). ` +
+        'Use browser_navigate to open a page first.'
       )
     }
     if (reason === 'timeout') {
@@ -1684,6 +1954,9 @@ export class AdoptedViewSession {
     } catch {
       // 页面正在换文档时读不到：如实缺席，面板那边显示"读不到"比显示一个旧值好。
     }
+    // 历史读一次、用两处：面板上的两颗按钮与"这份数是从哪来的"必须描述同一个瞬间
+    // （票 #18 加的那个来源字段说的就是这份读数的来源，分成两次读就会自相矛盾）。
+    const reading = await this.historyState()
     return {
       url: this.page.url(),
       title: await this.titleQuietly(),
@@ -1691,7 +1964,8 @@ export class AdoptedViewSession {
       ...(devicePixelRatio !== undefined ? { devicePixelRatio } : {}),
       ...(innerWidth !== undefined ? { innerWidth } : {}),
       ...(innerHeight !== undefined ? { innerHeight } : {}),
-      history: this.history.state(),
+      history: { back: reading.back, forward: reading.forward },
+      historySource: reading.source,
       ...(this.initialUrl !== undefined && this.initialUrl !== '' ? { initialUrl: this.initialUrl } : {}),
     }
   }

@@ -546,18 +546,33 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
     // 地址是**视图自己**说的，不是我们请求的那个字符串。
     expect(viewUrl()).toBe(shell.handshake.viewUrl)
     expect(facts.innerWidth, 'restart must also drop the zoom').toBe(620)
-    // 历史也清成"只有这一页"。
-    expect(session.historyState()).toEqual({ back: 0, forward: 0 })
+    // 历史是**引擎自己的**（票 #18）：重新开始那一次导航会占掉一个**新的**历史条目，
+    // 所以两边各有几格由引擎说了算（它以前走过的那一段也算数）。这里钉住的是"这个数
+    // 来自引擎、而且自洽"，不是某个写死的数 —— 写死一个数就等于把票 #18 那个假设抄回来。
+    const state = await session.historyState()
+    console.log("RAW the engine's history right after a restart: " + JSON.stringify(state))
+    expect(state.source).toBe('engine')
+    // 重新开始落在初始页上，而那一步是**刚刚**走的：前进侧不可能有东西。
+    expect(state.forward).toBe(0)
+    expect(Number.isInteger(state.back)).toBe(true)
+    expect(state.back).toBeGreaterThanOrEqual(0)
   }, 180_000)
 
-  it('没有可后退的历史时，会话如实说"不能后退"，而不是假装能', async () => {
+  it('重新开始之后"历史"这个数仍然来自引擎，而且它说能退就真的能退', async () => {
     await session.restart()
-    const state = session.historyState()
-    console.log('RAW observed history right after a restart: ' + JSON.stringify(state))
-    expect(state.back).toBe(0)
-    expect(state.forward).toBe(0)
+    const afterRestart = await session.historyState()
+    console.log("RAW the engine's history right after a restart: " + JSON.stringify(afterRestart))
+    expect(afterRestart.source).toBe('engine')
+    expect(afterRestart.forward).toBe(0)
+    // 走一段新路：引擎里必然多一格可以退。
     await session.goto(`${origin}/two`)
-    console.log('RAW observed history after one navigation: ' + JSON.stringify(session.historyState()))
-    expect(session.historyState().back).toBeGreaterThan(0)
+    const afterNavigation = await session.historyState()
+    console.log("RAW the engine's history after one navigation: " + JSON.stringify(afterNavigation))
+    expect(afterNavigation.back).toBeGreaterThan(0)
+    // 而它说的"能退"真的能退 —— 读数与动作是同一份事实（票 #18 的第二张脸）。
+    const beforeBack = viewUrl()
+    const moved = await session.goBack()
+    expect(moved.moved).toBe(true)
+    expect(viewUrl()).not.toBe(beforeBack)
   }, 120_000)
 })
