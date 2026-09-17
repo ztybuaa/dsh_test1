@@ -230,6 +230,17 @@ function usage() {
     '                           `cause` is what asked for the placement (panel-report,',
     '                           panel-none, window-resize, navigation, initial-bounds);',
     '                           `reason` is why the decision came out that way.',
+    '',
+    'Fit-to-pane (ticket #19): the shell fits the page to the pane it was given, by reading the',
+    "page's own documentElement.scrollWidth/clientWidth and calling setZoomFactor. It only moves",
+    'when the page really overflows, never zooms past 100%, and stands down once a zoom is asked',
+    'for by name (the toolbar reads `auto` / `manual` back from the shell). Each round that',
+    'actually changes the zoom prints one line, and so does a refusal:',
+    '  DSH_SHELL FIT {"space":"default","cause":"trailing","ms":36,"changed":2,"steps":[…]}',
+    '                           The latest reading (zoom, who is in charge, how many rounds ran)',
+    '                           is also written to <spaceChannel.dir>/zoom.json — a few hundred',
+    '                           bytes, refreshed on every change, because publishing the whole',
+    '                           space table takes ~0.9s and a drag cannot wait for that.',
   ].join('\n')
 }
 

@@ -69,6 +69,25 @@ const STATE_FILE_NAME = 'state.json'
 const DOWNLOAD_JOURNAL_FILE_NAME = 'downloads.json'
 
 /**
+ * 外壳写的**最新缩放读数**（票 #19 的自动适配）。
+ *
+ * 为什么它必须是一个单独的小文件，而不是只写进 `state.json`：`state.json` 是**整张空间表**，
+ * 发一版要列 CDP 目标、逐空间问 `cookies.get({})` —— 实测那一版要 ~0.9 秒（ADR-0013 的诚实清单，
+ * 本票又量了一次）。而自动适配会在**拖动侧边栏的每一帧**里改缩放，面板上那个读数
+ * （"自动 78%"）必须跟着走。把写一版整表的代价压在一次拖动上，等于让这个功能自己把自己拖死。
+ *
+ * 所以分成两件事，**方向与目录都与 `state.json` 相同**（外壳写、插件读）：
+ *   - `state.json`：那张**表**（有哪些空间、各自在哪、缩放多少），按请求与启动发布；
+ *   - `zoom.json`：**最新的一次缩放读数**（每块视图现在缩放多少、谁在管、适配跑了几轮），
+ *     每次缩放/模式/适配变化时立刻写一次（几百字节，无轮询、无列举）。
+ *
+ * 两个文件里的 `zoom` 都是**读回来的** `getZoomFactor()`，所以它们不会互相矛盾 ——
+ * `state.json` 那个只是可能更旧。插件优先读 `zoom.json`，读不到就退回表里那个值
+ * （旧外壳不写这个文件）。
+ */
+const ZOOM_FILE_NAME = 'zoom.json'
+
+/**
  * "这些 partition 的目录下次启动要删掉"。
  *
  * 关闭空间时**删不掉目录**（Windows 文件锁，实测见 docs/research/task-space-isolation.md 第 4 节），
@@ -141,7 +160,7 @@ function spaceStoragePath(userDataDir, name) {
  * "这次运行的状态"和"上次运行的状态"有机会对不上。
  *
  * @param {string} userDataDir - 外壳的档案目录。
- * @returns {{dir: string, requestFile: string, stateFile: string, downloadJournalFile: string, pendingDeletionFile: string, protocol: number}} 通道事实。
+ * @returns {{dir: string, requestFile: string, stateFile: string, downloadJournalFile: string, zoomFile: string, pendingDeletionFile: string, protocol: number}} 通道事实。
  */
 function spaceChannel(userDataDir) {
   const dir = path.join(userDataDir, SPACES_DIR_NAME)
@@ -150,6 +169,7 @@ function spaceChannel(userDataDir) {
     requestFile: path.join(dir, REQUEST_FILE_NAME),
     stateFile: path.join(dir, STATE_FILE_NAME),
     downloadJournalFile: path.join(dir, DOWNLOAD_JOURNAL_FILE_NAME),
+    zoomFile: path.join(dir, ZOOM_FILE_NAME),
     pendingDeletionFile: path.join(dir, PENDING_DELETION_FILE_NAME),
     protocol: SPACE_PROTOCOL,
   }
@@ -161,13 +181,22 @@ function spaceChannel(userDataDir) {
  * 拒绝的理由都写清楚，因为这条消息会一路走到模型面前：含糊的"请求非法"没法修，
  * "空间名 `Task 1` 不合法：只允许小写字母、数字与连字符"能。
  *
- * 每一项可以只是一个名字，也可以带上这块视图期望的**缩放**（`{name, zoom}`，票 #13）。
+ * 每一项可以只是一个名字，也可以带上这块视图期望的**缩放**（`{name, zoom}`，票 #13）、
+ * 以及**谁来管这次缩放**（`{name, mode}`，票 #19 的自动适配）：
+ *
+ *   - `{name, zoom: 0.9}`            —— 把缩放设成 0.9，并且**从此由人管**（manual）；
+ *   - `{name, mode: 'auto'}`         —— 把这一格交回自动适配（缩放开到 100% 之后再按栏宽适配）；
+ *   - `{name, zoom: 1, mode: 'auto'}`—— 两件事一起（本仓库没有调用方这么做，但形状允许）。
+ *
+ * `mode` 缺省是 `manual`：一个**指名要某个缩放值**的请求，语义上就是"这个值我说了算"，
+ * 而旧插件（不认识 `mode`）发的正是这一种 —— 于是缺省值让新旧两侧的行为完全一致。
+ *
  * 缩放只校验**形状**（有限正数）：合法范围是插件那边的策略（`src/navigation.ts` 的
  * `ZOOM_MIN`–`ZOOM_MAX`），在这里再写一份迟早会与它不一致 —— 与空间名的方向相反，
  * 名字的形状权威在外壳（它拿名字去建目录），缩放的权威在插件。
  *
  * @param {unknown} raw - 从 `request.json` 解析出来的东西。
- * @returns {{ok: true, request: {id: number, active: string, spaces: string[], zooms: Array<{name: string, zoom: number}>}} | {ok: false, error: string}} 归一化结果。
+ * @returns {{ok: true, request: {id: number, active: string, spaces: string[], zooms: Array<{name: string, zoom?: number, mode: 'auto'|'manual'}>}} | {ok: false, error: string}} 归一化结果。
  */
 function parseRequest(raw) {
   if (raw === null || typeof raw !== 'object') return { ok: false, error: 'the request is not a JSON object' }
@@ -189,8 +218,19 @@ function parseRequest(raw) {
     if (names.includes(name)) return { ok: false, error: `the space "${name}" is listed twice` }
     names.push(name)
     const wanted = typeof candidate === 'string' ? undefined : candidate?.zoom
-    if (wanted === undefined || wanted === null) continue
-    if (typeof wanted !== 'number' || !Number.isFinite(wanted) || wanted <= 0) {
+    const askedMode = typeof candidate === 'string' ? undefined : candidate?.mode
+    if (askedMode !== undefined && askedMode !== null && askedMode !== 'auto' && askedMode !== 'manual') {
+      return {
+        ok: false,
+        error:
+          `the zoom mode for the space "${name}" must be "auto" or "manual", got ${JSON.stringify(askedMode)}. ` +
+          '"auto" means the shell fits the page to the pane; anything else is the plugin\'s business, not this channel\'s',
+      }
+    }
+    const hasZoom = wanted !== undefined && wanted !== null
+    const hasMode = askedMode === 'auto' || askedMode === 'manual'
+    if (!hasZoom && !hasMode) continue
+    if (hasZoom && (typeof wanted !== 'number' || !Number.isFinite(wanted) || wanted <= 0)) {
       return {
         ok: false,
         error:
@@ -198,7 +238,7 @@ function parseRequest(raw) {
           'The range a person may pick (0.25-5) is the plugin\'s policy, not this channel\'s',
       }
     }
-    zooms.push({ name, zoom: wanted })
+    zooms.push({ name, ...(hasZoom ? { zoom: wanted } : {}), mode: hasMode ? askedMode : 'manual' })
   }
   // 默认空间一直在：一条把它丢掉的请求不是"关闭默认空间"，是插件算错了，所以拒绝而不是照做。
   if (!names.includes(DEFAULT_SPACE)) {
@@ -288,6 +328,7 @@ module.exports = {
   SPACE_PROTOCOL,
   SPACES_DIR_NAME,
   STATE_FILE_NAME,
+  ZOOM_FILE_NAME,
   isValidSpaceName,
   mergeTargetIds,
   parseRequest,

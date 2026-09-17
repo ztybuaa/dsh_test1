@@ -397,6 +397,8 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
 
   it('票 #13：请求里那块视图可以带上 zoom；只有**被改动的那一个**带，形状不对的拒绝', () => {
     // 一项可以只是名字，也可以是 `{name, zoom}`；归一化之后 zoom 单独成一张表。
+    // 票 #19 起那一项还带**谁管这个缩放**（`mode`）：一个指名要某个值的请求，缺省就是
+    // `manual`（"这个值我说了算"）—— 旧插件不认识这个字段，于是它的行为与从前一模一样。
     const named = shellSpaces.parseRequest({
       id: 9,
       active: 'default',
@@ -406,7 +408,30 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     expect(named.ok).toBe(true)
     if (!named.ok) return
     expect(named.request.spaces).toEqual(['default', 'task-1'])
-    expect(named.request.zooms).toEqual([{ name: 'task-1', zoom: 0.5 }])
+    expect(named.request.zooms).toEqual([{ name: 'task-1', zoom: 0.5, mode: 'manual' }])
+
+    // 票 #19：「把这一格交回自动适配」是一件**没有缩放值**的事（那个值由外壳按栏宽算），
+    // 所以带 `mode: 'auto'` 的那一项可以不带 `zoom`。两样一起给也可以（形状允许）。
+    const auto = shellSpaces.parseRequest({ id: 12, active: 'default', spaces: ['default', { name: 'task-1', mode: 'auto' }] })
+    console.log('RAW parseRequest handing the pane back to auto: ' + JSON.stringify(auto))
+    expect(auto.ok).toBe(true)
+    if (auto.ok) expect(auto.request.zooms).toEqual([{ name: 'task-1', mode: 'auto' }])
+    const both = shellSpaces.parseRequest({
+      id: 13,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', zoom: 1, mode: 'auto' }],
+    })
+    expect(both.ok).toBe(true)
+    if (both.ok) expect(both.request.zooms).toEqual([{ name: 'task-1', zoom: 1, mode: 'auto' }])
+    // 认不出的 mode 一律拒绝（一个"悄悄当成 manual"的实现会让面板上那颗「自动」变成撒谎的按钮）。
+    const badMode = shellSpaces.parseRequest({
+      id: 14,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', mode: 'Auto' }],
+    })
+    console.log('RAW parseRequest with a bad mode: ' + JSON.stringify(badMode))
+    expect(badMode.ok).toBe(false)
+    if (!badMode.ok) expect(badMode.error).toContain('"auto" or "manual"')
 
     // 形状不对的拒绝：0、负数、NaN、字符串都过不去，理由说得清它是什么。
     for (const bad of [0, -1, Number.NaN, '0.5']) {
@@ -451,10 +476,17 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     const planned = planZoom(state, 'default', 0.5)
     console.log('RAW planZoom: ' + JSON.stringify(planned))
     if ('error' in planned) throw new Error(planned.error)
-    // id 单调加一、当前空间不动、**只有** default 带上 zoom —— 其余原样是名字。
+    // id 单调加一、当前空间不动、**只有** default 带上 zoom 与 mode —— 其余原样是名字。
     expect(planned.request.id).toBe(5)
     expect(planned.request.active).toBe('task-1')
-    expect(planned.request.spaces).toEqual([{ name: 'default', zoom: 0.5 }, 'task-1'])
+    expect(planned.request.spaces).toEqual([{ name: 'default', zoom: 0.5, mode: 'manual' }, 'task-1'])
+    // 票 #19：交回自动是一个**没有缩放值**的请求（那个值由外壳按栏宽算），
+    // 所以那一项只有 `mode` —— 而它照旧只挂在被指名的那个空间上。
+    const automatic = planZoom(state, 'default', undefined, 'auto')
+    console.log('RAW planZoom 交回自动: ' + JSON.stringify(automatic))
+    if ('error' in automatic) throw new Error(automatic.error)
+    expect(automatic.request.spaces).toEqual([{ name: 'default', mode: 'auto' }, 'task-1'])
+    expect(automatic.request.id).toBe(5)
 
     // 不认识的空间：说得清有哪几个。
     const refused = planZoom(state, 'ghost', 0.5)

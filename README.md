@@ -152,6 +152,39 @@ DSH_SHELL VIEW {"cause":"panel-none","visible":false,"bounds":null,"appliedVisib
 `view.getVisible()` 读回来的实际可见性 —— 三者一致才叫"那一格真的就是这个浏览器"。
 `--placement-file <file>` 可以把最新一次摆放镜像到 JSON 文件里,方便脚本化观察。
 
+### 栏宽一变,整页自己进来(T19):自动适配
+
+把侧边栏拖窄时,那一格里的页面**自己缩放到刚好塞得下** —— 不用按 `−`。参考行为是 Codex 的
+浏览器面板。规则只有一条,**只在页面真的有横向溢出时才动手**:
+
+- 固定宽度排版的页面(统计年鉴、文库那类 1200px 的文档站):缩到"内容宽度 == 布局视口",整页可见;
+- **响应式页面一步都不动**(它的宽度跟着视口走,从来没有溢出)—— 这是这条规则里最要紧的一半;
+- 栏拖宽回去时,它按同一条规则**回到 100%**;
+- **手动优先**:你按过 `−` / `100%` / `+` 之后,自动适配**让位**,拖栏宽不会改掉你调好的值;
+- 工具条右边那个读数说清现在是哪种模式:**`自动 78%`** 或 **`手动 90%`**;
+- 工具条上那颗 **`auto`** 把这一格**交回自动适配**(手动模式唯一的出路 —— 换页不丢缩放是
+  #13 定下的语义,所以回到自动必须是一个说得出口的动作)。
+
+它由**外壳**做(插件那条路一次要 ~1 秒,而拖动侧边栏时那等于废掉,实测两个数量级:
+`tests/panel-toolbar.spec.ts` 的 `coldMs/warmMs` 与 `tests/fit-to-pane.spec.ts` 的
+`RAW 跟手延迟`)。两件对外可见的事:
+
+```
+DSH_SHELL FIT {"space":"default","cause":"trailing","ms":36,"changed":2,"steps":[…]}
+```
+
+只在**真的改了缩放**、或判定"这一页的溢出缩放治不了"时打一行;
+`<userDataDir>\spaces\zoom.json` 是**最新的一份缩放读数**(每块视图缩放多少、谁在管、
+适配跑了几轮改了几次),面板上那个数读的就是它 —— 与 `state.json` 同方向、同目录。
+
+内置夹具里因此多了三张页面(都用 `npm run shell:fixture` 起,视图地址分别填
+`/fixed-width`、`/fluid`、`/unfixable`):一张 1200px 的固定宽度页、一张响应式页、
+一张"任何缩放都塞不下"的页(它的正确行为是**不被缩放**,见 ADR-0014)。
+
+取舍、三处与票面建议不同的地方、以及每一条的实测数字:
+[`docs/adr/0014-fit-to-pane-is-the-shells-job.md`](docs/adr/0014-fit-to-pane-is-the-shells-job.md)、
+[`docs/research/t19-fit-to-pane-measured.md`](docs/research/t19-fit-to-pane-measured.md)。
+
 `--dsh` 时,同一份身份还会通过子进程环境变量交给载体无关的 DSH 进程:
 
 | 变量 | 含义 |

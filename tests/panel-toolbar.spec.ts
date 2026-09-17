@@ -268,6 +268,17 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
     const factsReset = await pageFacts()
     expect(Number(factsReset.innerWidth)).toBe(Number(factsBefore.innerWidth))
     expect(Math.abs((await viewDpr()) - before)).toBeLessThan(0.02)
+
+    // 票 #19：那颗「自动」按钮走的就是这条通道（`desktop-view-auto`）。
+    // 夹具页是响应式的（没有横向溢出），所以适配"跑了但一步都不动" —— 结果是 100% + `auto`。
+    const handedBack = await callPanelChannel('auto', { cookie })
+    const valueAuto = valueOf(handedBack, 'auto')
+    console.log('RAW 「自动」 over the panel channel: ' + JSON.stringify(valueAuto))
+    expect(handedBack.status).toBe(200)
+    expect(valueAuto.ok).toBe(true)
+    expect(valueAuto.zoomMode, 'the answer must say who is in charge of the zoom now').toBe('auto')
+    expect(Number(valueAuto.zoom)).toBe(1)
+    expect(String(valueAuto.message)).toContain('automatic fitting')
   }, 180_000)
 
   it('后退 / 前进 / 刷新：地址由**视图自己**读回，不是回答里那个字段', async () => {

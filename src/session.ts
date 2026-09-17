@@ -40,6 +40,7 @@ import {
 } from './overlay.ts'
 import {
   ObservedHistory,
+  ZOOM_RESET,
   classifyNavigationFailure,
   normalizeZoom,
   parseEngineHistory,
@@ -48,6 +49,7 @@ import {
   type HistorySource,
   type HistoryState,
   type NavigationFailureReason,
+  type ZoomMode,
 } from './navigation.ts'
 
 /**
@@ -125,9 +127,34 @@ export interface ViewZoomPort {
    * 把这块视图的缩放设成 `zoom`。
    *
    * @param zoom - 目标缩放值（调用方已经用 `normalizeZoom` 校验过范围）。
+   * @param mode - 谁管这个缩放（票 #19，缺省 `manual`）：指名一个值 = 这个值我说了算，
+   *   于是外壳的自动适配从此让位。
    * @returns **外壳读回来**的实际缩放值（`getZoomFactor()`），不是请求里的那个数。
    */
-  setZoom(zoom: number): Promise<number>
+  setZoom(zoom: number, mode?: ZoomMode): Promise<number>
+  /**
+   * 请外壳把这一格交回**自动适配**（票 #19）。
+   *
+   * 与 `setZoom` 分开，是因为这件事**没有缩放值可给**：那个值由外壳按栏宽算。缺席 = 这个
+   * 调用方（测试造的假口子、没有外壳的部署）没有这条路，`useAutoZoom` 会像 `zoomTo`
+   * 一样如实说"没有外壳可问"，而不是假装交回去了。
+   *
+   * @returns **外壳读回来**的实际缩放值 —— 而且是**适配跑完之后**的那个数。
+   */
+  useAutoZoom?(): Promise<number>
+  /**
+   * 这个空间**现在**缩放多少、谁在管（票 #19）。
+   *
+   * 为什么这道口子上必须有它：自动适配会在**没人请求**的时候改缩放（外壳按栏宽自己算），
+   * 所以会话手里记的那个数会过期。面板上那个读数（"自动 78%" / "手动 90%"）与工具回答的
+   * "现在是多少"都从这里读，而不是从会话的记忆里读。
+   *
+   * 缺席 = 这个调用方不提供这条读回；那时会话退回自己记的那个值，并且**不声称**任何模式 ——
+   * "不知道谁在管"与"自动在管"是两句不同的话。
+   *
+   * @returns 外壳读回来的读数，或 undefined（读不到）。
+   */
+  reading?(): Promise<{ zoom: number; mode: ZoomMode } | undefined>
 }
 
 /** Outcome of a navigation: the address actually reached, and its title. */
@@ -205,6 +232,13 @@ export interface ViewDisplayState {
   title: string
   /** 外壳读回来的缩放值（1 = 100%），见 {@link AdoptedViewSession.zoomLevel}。 */
   zoom: number
+  /**
+   * 那个缩放**归谁管**（票 #19）：`auto` = 外壳按栏宽自动适配，`manual` = 人（或工具）指名的。
+   *
+   * 缺席 = 读不到（没有外壳、旧外壳不发布这个字段）：面板那时只显示百分比，
+   * **不**编一个模式 —— "不知道谁在管"与"自动在管"是两句不同的话。
+   */
+  zoomMode?: ZoomMode
   /** 页面自己读到的 `devicePixelRatio`；页面正在换文档时缺席。 */
   devicePixelRatio?: number
   /** 页面自己读到的视口宽度（CSS 像素）；同上。 */
@@ -1957,10 +1991,15 @@ export class AdoptedViewSession {
     // 历史读一次、用两处：面板上的两颗按钮与"这份数是从哪来的"必须描述同一个瞬间
     // （票 #18 加的那个来源字段说的就是这份读数的来源，分成两次读就会自相矛盾）。
     const reading = await this.historyState()
+    // 缩放（票 #19）**当场读回来**，不是报会话记的那个数：自动适配会在没人请求的时候改它，
+    // 而这份读数的用途正是让人看见"现在是多少、谁在管"。读不到就退回会话记的值，
+    // 并且**不声称**任何模式（`zoomMode` 缺席）—— "不知道谁在管"不该被渲染成"自动在管"。
+    const fresh = await this.readZoomQuietly()
     return {
       url: this.page.url(),
       title: await this.titleQuietly(),
-      zoom: this.currentZoom,
+      zoom: fresh?.zoom ?? this.currentZoom,
+      ...(fresh !== undefined ? { zoomMode: fresh.mode } : {}),
       ...(devicePixelRatio !== undefined ? { devicePixelRatio } : {}),
       ...(innerWidth !== undefined ? { innerWidth } : {}),
       ...(innerHeight !== undefined ? { innerHeight } : {}),
@@ -1971,14 +2010,46 @@ export class AdoptedViewSession {
   }
 
   /**
-   * 现在的缩放值（1 = 没有缩放）。它是**会话记的**，不是页面读的。
+   * 现在是多少（1 = 没有缩放）。它是**会话记的**那个数。
    *
-   * 为什么不读页面：`window.devicePixelRatio` 在缩放前后都会变（我们按 zoom 拨它），
-   * 但它同时也受显示器与系统缩放影响（本机基线是 1.5），所以它证明不了"我们缩放了没有"。
-   * 真正被拨动的是**模拟视口**，而那个值由我们自己写、由会话记住。
+   * 票 #19 起这句话要加一个限定：自动适配会在没人请求的时候改缩放，所以这个数可能比外壳
+   * 知道的旧。要"现在真的是多少"就用 {@link displayState}（那次读数当场问外壳），
+   * 或者 {@link refreshZoom}（把会话记的这个数刷新到外壳说的那个）。
    */
   zoomLevel(): number {
     return this.currentZoom
+  }
+
+  /**
+   * 把会话记的那个缩放刷新到**外壳现在说的那个**（票 #19）。
+   *
+   * 为什么需要它：自动适配会在没人请求的时候改缩放（外壳按栏宽自己算），于是 `currentZoom`
+   * 会过期；而 `−` / `+` 是**相对**当前值走一档的，起点错了就走到错的档位上。
+   *
+   * 读不到（没有那条读回、外壳已关、文件还没写过）就**什么都不做**：沿用自己记的值，
+   * 不编一个。它不抛 —— 缩放的起点读不回来不该让一次缩放动作失败。
+   *
+   * @returns 刷新之后的值（刷新不了就是原来的那个）。
+   */
+  async refreshZoom(): Promise<number> {
+    const fresh = await this.readZoomQuietly()
+    if (fresh !== undefined) this.currentZoom = fresh.zoom
+    return this.currentZoom
+  }
+
+  /**
+   * 问一次"外壳现在说这块视图缩放多少、谁在管"，答不上来就是 `undefined`。
+   *
+   * @returns 读数，或 undefined。
+   */
+  private async readZoomQuietly(): Promise<{ zoom: number; mode: ZoomMode } | undefined> {
+    if (this.zoomPort === undefined || typeof this.zoomPort.reading !== 'function') return undefined
+    try {
+      return await this.zoomPort.reading()
+    } catch {
+      // 读回这条路是"面板上那句话的来源"，它坏了不该让任何动作失败：把它当作"读不到"。
+      return undefined
+    }
   }
 
   /**
@@ -2022,11 +2093,14 @@ export class AdoptedViewSession {
    * `playwright-core/lib/coreBundle.js:37196`，算出来是 1），它随那条路一起被删掉了。
    *
    * @param zoom - 目标缩放值，必须在 `ZOOM_MIN`–`ZOOM_MAX` 之内（`src/navigation.ts`）。
+   * @param mode - 谁管这个缩放（票 #19，缺省 `manual`）。会话里每一个"指名要一个缩放值"的
+   *   动作都走这条默认值：`−` / `+` / `100%` / 工具里的 `zoom`——它们的意思都是"这个值我说了算"，
+   *   于是外壳的自动适配从此让位（票面那条"手动缩放优先"的验收）。
    * @returns 缩放之后**从外壳与页面各自读回来**的视口、dpr 与源视口。
    * @throws RangeError 当 zoom 出界（悄悄夹到边界会让"100 倍"变成"5 倍"而不说一声）。
    * @throws ViewActionError 当这个会话没有可问的外壳 —— 那时**不能**假装缩放过。
    */
-  async zoomTo(zoom: number): Promise<ZoomResult> {
+  async zoomTo(zoom: number, mode: ZoomMode = 'manual'): Promise<ZoomResult> {
     this.assertOpen()
     const wanted = normalizeZoom(zoom)
     if (this.zoomPort === undefined) {
@@ -2040,7 +2114,7 @@ export class AdoptedViewSession {
       )
     }
     // 请外壳去改，并**用它读回来的值**当结果：请求里的那个数是愿望，`getZoomFactor()` 才是事实。
-    const applied = await this.zoomPort.setZoom(wanted)
+    const applied = await this.zoomPort.setZoom(wanted, mode)
     this.currentZoom = applied
     await this.settle()
     return await this.zoomReading(applied)
@@ -2049,17 +2123,49 @@ export class AdoptedViewSession {
   /**
    * 缩放一档（`+` / `−`）。
    *
+   * 步进的起点**先读回来**（票 #19）：自动适配会在没人请求的时候改缩放，所以会话手里记的
+   * 那个数可能是旧的 —— 从一个旧的 100% 往上走一步会跳到 110%，而画面其实在 52%，
+   * 用户按的是"再大一点"，得到的却是"大了一倍多"。读回来那一步的问法是"外壳现在说多少"，
+   * 答不上来（没有那条读回）就沿用自己记的值，不编。
+   *
    * @param direction - `1` 放大，`-1` 缩小。
    * @returns 与 {@link zoomTo} 同一形状。
    * @throws RangeError 当已经到头 —— 到头是一个结果，不是"什么也没发生"。
    */
   async stepZoom(direction: 1 | -1): Promise<ZoomResult> {
+    await this.refreshZoom()
     return await this.zoomTo(nextZoomStep(this.currentZoom, direction))
   }
 
   /** 回到 100%（T13 的"重置"之一）。 */
   async resetZoom(): Promise<ZoomResult> {
-    return await this.zoomTo(1)
+    return await this.zoomTo(ZOOM_RESET)
+  }
+
+  /**
+   * 把这一格**交回自动适配**（票 #19 的那颗「自动」）。
+   *
+   * 与 {@link resetZoom} 的差别是它没有终点：缩放到多少由外壳按当前栏宽算（页面塞不下就缩小，
+   * 塞得下就是 100%）。所以结果是**读回来的**，与其它缩放动作同一条规矩。
+   *
+   * @returns 缩放之后从外壳与页面各自读回来的视口、dpr 与源视口。
+   * @throws ViewActionError 当这个会话没有可问的外壳 —— 那时**不能**假装交回去了。
+   */
+  async useAutoZoom(): Promise<ZoomResult> {
+    this.assertOpen()
+    if (this.zoomPort === undefined || typeof this.zoomPort.useAutoZoom !== 'function') {
+      throw new ViewActionError(
+        'failed',
+        'browser-view: this view cannot be handed back to automatic fitting — this session has no shell to ask. ' +
+          'Fitting is `webContents.setZoomFactor()` computed from the page\'s own overflow, which only the shell can ' +
+          'reach (the plugin never gets an Electron handle, ADR-0003), so it goes through the task-space channel. ' +
+          'This session was adopted without that channel (no `DSH_DESKTOP_VIEW_SPACES`), so the zoom is unchanged.',
+      )
+    }
+    const applied = await this.zoomPort.useAutoZoom()
+    this.currentZoom = applied
+    await this.settle()
+    return await this.zoomReading(applied)
   }
 
   /**
