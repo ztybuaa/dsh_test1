@@ -72,7 +72,7 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
   /** 面板那一页的样子：它调 `ctx.connection.rpc.call` 时打出来的东西，逐字段一样。 */
   const callPanelChannel = async (
     action: string,
-    options: { cookie?: string; origin?: string } = {},
+    options: { cookie?: string; origin?: string; payload?: Record<string, unknown> } = {},
   ): Promise<{ status: number; body: string; answer: unknown }> => {
     const endpoint = viewEndpointPath(action as (typeof VIEW_ACTIONS)[number])
     const response = await fetch(`${dshOrigin}${endpoint}`, {
@@ -87,7 +87,8 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
         type: 'client-request',
         rpcId: `t13-${action}-${String(Date.now())}`,
         method: `desktop-view-${action}`,
-        payload: { nonce: String(Date.now()) },
+        // `payload` 是面板那两条带参数的动作（票 #20 的地址栏与档位菜单）用的那一段。
+        payload: { nonce: String(Date.now()), ...(options.payload ?? {}) },
       }),
     })
     const body = await response.text()
@@ -249,10 +250,14 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
     expect(Math.abs(afterIn - Number(valueIn.devicePixelRatio))).toBeLessThan(0.02)
     expect(afterIn).not.toBe(before)
     // 延迟：这两条是**读回来的**，不是估的。第一按是冷路径，第二按是热路径 ——
-    // 两个数都记在报告与 ADR 的诚实清单里；门禁给的是"这一按确实会到"的宽松上界，
-    // 不是把量到的值抄成断言（抄下来会让它变成一条测不出来任何东西的句子）。
-    expect(coldMs, 'the first press must reach the view').toBeLessThan(5000)
-    expect(warmMs, 'a repeat press must reach the view').toBeLessThan(5000)
+    // 两个数都记在报告与 ADR 的诚实清单里。
+    //
+    // 票 #20 E 把上界**收紧**了：这条路上那 0.9 秒（会话在缩放之后等一个合成帧，
+    // 见 `docs/research/t20-why-the-panel-button-waits-a-second.md`）已经拿掉，
+    // 剩下的只有外壳那条 150ms 轮询。所以门禁从"5000ms 的宽松上界"改成"**800ms**"：
+    // 它比实测（150–250ms）宽三倍多，但**回退掉那个修复就会红**（实测回退后 ~1010ms）。
+    expect(coldMs, 'the first press must reach the view').toBeLessThan(800)
+    expect(warmMs, 'a repeat press must reach the view').toBeLessThan(800)
     // 第二次按**再往前一档**（100% → 110% → 125%）—— 顺带证明这两按不是同一次调用的两种说法。
     const zoomInSteps = [1.1, 1.25]
     expect(Math.abs(Number(valueIn.zoom) - zoomInSteps[0])).toBeLessThan(0.001)
@@ -279,6 +284,13 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
     expect(valueAuto.zoomMode, 'the answer must say who is in charge of the zoom now').toBe('auto')
     expect(Number(valueAuto.zoom)).toBe(1)
     expect(String(valueAuto.message)).toContain('automatic fitting')
+    // 票 #20 C：宿主那句话仍然在（它是诊断通道的一半），而**用户看的那一行**由面板决定
+    // 只显示"模式 + 百分比" —— 那一条由 `tests/toolbar-panel.spec.ts` 从 DOM 上读回。
+    // 这里顺带钉住：`state` 那条纯读回的那句诊断话术**还在回答里**（没被删掉）。
+    const plain = await callPanelChannel('state', { cookie })
+    const plainValue = valueOf(plain, 'state-diagnostic')
+    console.log('RAW the state answer that must keep its diagnostic: ' + JSON.stringify(plainValue.message))
+    expect(plainValue.message).toBe('nothing was changed')
   }, 180_000)
 
   it('后退 / 前进 / 刷新：地址由**视图自己**读回，不是回答里那个字段', async () => {
@@ -347,18 +359,114 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
     expect(Number(value.zoom)).toBe(1)
   }, 180_000)
 
+  it('票 #20 A · 地址栏那条动作：带 url 的 navigate 真的把视图开过去，地址由视图自己读回', async () => {
+    await session.goto(`${shell.handshake.fixtureOrigin}/view`)
+    const target = `${linkedOrigin}/two`
+    const answer = await callPanelChannel('navigate', { cookie, payload: { url: target } })
+    const value = valueOf(answer, 'navigate')
+    console.log('RAW navigate over the panel channel: ' + JSON.stringify({ target, value, viewUrlNow: viewUrlNow() }))
+    expect(answer.status).toBe(200)
+    expect(value.ok).toBe(true)
+    // **视图自己**到的那个地址（不是回答里那个字段）—— 与后面那一条快照用的是同一个读回口。
+    expect(viewUrlNow()).toBe(target)
+    expect(await (view as { page: Page }).page.title()).toBe('t13-linked-two')
+
+    // 非法的协议**在这里被拒**（不信任客户端说它规范化过了）：不发出去，答一句为什么。
+    const refused = await callPanelChannel('navigate', { cookie, payload: { url: 'javascript:alert(1)' } })
+    const refusedValue = valueOf(refused, 'navigate-refused')
+    console.log('RAW navigate refused: ' + JSON.stringify(refusedValue))
+    expect(refusedValue.ok).toBe(false)
+    expect(String(refusedValue.message)).toContain('javascript:')
+    // 视图没动。
+    expect(viewUrlNow()).toBe(target)
+
+    // 一条根本解析不了的地址也一样：答一句人话，不 500。
+    const broken = await callPanelChannel('navigate', { cookie, payload: { url: 'not a url' } })
+    expect(broken.status).toBe(200)
+    const brokenValue = valueOf(broken, 'navigate-broken')
+    expect(brokenValue.ok).toBe(false)
+    expect(String(brokenValue.message)).toContain('not a url')
+    expect(viewUrlNow()).toBe(target)
+
+    // 连 `url` 都不给：也答一句人话。
+    const missing = await callPanelChannel('navigate', { cookie, payload: {} })
+    expect(valueOf(missing, 'navigate-missing').ok).toBe(false)
+  }, 240_000)
+
+  it('票 #20 D · 档位那条动作：表内的档位真的跳过去，表外的一律拒', async () => {
+    await callPanelChannel('zoom-reset', { cookie })
+    const picked = await callPanelChannel('zoom-to', { cookie, payload: { zoom: 1.5 } })
+    const value = valueOf(picked, 'zoom-to')
+    console.log('RAW zoom-to 150%: ' + JSON.stringify({ value, dpr: await viewDpr() }))
+    expect(picked.status).toBe(200)
+    expect(Number(value.zoom)).toBeCloseTo(1.5, 6)
+    // 页面自己报的 dpr 跟着变（与 `−`/`+` 走的是同一条路、同一套读回）。
+    expect(await viewDpr()).toBeGreaterThan(1)
+    // 它同时是一次"指名了一个值" ⇒ 归手动管（票 #19 的语义在两条路上一致）。
+    expect(value.zoomMode).toBe('manual')
+
+    // 表外的值：拒，而且说得出是哪个值不在表里。
+    const offTable = await callPanelChannel('zoom-to', { cookie, payload: { zoom: 0.83 } })
+    const offValue = valueOf(offTable, 'zoom-to-off')
+    console.log('RAW zoom-to 83%: ' + JSON.stringify(offValue))
+    expect(offValue.ok).toBe(false)
+    expect(String(offValue.message)).toContain('0.83')
+    // 数字都给错时也答一句人话。
+    const notANumber = await callPanelChannel('zoom-to', { cookie, payload: { zoom: '125%' } })
+    expect(valueOf(notANumber, 'zoom-to-bad').ok).toBe(false)
+
+    await callPanelChannel('zoom-reset', { cookie })
+  }, 240_000)
+
+  it('票 #20 F · 悬停要的"会去哪一页"来自引擎自己的历史（宿主那次读回里带着它）', async () => {
+    await session.goto(`${linkedOrigin}/one`)
+    await callPanelChannel('reload', { cookie })
+    // 让**视图自己**再走一步：引擎的历史里于是有一前一后两条。
+    await session.click('#t13-next')
+    await session.wait({ text: 'page two' })
+    const answer = await callPanelChannel('state', { cookie })
+    const value = valueOf(answer, 'state-neighbours')
+    console.log('RAW 票 #20 F 的邻居读数: ' + JSON.stringify({ backTarget: value.backTarget, forwardTarget: value.forwardTarget }))
+    // 后退那一页就是引擎历史里的前一条，标题是**引擎记下的**那个。
+    expect(value.backTarget).toBeTruthy()
+    expect((value.backTarget as { title: string }).title).toBe('t13-linked')
+    expect((value.backTarget as { url: string }).url).toBe(`${linkedOrigin}/one`)
+    // 刚走了一段新路 ⇒ 前进那一侧引擎里没有下一页，于是**这个键缺席**（不是给一个空对象）。
+    expect(value.forwardTarget).toBeUndefined()
+    // 页面自己还在不在加载：这也是页面说的一句话。
+    expect(typeof value.loading).toBe('boolean')
+  }, 240_000)
+
   it('工具条存在时，视图的快照**逐项不变**，而且视图那一页里根本没有工具条的痕迹', async () => {
     // 快照看的是**视图那一页**。工具条在**面板那一页**，所以它不可能出现在快照里 ——
     // 但这件事必须被证明，因为"注入到错误的那一页"是一个很容易犯的错误。
+    //
+    // 票 #20 A 之后这一条的份量更大了：**地址栏是一个输入框**，而输入框是"往被驱动的那一页
+    // 里塞东西"最容易出错的形状（一个 `document.querySelector` 写错名字就够了）。所以这里
+    // 逐个点名读回：地址栏、档位菜单、状态读数，在视图那一页上**一个都没有**。
     const snapshot = await session.snapshot()
     console.log('RAW the view snapshot: ' + JSON.stringify(snapshot.elements.map((element) => element.name)))
     const inView = await (view as { page: Page }).page.evaluate(() => ({
       toolbar: document.querySelectorAll('[data-dsh-view-toolbar]').length,
       buttons: document.querySelectorAll('[data-dsh-view-action]').length,
       panel: document.querySelectorAll('[data-dsh-desktop-view-panel]').length,
+      address: document.querySelectorAll('[data-dsh-view-address]').length,
+      addressInputs: document.querySelectorAll('input[data-dsh-view-address]').length,
+      zoomMenu: document.querySelectorAll('[data-dsh-view-zoom-menu]').length,
+      zoomPresets: document.querySelectorAll('[data-dsh-view-zoom-preset]').length,
+      reading: document.querySelectorAll('[data-dsh-view-reading]').length,
     }))
     console.log('RAW what the view page itself holds: ' + JSON.stringify(inView))
-    expect(inView).toEqual({ toolbar: 0, buttons: 0, panel: 0 })
+    expect(inView).toEqual({
+      toolbar: 0,
+      buttons: 0,
+      panel: 0,
+      address: 0,
+      addressInputs: 0,
+      zoomMenu: 0,
+      zoomPresets: 0,
+      reading: 0,
+    })
 
     // 面板那一页上也没有（今天那一格没渲染出来，所以它的工具条也不该在）。
     // 这一条是"两边都没有"的读回：它证明不了工具条长什么样，但它证明**它没有跑到视图里去**。

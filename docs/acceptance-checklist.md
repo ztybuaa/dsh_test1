@@ -216,7 +216,13 @@ npm run shell
 |---|---|---|
 | **后退 / 前进 / 刷新**(Agent 侧) | **有**:`browser_view` 的 `back` / `forward` / `reload`,失败分四类 | ✅ `tests/view-actions.spec.ts`、`tests/history-truth.spec.ts` |
 | **缩放**(Agent 侧) | **有**:`zoom-in` / `zoom-out` / `zoom` / `zoom-reset` | ✅ `tests/view-actions.spec.ts`、`tests/fit-to-pane.spec.ts` |
-| **那一格顶部的工具条** | **有**:`← → ↻ − % + 重置 自动 重新开始`,全部经"面板 → 宿主"的内部通道驱动同一套会话能力 | ✅ `tests/panel-toolbar.spec.ts`、`tests/toolbar.spec.ts` |
+| **那一格顶部的工具条** | **有**:`← → ↻ 地址栏 − % + 重置 自动 重新开始`,全部经"面板 → 宿主"的内部通道驱动同一套会话能力 | ✅ `tests/panel-toolbar.spec.ts`、`tests/toolbar.spec.ts`、`tests/toolbar-panel.spec.ts` |
+| **地址栏**(票 #20 A) | **有**:输入网址回车打开;**跳转后框里的地址跟着页面走**(读回来,不是自己记);只写主机名补 `https://`,回环主机(`localhost` / `127.0.0.1` / `[::1]`)补 `http://`,别的协议**说得出是拒**;规则写在输入框的 `title` 上 | ✅ `tests/toolbar.spec.ts`(规则逐条)、`tests/toolbar-panel.spec.ts`(DOM 上读回框里的字、发出去的 `url`、非法输入一个请求都不发)、`tests/panel-toolbar.spec.ts`(真宿主:`navigate` 真的开过去,非法协议被宿主自己再拒一次) |
+| **侧边栏标签显示页面标题**(票 #20 B) | **有**:标签写的是**当前页面标题**,读不到回落"浏览器" —— 走的是宿主**为会变的标题准备的那个座位**(`sidebar.right.pane.tab.title`,产品自己的 Files 插件同款) | ✅ 到"座位注册 + 组件输出"为止:`tests/toolbar-panel.spec.ts`(注册上了、渲染出页面标题、空标题回落)。👤 **"宿主标签条上那一格真的变了"没有自动化证据** —— 真 DSH 界面里那一格渲染不出来(首启流程要工作区/API Key,ADR-0013 记过) |
+| **读数干净**(票 #20 C) | **有**:那一行只有"模式 + 百分比"(必要时加`加载中` / `✗ 为什么没成`);`nothing was changed` 这种给开发者看的话**不在**用户可见文本里,但**没被删**(同一元素的 `title` 与 `data-dsh-view-diagnostic` 读得到);URL 那半条缩掉,位置让给地址栏 | ✅ `tests/toolbar-panel.spec.ts`(DOM 上逐项读回三个通道)、`tests/toolbar.spec.ts`(纯判断)、`tests/panel-toolbar.spec.ts`(宿主那句诊断仍在回答里) |
+| **缩放选档位**(票 #20 D) | **有**:点百分比给出一排标准档位(50/67/75/80/90/100/110/125/150/175/200),选一个跳过去;`−`/`+`/重置/自动 全部保留;展开时工具条长高一行(不是浮层 —— 浮层会被原生画面盖住) | ✅ `tests/toolbar-panel.spec.ts`(11 个档位、当前档位标记、选一个发出的 `zoom`、展开后高度)、`tests/panel-toolbar.spec.ts`(真宿主:150% 真的生效、83% 被拒) |
+| **按钮跟手**(票 #20 E) | **有**:一按从 ~1010 ms 降到 ~120–175 ms —— 拿掉的是会话在缩放之后等的那一帧(实测 570–952 ms),而**不是**外壳的发布(实测 4–8 ms,含 `cookies.get({})` 0–1 ms) | ✅ `tests/panel-toolbar.spec.ts`(`coldMs` / `warmMs` < 800 ms;回退那个修复就变红) 🔬 拆解与原始输出:[`docs/research/t20-why-the-panel-button-waits-a-second.md`](research/t20-why-the-panel-button-waits-a-second.md)、决定:[`docs/adr/0015-*.md`](adr/0015-toolbar-polish-and-the-frame-wait.md) |
+| **加载中有提示 / 悬停看到会去哪一页**(票 #20 F) | **有**:页面自己说它在加载时读数上写`加载中`;悬停`←`/`→`显示**引擎历史里那一页**的标题(没标题就用地址);引擎答不上来就一个字都不加 | ✅ `tests/toolbar-panel.spec.ts`(两条各自正反都读回)、`tests/panel-toolbar.spec.ts`(`backTarget` 来自引擎、没有下一页时那个键**缺席**)、`tests/toolbar.spec.ts`(纯判断) |
 | **页面自己适应栏宽**(不用按任何按钮) | **有**:栏宽一变,放不下的页面**自动**缩到刚好塞下;能重排的页面**一步都不动** | ✅ `tests/fit-to-pane.spec.ts`、`tests/fit-pixels.spec.ts`(真窗口像素:整页真的可见)、`tests/fit-rule.spec.ts`(纯规则) |
 | **新开外壳就是「自动」**(不用按任何按钮) | **有**:真外壳 + 真插件装上之后,`zoom.json` / `state.json` / 工具条读数三处都是 `auto`,`requestId` 是 0(启动时没有任何人下过命令) | ✅ `tests/product-startup.spec.ts`(真外壳 + 真 dsh 宿主 + 真插件,探针在宿主进程里读回通道) |
 | **重新开始** | **有**:回到初始页并重置缩放 | ✅ `tests/view-actions.spec.ts` |
@@ -236,10 +242,11 @@ npm run shell
 ## 12. 自动化证据在哪、怎么重跑
 
 ```pwsh
-npm test                                   # 全部 26 个 spec 文件、218 条用例（约 7 分钟；起真 Electron 与真 dsh 宿主）
+npm test                                   # 全部 27 个 spec 文件、238 条用例（约 7 分钟；起真 Electron 与真 dsh 宿主）
 npm test -- tests/acceptance.spec.ts       # 只看本票新增的 10 条（约 40 秒，会起 4 个真 dsh 宿主）
 npm test -- tests/product-startup.spec.ts  # 只看"新开外壳就是自动"（约 20 秒，会起 1 个真 dsh 宿主）
 npm test -- tests/panel-placement.spec.ts  # 只看"视图跟随"
+npm test -- tests/toolbar-panel.spec.ts    # 只看"那一格上的界面"（票 #20 的 A/B/C/D/F，约 10 秒）
 ```
 
 | 想要什么证据 | 看哪个文件 |
@@ -257,5 +264,8 @@ npm test -- tests/panel-placement.spec.ts  # 只看"视图跟随"
 | 光标覆盖层 | `tests/overlay.spec.ts` |
 | 截图默认落在哪（不给路径时） | `tests/screenshot-dir.spec.ts` |
 | 没有外壳时的行为（面板文案、工具回答） | `tests/no-shell.spec.ts` |
+| 面板那一按（真外壳 + 真 dsh 宿主 + 真通道） | `tests/panel-toolbar.spec.ts` |
+| **那一格上的界面**（地址栏、标签标题、读数、档位、加载提示、悬停目标） | `tests/toolbar-panel.spec.ts`（真 DOM）；判断层在 `tests/toolbar.spec.ts` |
 | 客户端半边（tab 类型、guide 入口） | `tests/client-half.spec.ts` |
 | 本清单背后的原始测量 | `docs/research/t12-one-command-and-the-three-first-evidence.md` |
+| **那 0.9 秒花在哪**（票 #20 E 的拆解） | `docs/research/t20-why-the-panel-button-waits-a-second.md` |

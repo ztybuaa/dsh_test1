@@ -44,7 +44,9 @@ import {
   classifyNavigationFailure,
   normalizeZoom,
   parseEngineHistory,
+  parseEngineNeighbours,
   stepZoom as nextZoomStep,
+  type EngineHistoryNeighbours,
   type EngineHistoryReading,
   type HistorySource,
   type HistoryState,
@@ -245,10 +247,19 @@ export interface ViewDisplayState {
   innerWidth?: number
   /** 页面自己读到的视口高度；同上。 */
   innerHeight?: number
+  /**
+   * 这一页**还在加载中**吗（票 #20 F）：页面自己说的 `document.readyState !== 'complete'`。
+   *
+   * 缺席 = 读不到（正在换文档、页面抛了）。它与 `devicePixelRatio` 那几个是同一类：
+   * 一次读不到就缺席，面板不显示那个提示，而不是猜一个。
+   */
+  loading?: boolean
   /** 还能后退/前进几页（引擎答的，或引擎答不上来时账本答的）。 */
   history: HistoryState
   /** 那份历史是从哪读来的（票 #18）：`engine` 或 `observed`。 */
   historySource: HistorySource
+  /** 后退/前进各自会去哪一页（票 #20 F）；读不到就没有这个键。 */
+  neighbours?: EngineHistoryNeighbours
   /** 外壳握手发布的初始页；没有就缺席（「重新开始」会去空白页）。 */
   initialUrl?: string
 }
@@ -582,6 +593,40 @@ const SCREENSHOT_ATTEMPT_MS = 3_000
 
 /** How many capture attempts one screenshot makes before giving up with a timeout. */
 const SCREENSHOT_ATTEMPTS = 4
+
+/**
+ * 一次缩放之后，最多花多久等页面自己的读数跟上（票 #20 E）。
+ *
+ * **它不是一个延迟，是一个上界**：第一次读就对上了就立刻返回（实测常态，整个动作 119–175 ms），
+ * 只有"渲染进程还没把那个缩放应用上去"的时候才会用到它。所以给宽一点没有代价，给窄了有代价 ——
+ * 预算用完就**如实返回读到的东西**，那意味着面板上那个数可能还是上一次缩放的（一次）。
+ *
+ * 1 秒这个数有来处：**票前那个实现等的就是一帧，而这一页不被合成时一帧正好 ~1 秒**
+ * （见 `docs/research/t20-why-the-panel-button-waits-a-second.md`）。所以这个上界**等于**
+ * 票前那次等待 —— 最坏情况一模一样，常态从 ~1 秒降到几十毫秒，不会更差。
+ * （第一版给的是 200 ms；整包连跑时 `tests/view-actions.spec.ts` 的 dpr 那一组在机器被占满的
+ * 那一轮红过一次，正是"渲染进程还没跟上"的形状，所以放宽到这个不会更差的上界。）
+ *
+ * 为什么不在超时之后"当作成功"：那会把一个读不到的东西说成读到了，与仓库一贯的规矩相反。
+ * 超时只是不再等，返回的仍然是页面真报的那个数。
+ */
+const SETTLE_BUDGET_MS = 1_000
+
+/** 上面那个预算里每次重试之间等多久。10 ms 是"不让出一个帧的时间"，也就不受出帧节奏影响。 */
+const SETTLE_STEP_MS = 10
+
+/**
+ * 等一小会儿（票 #20 E 的重试间隔）。
+ *
+ * 它刻意**不是** `requestAnimationFrame`：这一页不出帧的时候，rAF 是那个 ~1 秒的坑，
+ * 而这里要的只是"让出一个宏任务的时间"，好让渲染进程把已经收到的缩放消息处理掉。
+ *
+ * @param ms - 毫秒。
+ * @returns 到点就 resolve。
+ */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
 /**
  * ARIA widget roles that count as interactive even on a plain `<div>`, so a page
@@ -1245,6 +1290,9 @@ class HistoryReader {
     private readonly ledger: ObservedHistory,
   ) {}
 
+  /** 票 #20 F：最近一次引擎历史里那两个相邻页（读不到就是空，见 {@link neighbours}）。 */
+  private neighbourCache: EngineHistoryNeighbours = {}
+
   /**
    * 问一次引擎，并把它答的记下来。
    *
@@ -1261,9 +1309,13 @@ class HistoryReader {
       if (parsed === undefined) {
         this.lastEngineError = `Page.getNavigationHistory answered without a usable index and entry list: ${JSON.stringify(raw)}`
         this.cached = undefined
+        this.neighbourCache = {}
         return
       }
       this.cached = { ...parsed, source: 'engine' }
+      // 票 #20 F：同一份原始回答里那两个相邻页（悬停提示要的）。失败路径上它跟着清空 ——
+      // 一份"上一次读到过的目标"继续当权威，与票 #18 修掉的那个毛病是同一个形状。
+      this.neighbourCache = parseEngineNeighbours(raw)
       this.lastEngineError = undefined
     } catch (error) {
       // 读不到就**如实退到账本**，并把上一次那份读数丢掉：一份"曾经对过"的读数继续当权威，
@@ -1271,7 +1323,21 @@ class HistoryReader {
       // 退到账本的代价是**可能低估**（按钮灰得多一点），而高估是让用户按一颗撒谎的按钮。
       this.lastEngineError = error instanceof Error ? error.message : String(error)
       this.cached = undefined
+      this.neighbourCache = {}
     }
+  }
+
+  /**
+   * 这份历史里**相邻的那两页**（票 #20 F 的悬停提示）。
+   *
+   * 与 {@link read} 同源同一次读：都出自最近一次 `Page.getNavigationHistory`。
+   * 引擎没答上来时这里是空的 —— 那时面板一个字的提示都不给（见 `src/toolbar.js` 的
+   * `travelHint`），而不是拿账本里那条只有地址的账去凑一句。
+   *
+   * @returns 两个方向各自的目标（可能各自缺席）。
+   */
+  neighbours(): EngineHistoryNeighbours {
+    return this.cached === undefined ? {} : this.neighbourCache
   }
 
   /**
@@ -1468,6 +1534,15 @@ export class AdoptedViewSession {
    * 它与页面读到的 `devicePixelRatio` 不是一回事（外壳侧是 `屏幕dpr × zoom`），见 {@link zoomTo}。
    */
   private currentZoom: number
+
+  /**
+   * 上一次从页面读回来的那三件事（票 #20 E）。
+   *
+   * 它是 {@link settle} 唯一的参照物：判"页面跟上新缩放了没有"时，拿**上一次的实测读数**按
+   * 比例推这一次该是多少 —— 于是没有"记住屏幕 dpr"这种会过期的常数。会话没有这一步时
+   * （还没做过任何缩放）它是 `undefined`，那就没有参照，也就不用等。
+   */
+  private lastViewport: { zoom: number; innerWidth: number; innerHeight: number; devicePixelRatio: number } | undefined
 
   /**
    * What the injected cursor overlay is told to draw (T8).
@@ -1976,15 +2051,19 @@ export class AdoptedViewSession {
     let innerWidth: number | undefined
     let innerHeight: number | undefined
     let devicePixelRatio: number | undefined
+    let loading: boolean | undefined
     try {
       const seen = await this.page.evaluate(() => ({
         innerWidth: window.innerWidth,
         innerHeight: window.innerHeight,
         devicePixelRatio: window.devicePixelRatio,
+        // 票 #20 F：这一页还在加载中吗 —— 页面自己说的，不是我们猜的。
+        loading: document.readyState !== 'complete',
       }))
       innerWidth = seen.innerWidth
       innerHeight = seen.innerHeight
       devicePixelRatio = seen.devicePixelRatio
+      loading = seen.loading
     } catch {
       // 页面正在换文档时读不到：如实缺席，面板那边显示"读不到"比显示一个旧值好。
     }
@@ -1995,6 +2074,7 @@ export class AdoptedViewSession {
     // 而这份读数的用途正是让人看见"现在是多少、谁在管"。读不到就退回会话记的值，
     // 并且**不声称**任何模式（`zoomMode` 缺席）—— "不知道谁在管"不该被渲染成"自动在管"。
     const fresh = await this.readZoomQuietly()
+    const neighbours = this.historyReader.neighbours()
     return {
       url: this.page.url(),
       title: await this.titleQuietly(),
@@ -2003,8 +2083,10 @@ export class AdoptedViewSession {
       ...(devicePixelRatio !== undefined ? { devicePixelRatio } : {}),
       ...(innerWidth !== undefined ? { innerWidth } : {}),
       ...(innerHeight !== undefined ? { innerHeight } : {}),
+      ...(loading !== undefined ? { loading } : {}),
       history: { back: reading.back, forward: reading.forward },
       historySource: reading.source,
+      ...(neighbours.back !== undefined || neighbours.forward !== undefined ? { neighbours } : {}),
       ...(this.initialUrl !== undefined && this.initialUrl !== '' ? { initialUrl: this.initialUrl } : {}),
     }
   }
@@ -2116,7 +2198,7 @@ export class AdoptedViewSession {
     // 请外壳去改，并**用它读回来的值**当结果：请求里的那个数是愿望，`getZoomFactor()` 才是事实。
     const applied = await this.zoomPort.setZoom(wanted, mode)
     this.currentZoom = applied
-    await this.settle()
+    await this.settle(applied)
     return await this.zoomReading(applied)
   }
 
@@ -2164,7 +2246,7 @@ export class AdoptedViewSession {
     }
     const applied = await this.zoomPort.useAutoZoom()
     this.currentZoom = applied
-    await this.settle()
+    await this.settle(applied)
     return await this.zoomReading(applied)
   }
 
@@ -2222,9 +2304,85 @@ export class AdoptedViewSession {
     }
   }
 
-  /** 让一轮布局/绘制落定，好在同一个动作里把缩放读回来（读的是页面，不是我们写下去的值）。 */
-  private async settle(): Promise<void> {
-    await this.page.evaluate(() => new Promise<void>((done) => requestAnimationFrame(() => done())))
+  /**
+   * 一次缩放之后，等页面**自己的读数**追上外壳已经应用的那个缩放（票 #20 E）。
+   *
+   * ## 为什么不是"等一帧"（票前的写法，实测 570–952 ms）
+   *
+   * 原来的实现是等一个 `requestAnimationFrame`。票 #20 亲测：这一页在**没有前台焦点 / 不被合成**
+   * 的时候几乎不出帧（500 ms 里 0–1 帧，而页面上有一个一直在排队的 rAF 回调），
+   * 于是"等一帧"变成"等最多一秒" —— 那就是用户按一次缩放要等的那 0.9 秒，
+   * 也是这条路上**唯一**一笔超过 200 ms 的开销（HTTP 往返 10–20 ms、外壳一次发布 4–8 ms、
+   * 外壳侧轮询 12–137 ms 都量过，完整数据见 `docs/research/t20-why-the-panel-button-waits-a-second.md`）。
+   * 而 `requestAnimationFrame` 从来不是我们要的那个事实：我们要的是"**布局已经按新缩放算过**"。
+   *
+   * ## 现在等的那个事实
+   *
+   * 1. 一次**同步强制布局**（读 `documentElement.scrollHeight`）把布局冲出来。它不经过合成器，
+   *    所以不受出帧节奏影响 —— 这是它与"等一帧"的本质差别；
+   * 2. 拿这一次读到的三件事与**上一次从页面读回来的那一份**对照，看它有没有跟上外壳说的那个缩放
+   *    （`dpr` 与布局视口都按 `zoom` 的比例走，这是同一次读回里自洽的换算，不是记一个常数）；
+   * 3. 跟不上就在一个**有界**的窗口内重试几次（窗口本身不是延迟：第一次就对上了就立刻返回）。
+   *    窗口用完就**如实返回读到的东西**，绝不编 —— 对不上的那个读数照样会被返回、照样会显示，
+   *    读数与事实的差别因此看得见，而不是被一段等待盖住。
+   *
+   * 实测：改完之后同一个动作从 ~1010 ms 降到 ~119–175 ms（降下去的正是那一帧的钱，
+   * 剩下的那段是外壳那条 150 ms 轮询，票面明令不许为了好看去缩它）。
+   *
+   * @param zoom - 外壳**读回来**的那个缩放值（1 = 100%）。
+   * @returns 页面最后报的那三件事（成功与否都返回读到的那个）。
+   */
+  private async settle(zoom: number): Promise<{ innerWidth: number; innerHeight: number; devicePixelRatio: number }> {
+    const deadline = Date.now() + SETTLE_BUDGET_MS
+    for (;;) {
+      const seen = await this.page.evaluate(() => {
+        // 同步强制布局：读一次 scrollHeight 就把待处理的样式与布局算完。
+        // 这一句是**这个函数存在的理由**，删掉它就退回"读到一个还没跟上缩放的视口"。
+        void document.documentElement.scrollHeight
+        return {
+          innerWidth: window.innerWidth,
+          innerHeight: window.innerHeight,
+          devicePixelRatio: window.devicePixelRatio,
+        }
+      })
+      const last = this.lastViewport
+      const followed = last === undefined || zoom === last.zoom || this.viewportFollows(last, zoom, seen)
+      if (followed || Date.now() >= deadline) {
+        // 参照物**每次都以这一次的读数为准**（跟上了、没跟上、没有参照物，三种都一样）：
+        // 只在对上时才记，会让"某一次没跟上"永远留在参照物里，之后每一次缩放都要白等一遍上界。
+        // 记下一个可能没对上的配对不会造成"假的成功" —— 下一轮的判据只会因此更保守（多等一会儿）。
+        this.lastViewport = { zoom, ...seen }
+        return seen
+      }
+      await delay(SETTLE_STEP_MS)
+    }
+  }
+
+  /**
+   * 页面报的这一份读数，跟上新的缩放了吗（票 #20 E 的判据）。
+   *
+   * 两条关系都来自"缩放就是布局视口按比例变、`devicePixelRatio` 按同一比例变"这一件事，
+   * 而**参照物是上一次从页面读回来的那一份**（不是记下来的屏幕 dpr）：
+   * 于是显示器换了、dpr 变了，判据自己就跟着变，不需要任何缓存失效逻辑。
+   *
+   * 容差与 `tests/panel-toolbar.spec.ts` 里那条验收同源：`dpr` 用 0.02，宽度用 2 个 CSS 像素
+   * （四舍五入与子像素布局都会带来一点差）。
+   *
+   * @param last - 上一次从页面读回来的那一份。
+   * @param zoom - 外壳刚读回来的缩放值。
+   * @param seen - 这一次读到的。
+   * @returns 跟上了就是 true。
+   */
+  private viewportFollows(
+    last: { zoom: number; innerWidth: number; devicePixelRatio: number },
+    zoom: number,
+    seen: { innerWidth: number; devicePixelRatio: number },
+  ): boolean {
+    if (last.zoom <= 0) return true
+    const ratio = zoom / last.zoom
+    const wantedDpr = last.devicePixelRatio * ratio
+    const wantedWidth = last.innerWidth / ratio
+    return Math.abs(seen.devicePixelRatio - wantedDpr) < 0.02 && Math.abs(seen.innerWidth - wantedWidth) <= 2
   }
 
 

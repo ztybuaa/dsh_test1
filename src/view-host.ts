@@ -3,9 +3,12 @@ import type { AdoptedViewSession } from './session.ts'
 import {
   VIEW_ACTIONS,
   VIEW_RPC_CHANNEL,
+  parseNavigationUrl,
   parseViewAction,
+  parseZoomPreset,
   viewEndpointPath,
   type ViewAction,
+  type ViewRequest,
   type ViewState,
 } from './view-rpc.ts'
 
@@ -55,7 +58,7 @@ interface ConnectionLike {
  * @param action - 已经解析过的动作。
  * @returns 给面板的 {@link ViewState}。
  */
-async function runAction(session: AdoptedViewSession, action: ViewAction): Promise<ViewState> {
+async function runAction(session: AdoptedViewSession, action: ViewAction, request: ViewRequest): Promise<ViewState> {
   /** 动作做完之后，一次读回面板要显示的一切。 */
   const readBack = async (ok: boolean, message: string, reason?: string): Promise<ViewState> => {
     const state = await session.displayState()
@@ -67,9 +70,12 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
       devicePixelRatio: state.devicePixelRatio ?? Number.NaN,
       innerWidth: state.innerWidth ?? Number.NaN,
       innerHeight: state.innerHeight ?? Number.NaN,
+      ...(state.loading !== undefined ? { loading: state.loading } : {}),
       canGoBack: state.history.back > 0,
       canGoForward: state.history.forward > 0,
       historySource: state.historySource,
+      ...(state.neighbours?.back !== undefined ? { backTarget: state.neighbours.back } : {}),
+      ...(state.neighbours?.forward !== undefined ? { forwardTarget: state.neighbours.forward } : {}),
       restartTarget:
         state.initialUrl ?? '(no initial page: the shell published none, so this goes to a blank page)',
       ok,
@@ -84,6 +90,13 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
       const restarted = await session.restart()
       return await readBack(true, `restarted at ${restarted.url} and reset the zoom to 100%`)
     }
+    // 票 #20 A：地址栏回车。地址在这里**再收一次**（不信客户端说它规范过了，见 `parseNavigationUrl`），
+    // 收不进来就是一条失败回答 —— 面板把它显示成"为什么这一按没生效"。
+    if (action === 'navigate') {
+      const url = parseNavigationUrl(request.url)
+      const landed = await session.goto(url)
+      return await readBack(true, `navigated to ${landed.url}`)
+    }
     // 票 #19：「自动」——把这一格交回按栏宽自动适配。它没有目标值可给（那个值由外壳按
     // 页面自己的溢出算），所以结果只能**读回来**：`useAutoZoom` 返回的是外壳在适配跑完之后
     // 读回的那个数。
@@ -93,6 +106,18 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
         true,
         `handed this pane back to automatic fitting: the zoom is now ${Math.round(result.zoom * 100)}% ` +
           `(layout viewport ${result.innerWidth}x${result.innerHeight} CSS px)`,
+      )
+    }
+    // 票 #20 D：档位菜单选了一个档位。与 `−`/`+` 走的是**同一个** `zoomTo(…, 'manual')`，
+    // 所以"指名了一个值 ⇒ 归手动管"这条语义两处一致（票 #19）。
+    if (action === 'zoom-to') {
+      const before = session.zoomLevel()
+      const wanted = parseZoomPreset(request.zoom)
+      const result = await session.zoomTo(wanted)
+      return await readBack(
+        true,
+        `zoom ${Math.round(before * 100)}% → ${Math.round(result.zoom * 100)}% (chosen from the preset list; ` +
+          `layout viewport is now ${result.innerWidth}x${result.innerHeight} CSS px)`,
       )
     }
     if (action === 'zoom-in' || action === 'zoom-out' || action === 'zoom-reset') {
@@ -209,13 +234,22 @@ export function registerViewRpc(
             })
           }
           let value: ViewState
+          // 票 #20：那两条带参数的动作（地址栏、档位）从这里取参数。**payload 是面板给的东西**，
+          // 与 `method` 一样不可信，所以这里只搬运、不解释 —— 解释（收窄、拒绝）在
+          // `parseNavigationUrl` / `parseZoomPreset` 里，抛出来的话下面的 catch 会把它变成
+          // 一句失败的读回，而不是一个 500。
+          const payload =
+            envelope.payload !== null && typeof envelope.payload === 'object'
+              ? (envelope.payload as ViewRequest)
+              : ({} as ViewRequest)
           try {
             const requested = parseViewAction(action)
             const session = await adopt()
-            value = await runAction(session, requested)
+            value = await runAction(session, requested, payload)
           } catch (error) {
-            // 到这里只可能是"解析动作"或"领养视图"失败：动作名来自我们自己的常量表，
-            // 领养失败则要如实说（没有外壳、端点连不上），不能变成一句没有下文的 500。
+            // 到这里只可能是"解析动作/参数"或"领养视图"失败：动作名来自我们自己的常量表，
+            // 领养失败则要如实说（没有外壳、端点连不上），参数不对要说是哪个参数不对，
+            // 都不能变成一句没有下文的 500。
             const message = error instanceof Error ? error.message : String(error)
             return Response.json({
               type: 'server-response',
