@@ -25,6 +25,7 @@ const { parseArgv, usage } = require('./args.js')
 const { startFixtureServer } = require('./fixture.js')
 const cdp = require('./cdp.js')
 const downloads = require('./downloads.js')
+const fit = require('./fit.js')
 const geometry = require('./geometry.js')
 const identity = require('./identity.js')
 const spaces = require('./spaces.js')
@@ -44,6 +45,42 @@ const ENV_SPACES = 'DSH_DESKTOP_VIEW_SPACES'
 
 /** How often the shell looks for a new space request. */
 const SPACE_POLL_MS = 150
+
+/**
+ * 自动适配（票 #19）在**连续拖动**里的节流：两次适配之间至少隔这么久。
+ *
+ * 侧边栏拖动时面板每一帧都会上报新矩形，而"页面还塞不塞得下"每帧都答得出来 —— 但没必要求
+ * 那么勤：一次适配是两次 `executeJavaScript` 往返 + 一次 `setZoomFactor`，而人眼要的是
+ * "跟着手走"。80ms（12.5 次/秒）在拖动时看不出延迟，又不会把主进程刷满。
+ *
+ * **尾随那一次是必须的**：节流只延迟"下一次"，不会漏掉"最后一次"。停下来之后一定还会跑一轮，
+ * 所以最终状态永远是对着**最终栏宽**算出来的，而不是对着拖动中途某一帧。
+ */
+const FIT_MIN_INTERVAL_MS = 80
+
+/**
+ * 读"页面有没有横向溢出"的那一句。
+ *
+ * 只读两个数、不碰页面：`documentElement.scrollWidth` 是**整个文档**的横向内容宽度，
+ * `clientWidth` 是它的内容盒宽度（已经扣掉纵向滚动条）—— 所以"有没有溢出"以及
+ * "溢出了多少"都在这两个数里，而滚动条的宽度会自然被算进去（这正是我们想要的：
+ * 适配之后不该再出现横向滚动条，纵向滚动条该在还在）。
+ */
+const FIT_READ_EXPRESSION =
+  '(() => { const root = document.documentElement; ' +
+  'return { clientWidth: root.clientWidth, scrollWidth: root.scrollWidth } })()'
+
+/**
+ * 改完缩放之后，最多等这么久页面才报出新的布局（每 {@link FIT_RELAYOUT_POLL_MS} 问一次）。
+ *
+ * 这两个数是"等一次重新排版"的代价，而它直接进"跟手延迟"：实测这一等通常只要 5–20ms
+ * （一次重新排版的距离），撞上超时才是 300ms —— 而撞上超时时我们会**停手并如实记录**，
+ * 绝不拿一个没跟上的读数继续算（那样算出来的缩放是错的，见 {@link waitForRelaidOut}）。
+ */
+const FIT_RELAYOUT_TIMEOUT_MS = 300
+
+/** 上面那个等待的轮询间隔。 */
+const FIT_RELAYOUT_POLL_MS = 5
 
 /**
  * 新建空间之后，最多等多久它的视图在端点上**可解析**（发布那张表之前）。
@@ -171,6 +208,22 @@ const state = {
   downloadJournal: undefined,
   /** 下载记录的编号来源；跨重启接着上次的最大值往下发。 */
   downloadId: 0,
+  /**
+   * 自动适配（票 #19）的运行状态。
+   *
+   * 它只记**这一轮跑到哪了**，不记策略：什么时候该动、动到多少是 `shell/fit.js` 的事，
+   * "现在归谁管"是每条空间记录上的 `zoomMode`。
+   */
+  fit: {
+    /** 已经排上的尾随那一轮（节流窗口结束时跑）。 */
+    timer: undefined,
+    /** 现在正有一轮在跑。 */
+    running: false,
+    /** 跑的期间又来了请求：跑完再跑一轮（对着最新几何）。 */
+    pending: false,
+    /** 上一轮是什么时候跑完的，用来算节流窗口。 */
+    lastAt: 0,
+  },
 }
 
 /** @param {string} line - one log line on stdout (stable, machine-readable). */
@@ -382,6 +435,13 @@ function applyPlacement(cause) {
     }
   }
   emit(`DSH_SHELL VIEW ${JSON.stringify(record)}`)
+  // 票 #19：视图被摆到哪，就决定了这一页还塞不塞得下。**每一次"真的画出来了"的落点**都请
+  // 一轮自动适配（节流在 {@link requestFit} 里）：
+  //   - 拖动侧边栏时面板每帧上报 ⇒ 每一帧都是一个落点 ⇒ 这就是"跟手"，而且是**推**过来的，
+  //     不经过"面板 → 宿主 → 请求文件 → 150ms 轮询"那条实测 ~1 秒的路（ADR-0013 诚实清单）；
+  //   - 可见性/空间切换也走这里，于是"切到另一个空间"同样会被适配一次；
+  //   - 响应式页面在 `shell/fit.js` 的规则下是恒等的（`ratio == 1`），一步都不会动。
+  if (decision.visible) requestFit(cause ?? 'report')
   return record
 }
 
@@ -525,6 +585,10 @@ function shutdown() {
     clearInterval(state.spaceTimer)
     state.spaceTimer = undefined
   }
+  if (state.fit.timer !== undefined) {
+    clearTimeout(state.fit.timer)
+    state.fit.timer = undefined
+  }
   killHostProcess()
   const fixture = state.fixture
   state.fixture = undefined
@@ -578,6 +642,45 @@ function createSpace(name) {
     // 插件请求过的缩放（这块视图**期望**是多少）。undefined = 从没被请求过 ——
     // 那时 `spaceRecord` 发布的是 Electron 读回来的当前值，而这里不插手。
     zoom: undefined,
+    /**
+     * 这块视图的缩放**现在归谁管**（票 #19）：`auto` = 外壳按栏宽自动适配，`manual` = 人
+     * （或工具）指名要的那个值，外壳不再动它。新视图从 `auto` 开始 —— 用户要的就是
+     * "不用我按 −"。
+     */
+    zoomMode: 'auto',
+    /** 这块视图上跑过几轮自动适配（一轮 = 一次"读、算、可能改"的循环）。诊断与证据用。 */
+    fitPasses: 0,
+    /** 那几轮里一共改了几次缩放。响应式页面的断言就是"栏宽变了而这个是 0"。 */
+    fitChanges: 0,
+    /** 最近一轮适配的原始记录（每一步读了什么、算了什么、停在哪），写进 `zoom.json`。 */
+    lastFit: undefined,
+    /**
+     * 这一页**曾经**有多宽（CSS 像素），只增不减，换页清空。
+     *
+     * 它是本票量出来的一个必需项，不是缓存优化：`documentElement.scrollWidth` **不会小于
+     * 视口宽度**，所以一个页面一旦塞得下，就再没有人报得出它的内容宽度 —— 而"栏拖宽了该回到
+     * 100%"正需要那个数（否则页面会永远停在为窄栏算出来的缩放上）。理由与原始测量见
+     * `shell/fit.js` 顶部的"偏离二"。
+     */
+    fitContentWidth: 0,
+    /**
+     * 这份文档被判定过"**缩放治不了它的溢出**"时，这里记着结论与原因；换页或被人交回自动时清空。
+     *
+     * 为什么必须记得住：那种页面（`width: 100vw` 配纵向滚动条、`calc(100% + 40px)`）的溢出
+     * 在 CSS 像素里是常数，缩得越小视口越大、内容也跟着变大，差永远消不掉。一轮一轮地"再试
+     * 一次"就是一路把它缩小 —— 拖动几次之后一个完全正常的页面会明显变小。
+     */
+    fitDeclined: undefined,
+    /**
+     * 上一份"溢出样本"（`{viewport, contentWidth}`），用来判断这一页的内容宽度是**常数**
+     * 还是**跟着视口走**（后者缩放治不了它的溢出）。与内容宽度一样属于**当前这份文档**。
+     */
+    fitSample: undefined,
+    /**
+     * "有人指名改过缩放"的代次。正在跑的一轮适配拿它当凭据：代次变了就作废，
+     * 免得把用户刚按下去的那个值又改回去（实测过这个 bug）。
+     */
+    zoomToken: 0,
   }
   state.spaces.set(name, entry)
   // 缩放**跟着视图走**，不跟着网站走（票 #13 定下的语义）。
@@ -590,12 +693,44 @@ function createSpace(name) {
   //
   // 代价写在 ADR-0013 里：用户自己用 Ctrl+滚轮调过的缩放会被下一次导航覆盖回这里的期望值。
   // 一个属性只能有一个主子，这是"跟视图走"这条选择的必然代价。
+  //
+  // 票 #19 把这条规则一分为二（见 `shell/fit.js` 与 ADR-0014）：
+  //   - `manual`：与上面那段一字不差 —— 把期望值按回去，换页也不丢（这是 #13 定下的语义，
+  //     也是"手动缩放优先"那条验收）；
+  //   - `auto`：换页就是**换了一页文档**，而自动适配是按这一页的宽度算的，所以先回到 100%
+  //     再重新适配。不这么做的话，一个响应式页面会停在"上一页是固定宽度文档"留下的 52% 上：
+  //     它没有横向溢出，而适配规则（按定义）对没有溢出的页面一步都不动 —— 那个 52% 就永远
+  //     回不来了。这是本票唯一一处要"先退回去再算"的地方，理由就在这一句。
   view.webContents.on('did-navigate', () => {
     const current = state.spaces.get(name)
-    if (current === undefined || current.zoom === undefined) return
+    if (current === undefined) return
     const contents = liveContents(current)
     if (contents === undefined) return
+    if (current.zoomMode === 'auto') {
+      // 这块视图还没显示过时不插手（第一次装载，或这一格还没被切到前台）：那时它占的
+      // 还是 `--bounds` 那个**占位矩形**，对着它算出来的适配没有意义。
+      if (current.view.getVisible() !== true) return
+      // 换页了：那个"这一页曾经有多宽"属于**上一份文档**，留着它会让新页面按旧宽度被缩放；
+      // 那条"缩放治不了它的溢出"的结论与它用的样本同理。
+      current.fitContentWidth = 0
+      current.fitSample = undefined
+      current.fitDeclined = undefined
+      current.zoomToken += 1
+      if (Math.abs(contents.getZoomFactor() - 1) > 1e-6) contents.setZoomFactor(1)
+      current.zoom = 1
+      writeZoomFile('navigation')
+      requestFit('navigation')
+      return
+    }
+    if (current.zoom === undefined) return
     if (Math.abs(contents.getZoomFactor() - current.zoom) > 1e-6) contents.setZoomFactor(current.zoom)
+  })
+  // 装载完之后再确认一次：`did-navigate` 是**提交**那一刻，文档可能还没排完版（图片、字体、
+  // 脚本都还在路上）。适配是幂等的，多跑一轮只会更准。
+  view.webContents.on('did-finish-load', () => {
+    const current = state.spaces.get(name)
+    if (current === undefined || current.view.getVisible() !== true) return
+    requestFit('load')
   })
   attachDownloadHandling(viewSession)
   return entry
@@ -903,6 +1038,10 @@ function spaceRecord(entry, contents, identity, cookieCount) {
     // 插件侧拿它当"缩放真的生效了"的唯一证据（`SpaceManager.setZoom`）。视图没了就没有这个
     // 字段：那时没人回答得出来，缺省比编一个 1 诚实。
     ...(live ? { zoom: contents.getZoomFactor() } : {}),
+    // 这个缩放**现在归谁管**（票 #19）：`auto` = 外壳按栏宽自动适配，`manual` = 人指名要的。
+    // 它与 `zoom` 一起发布，因为一个数离开它的主子就没有意义（"78%，但谁说了算？"）。
+    // 最新的读数在 `zoom.json` 里（那张表的发布代价太大，跟不上一次拖动）。
+    ...(live ? { zoomMode: entry.zoomMode } : {}),
     // 视图没了这件事**显式写明**，不静默省略：读表的人要能看见"这个空间现在动不了、为什么"。
     ...(live ? {} : { destroyed: true, contentsGoneAt: entry.contentsGoneAt }),
     ...(entry.inherited !== undefined ? { inherited: entry.inherited } : {}),
@@ -1004,6 +1143,9 @@ async function publishSpaces(cause) {
   } catch (error) {
     emit(`DSH_SHELL SPACES_WRITE_FAILED ${JSON.stringify({ message: error?.message ?? String(error) })}`)
   }
+  // 最新读数（`zoom.json`）跟着整张表一起刷新一次：发布是一件"这一刻的事实是这样"的声明，
+  // 而那份小文件说的是同一件事里最新的那一半（见 {@link writeZoomFile}）。
+  writeZoomFile(`spaces:${cause}`)
   emit(`DSH_SHELL SPACES ${JSON.stringify(record)}`)
   return record
 }
@@ -1045,7 +1187,13 @@ async function applySpaceRequest(raw) {
         // 反过来会让"给一个刚被关掉的空间设缩放"这种顺序错误变成一次无谓的失败。
         // 记录到 plan 里是为了让它出现在发布的 `lastRequest` 里（诊断用）。
         plan.zoom = parsed.request.zooms
-        for (const { name, zoom } of parsed.request.zooms) applyZoom(name, zoom)
+        for (const request of parsed.request.zooms) {
+          // `auto` 那一种是"把这一格交回自动适配"（票 #19）：它要**等这一轮适配跑完**再发布 ——
+          // 发布出去的那个 zoom 是 `getZoomFactor()` 的读回值，而适配正是它紧接着的来源。
+          // 不等它，按一下「自动」得到的回答会是"自动 100%"，而画面已经是 52% 了。
+          if (request.mode === 'auto') await handBackToAuto(request.name, 'auto-request')
+          else applyZoom(request.name, request.zoom)
+        }
       } catch (error) {
         state.spaceError = error?.message ?? String(error)
       }
@@ -1077,8 +1225,13 @@ async function applySpaceRequest(raw) {
  * 读回由 {@link spaceRecord} 里的 `contents.getZoomFactor()` 负责：这里**只改**，不记录改了
  * 多少 —— 发布出去的那个数必须是 Electron 说的，不是我们写下去的。
  *
+ * 票 #19 起它同时是"**人接管了缩放**"这件事的落点：一个指名要某个缩放值的请求，语义上就是
+ * "这个值我说了算"，所以这里的视图从此是 `manual` —— 栏宽再变，外壳也不会去改它
+ * （票面那条"手动缩放优先"的验收）。把这一格交回自动适配的是另一个动作
+ * （{@link handBackToAuto}，面板上那颗「自动」）。
+ *
  * @param {string} name - 空间名（已经由 {@link spaces.parseRequest} 校验过形状）。
- * @param {number} zoom - 期望的缩放值。
+ * @param {number | undefined} zoom - 期望的缩放值；只改模式时可以缺席。
  * @throws 空间不存在、或它的视图已经没有 webContents 时（原因会写进 state）。
  */
 function applyZoom(name, zoom) {
@@ -1091,10 +1244,333 @@ function applyZoom(name, zoom) {
         'so there is nothing to scale',
     )
   }
-  contents.setZoomFactor(zoom)
-  // 记住**期望值**：主文档导航之后要把它重新按上去（Chromium 的缩放是按站点记的，
-  // 换站点会回到那个站点的默认值）。读回仍然走 `getZoomFactor()`。
-  entry.zoom = zoom
+  if (zoom !== undefined) {
+    contents.setZoomFactor(zoom)
+    // 记住**期望值**：主文档导航之后要把它重新按上去（Chromium 的缩放是按站点记的，
+    // 换站点会回到那个站点的默认值）。读回仍然走 `getZoomFactor()`。
+    entry.zoom = zoom
+  }
+  entry.zoomMode = 'manual'
+  // 正在跑的那一轮适配立刻作废：它是照着旧状态算的，照着它写下去就是把用户刚按的值抹掉。
+  entry.zoomToken += 1
+  writeZoomFile('zoom-request')
+}
+
+/**
+ * 把一块视图交回自动适配（票 #19）。
+ *
+ * 三件事，顺序是有理由的：
+ *  1. 模式先归 `auto`，并且**先回到 100%** —— 自动适配算的是"这一页在这个栏宽里该是多少"，
+ *     而它只在页面**溢出**时才动手（响应式页面一步都不动，票面点名要求的那条）。所以若不先回
+ *     100%，一个没有溢出的页面会永远停在上一页/上一次手工留下的那个值上，而那个值是谁留下的
+ *     已经没人说得清了；
+ *  2. 立刻写一次 `zoom.json`：面板上那个读数（"自动 100% → 自动 52%"）要跟着走；
+ *  3. **等这一轮适配跑完**再返回 —— 调用方（{@link applySpaceRequest}）紧接着就要发布整张
+ *     空间表，而表里那个 `zoom` 是读回来的值；不等它，那一按的答案就会是适配**之前**的数。
+ *
+ * @param {string} name - 空间名。
+ * @param {string} cause - 为什么交回自动（诊断用）。
+ * @returns {Promise<void>} 适配跑完就 resolve。
+ */
+async function handBackToAuto(name, cause) {
+  const entry = state.spaces.get(name)
+  if (entry === undefined) throw new Error(`cannot hand "${name}" back to automatic fitting: there is no such space`)
+  const contents = liveContents(entry)
+  if (contents === undefined) {
+    throw new Error(
+      `cannot hand "${name}" back to automatic fitting: its view has no webContents any more ` +
+        '(it was destroyed), so there is nothing to fit',
+    )
+  }
+  entry.zoomMode = 'auto'
+  // "交回自动"是用户明确要的 ⇒ 之前那条"缩放治不了这一页"的结论与它的样样本一起作废，重新试一次。
+  // 试还是治不了的话，下一轮会再判定一次（并且依旧放回 100%，不会留下任何缩小）。
+  entry.fitDeclined = undefined
+  entry.fitSample = undefined
+  entry.zoomToken += 1
+  if (Math.abs(contents.getZoomFactor() - 1) > 1e-6) contents.setZoomFactor(1)
+  entry.zoom = 1
+  writeZoomFile(cause)
+  await runScheduledFit(cause, name)
+}
+
+/**
+ * 把"每块视图现在缩放多少、谁在管、适配跑成什么样"写进 `zoom.json`（票 #19）。
+ *
+ * 为什么不是只写 `state.json`：那一版是整张空间表 —— 列 CDP 目标、逐空间问 `cookies.get({})`，
+ * 实测一次发布 ~0.9 秒（ADR-0013 的诚实清单，本票又量了一次）。而自动适配在拖动侧边栏时要
+ * 跟着每一帧走，把那个代价压在拖动上等于让功能自己拖死自己。所以"最新读数"单独一个小文件，
+ * **方向与目录都与 `state.json` 一致**（外壳写、插件读），几百字节、无列举、无轮询。
+ *
+ * 两个地方都写的是 `getZoomFactor()` 的**读回值**，所以它们不可能互相矛盾：
+ * `state.json` 里那个只是可能更旧。
+ *
+ * @param {string} cause - 为什么要写这一次（诊断用）。
+ * @returns {object} 写下去的那条记录。
+ */
+function writeZoomFile(cause) {
+  const readings = {}
+  for (const entry of state.spaces.values()) {
+    const contents = liveContents(entry)
+    // 视图没了的空间不进这份读数：那时没人答得出来，缺省比编一个数诚实（与 `spaceRecord` 同一条规矩）。
+    if (contents === undefined) continue
+    readings[entry.name] = {
+      zoom: contents.getZoomFactor(),
+      mode: entry.zoomMode,
+      fitPasses: entry.fitPasses,
+      fitChanges: entry.fitChanges,
+      // "缩放治不了这一页的溢出"这条结论**说出来**：它是"适配在管着、但它决定不动手"的
+      // 唯一解释，藏起来的话面板上那个不动的数看起来就像坏了。
+      ...(entry.fitDeclined !== undefined ? { fitDeclined: entry.fitDeclined.reason } : {}),
+      ...(entry.lastFit !== undefined ? { lastFit: entry.lastFit } : {}),
+    }
+  }
+  const record = { protocol: spaces.SPACE_PROTOCOL, at: Date.now(), cause, spaces: readings }
+  try {
+    writeJsonAtomic(state.spaceChannel.zoomFile, record)
+  } catch (error) {
+    // 这份文件是"最新读数"的快捷方式，不是任何东西的前提：写不动就发一行，绝不因此中断缩放。
+    emit(`DSH_SHELL ZOOM_WRITE_FAILED ${JSON.stringify({ message: error?.message ?? String(error) })}`)
+  }
+  return record
+}
+
+/**
+ * 问页面一句"你现在有多宽、里面有多宽"。
+ *
+ * 只读、不改、不注入任何东西；读不到（正在换文档、视图没了）就是 `undefined`，由调用方决定怎么办。
+ *
+ * @param {object} contents - 活着的 webContents。
+ * @returns {Promise<{clientWidth: number, scrollWidth: number} | undefined>} 页面报的两个宽度。
+ */
+async function readFitWidths(contents) {
+  const seen = await contents.executeJavaScript(FIT_READ_EXPRESSION, false)
+  if (seen === null || typeof seen !== 'object') return undefined
+  return { clientWidth: seen.clientWidth, scrollWidth: seen.scrollWidth }
+}
+
+/**
+ * 等页面**真的按新缩放重新排版**过，再读下一次。
+ *
+ * 这是本票**量出来的**一个坑，不是防御性编程：`setZoomFactor()` 之后立刻 `executeJavaScript`
+ * 读回来的可能还是**旧**的布局视口（缩放要经一次浏览器进程 → 渲染进程的视口更新）。
+ * 实测症状很显眼：把 1200px 的页面往 620 的栏里适配，第一次乘出 0.5166，第二次读到的还是
+ * `clientWidth = 620`（旧的），于是又乘一次同一个比例 ⇒ **0.2668** —— 页面被缩得远小于"刚好塞下"，
+ * 而且 `devicePixelRatio` 会一路掉到 0.4 去。所以两次读之间必须等到"页面报的数真的变了"。
+ *
+ * 判据用页面自己的两个数：缩放一定改布局视口，所以 `clientWidth` 一定会变（等不到就是有界地放弃，
+ * 并如实写进那一步的记录里）。
+ *
+ * @param {object} contents - 活着的 webContents。
+ * @param {{clientWidth: number, scrollWidth: number}} before - 改缩放之前那一次读到的数。
+ * @param {number} timeoutMs - 最多等这么久。
+ * @returns {Promise<boolean>} 页面报的数变了为真。
+ */
+async function waitForRelaidOut(contents, before, timeoutMs) {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    await delay(FIT_RELAYOUT_POLL_MS)
+    let seen
+    try {
+      seen = await readFitWidths(contents)
+    } catch {
+      return false
+    }
+    if (seen === undefined) return false
+    if (seen.clientWidth !== before.clientWidth || seen.scrollWidth !== before.scrollWidth) return true
+  }
+  return false
+}
+
+/**
+ * 跑一轮自动适配：读页面、算、可能需要改，改完再读一次（**有界**）。
+ *
+ * 一轮 = 最多 {@link fit.MAX_STEPS} 次"读 → 算 → 改（→ 等重新排版）"。为什么不止一次：缩放改的是
+ * **布局视口**，所以改完之后页面报的宽度就变了 —— 收敛判据只能在下一次读回里看到
+ * （`shell/fit.js` 顶部有为什么它两步就收敛的推演，`tests/fit-rule.spec.ts` 与
+ * `tests/fit-to-pane.spec.ts` 有量出来的）。
+ *
+ * 全程**只做三件事**：读两个数、可能调 `setZoomFactor`、记下"这一页曾经有多宽"。它不导航、
+ * 不注入、不碰页面内容 —— 这不是一条新的驱动通道，而只是"这一格该画多大"这件事的延伸（ADR-0014）。
+ *
+ * @param {string} cause - 谁请的这一轮（诊断与证据用）。
+ * @param {string} [name] - 哪个空间；缺省是当前空间。
+ * @returns {Promise<void>} 一轮跑完就 resolve。
+ */
+async function runFitPass(cause, name) {
+  const entry = state.spaces.get(name ?? state.activeSpace)
+  if (entry === undefined || entry.zoomMode !== 'auto') return
+  const contents = liveContents(entry)
+  if (contents === undefined) return
+  // 这份文档已经被判定"缩放治不了它的溢出"（见 `shell/fit.js` 的 `contentTracksViewport`）：
+  // 不再试。一条**记得住的**结论，不是每一轮重新试一次 —— 重试就是一路缩下去。
+  if (entry.fitDeclined !== undefined) return
+  const startedAt = Date.now()
+  /**
+   * 这一轮的"代次"。任何人指名改缩放、或把它交回自动，都会让这个数 +1，于是**正在跑的这一轮
+   * 立刻作废**：它算出来的目标是照着旧状态算的，照着它写下去就等于把用户刚按的那个值抹掉。
+   * 实测过这个 bug：面板上按 `100%` 之后，一次在飞的一轮把它又改回 0.5167，而模式已经是 manual。
+   */
+  const token = entry.zoomToken
+  const steps = []
+  let changed = 0
+  for (let step = 1; step <= fit.MAX_STEPS; step += 1) {
+    if (entry.zoomToken !== token || entry.zoomMode !== 'auto') {
+      steps.push({ step, aborted: 'a zoom request arrived while this pass was running' })
+      break
+    }
+    let widths
+    try {
+      widths = await readFitWidths(contents)
+    } catch (error) {
+      steps.push({ step, unreadable: error?.message ?? String(error) })
+      break
+    }
+    if (widths === undefined) {
+      steps.push({ step, unreadable: 'the page did not answer with two widths' })
+      break
+    }
+    const before = contents.getZoomFactor()
+    /**
+     * 这一份读回也是一份"溢出样本"（只在这页真的溢出时才有）。
+     *
+     * 两份样本一比就知道这一页的内容宽度是**常数**（固定宽度排版，适配有意义）还是
+     * **跟着视口走**（`width: 100vw` 配滚动条那类，缩放治不了）—— 见 `shell/fit.js`
+     * 的 `contentTracksViewport`。判据刻意**不**用"缩一次看看有没有变好"：拖动时栏宽一直在变，
+     * 那样会误判（实测：页面停在 93% 而栏早就到了 620）。
+     */
+    const sample = fit.overflowSample(widths)
+    if (sample !== undefined) {
+      if (fit.contentTracksViewport(entry.fitSample, sample)) {
+        // 治不了 ⇒ 放回 100%（这一页的"正常状态"就是 100%，缩一点点对它没有任何好处），
+        // 记下结论，这份文档此后不再尝试。
+        if (Math.abs(before - 1) > 1e-6) contents.setZoomFactor(1)
+        entry.zoom = 1
+        entry.fitDeclined = {
+          at: Date.now(),
+          overflow: sample.contentWidth - sample.viewport,
+          reason:
+            `this page's width follows its viewport, so its overflow (${String(sample.contentWidth - sample.viewport)}px) ` +
+            'cannot be removed by zooming — automatic fitting leaves this document at 100%',
+        }
+        steps.push({ step, ...widths, declined: entry.fitDeclined.reason, revertedTo: 1 })
+        break
+      }
+      entry.fitSample = sample
+      // 记下"这一页曾经有多宽"：**只有真的溢出时**页面报的那个 `scrollWidth` 才是内容宽度，
+      // 没溢出时它是被视口夹住的结果（等于 `clientWidth`），记下来会把一个响应式页面
+      // 记成固定宽度页。它属于**当前这份文档**，所以换页时清空（见 `did-navigate` 那一段）。
+      entry.fitContentWidth = Math.max(entry.fitContentWidth, sample.contentWidth)
+    }
+    const decision = fit.nextFitZoom({ zoom: before, ...widths, contentWidth: entry.fitContentWidth })
+    if (decision.zoom === null) {
+      steps.push({ step, ...widths, contentWidth: decision.contentWidth, zoom: before, hold: decision.reason })
+      break
+    }
+    // 落笔之前再确认一次"没人在这中间插过手"（见上面 token 的说明）：这一次检查与 `setZoomFactor`
+    // 之间只剩下同步的几行，窗口从"一次页面往返"缩到微秒级。
+    if (entry.zoomToken !== token || entry.zoomMode !== 'auto') {
+      steps.push({ step, aborted: 'a zoom request arrived while this pass was running' })
+      break
+    }
+    contents.setZoomFactor(decision.zoom)
+    entry.zoom = decision.zoom
+    changed += 1
+    steps.push({
+      step,
+      ...widths,
+      contentWidth: decision.contentWidth,
+      from: before,
+      to: decision.zoom,
+      ratio: decision.ratio,
+      ...(decision.capped !== undefined ? { capped: decision.capped } : {}),
+    })
+    // 等页面真的按新缩放排版过，再读下一次（理由与实测见 {@link waitForRelaidOut}）。
+    const relaidOut = await waitForRelaidOut(contents, widths, FIT_RELAYOUT_TIMEOUT_MS)
+    if (!relaidOut) {
+      steps.push({ step, note: 'the page did not report a new layout after the zoom, so the loop stops here' })
+      break
+    }
+  }
+  entry.fitPasses += 1
+  entry.fitChanges += changed
+  entry.lastFit = { cause, at: Date.now(), changed, steps }
+  // **每一轮都写一次**，改没改都写：`fitPasses` 涨了而 `fitChanges` 没涨，正是"适配跑了、
+  // 判断是不动手"这件事的唯一读数 —— 响应式页面那条断言量的就是这个（见 zoom.json 的说明）。
+  writeZoomFile(`fit:${cause}`)
+  // stdout 上在两种时候发一行：**真的改了**（拖动一个响应式页面时它每 80ms 跑一轮而一步不动，
+  // 那时候的安静是有意的，"跑了但没动"由 zoom.json 里的两个计数说），以及**判定治不了**
+  // （那是一条结论，必须说出来，否则"适配在管却什么也没做"就没人看得见为什么）。
+  if (changed > 0 || entry.fitDeclined !== undefined) {
+    emit(
+      `DSH_SHELL FIT ${JSON.stringify({ space: entry.name, cause, ms: Date.now() - startedAt, changed, steps })}`,
+    )
+  }
+}
+
+/**
+ * 跑一轮适配，并且保证**同一时刻只有一轮**。
+ *
+ * 拖动时请求会连着来，而一轮本身是异步的（两次 `executeJavaScript` 往返）。所以：
+ * 正在跑的时候来的请求只把 `pending` 立起来，跑完立刻再跑一轮（对着那时最新的几何）。
+ *
+ * @param {string} cause - 谁请的。
+ * @param {string} [name] - 哪个空间。
+ * @returns {Promise<void>} 这一串跑完（或直接被挡掉）就 resolve。
+ */
+async function runScheduledFit(cause, name) {
+  if (state.fit.running) {
+    // 已经有一轮在跑：它会看到最新几何（下面那个 do/while），这里不叠第二轮。
+    state.fit.pending = true
+    return
+  }
+  state.fit.running = true
+  try {
+    do {
+      state.fit.pending = false
+      await runFitPass(cause, name)
+    } while (state.fit.pending === true && state.shuttingDown !== true)
+  } finally {
+    state.fit.running = false
+    state.fit.lastAt = Date.now()
+  }
+}
+
+/**
+ * 请外壳跑一轮自动适配（票 #19 的触发口）。
+ *
+ * 触发它的是"视图的几何刚刚变了"（{@link applyPlacement}）与"页面换了/装载完了"
+ * （`did-navigate` / `did-finish-load`）。**不是**面板那条请求通道 —— 那条路上一次要 ~1 秒
+ * （ADR-0013 实测），拖动侧边栏时那就是废的。
+ *
+ * 两个闸门：
+ *   - `zoomMode !== 'auto'`：人（或工具）指名过缩放，自动适配**让位**；
+ *   - 视图没显示（面板没报矩形、被折叠、切走了）：那一刻没有"栏宽"可言。
+ *
+ * @param {string} cause - 谁请的（诊断与证据用）。
+ */
+function requestFit(cause) {
+  if (state.shuttingDown) return
+  const entry = activeEntry()
+  if (entry === undefined || entry.zoomMode !== 'auto') return
+  if (entry.view.getVisible() !== true) return
+  if (state.fit.running) {
+    state.fit.pending = true
+    return
+  }
+  const since = Date.now() - state.fit.lastAt
+  if (since >= FIT_MIN_INTERVAL_MS) {
+    void runScheduledFit(cause)
+    return
+  }
+  // 还在节流窗口里：排一轮到窗口末尾。**尾随那一轮是必须的** —— 只延迟不补的话，
+  // 一次拖动的最后那几帧（也就是最终栏宽）就再也没人看过了。
+  if (state.fit.timer === undefined) {
+    state.fit.timer = setTimeout(() => {
+      state.fit.timer = undefined
+      void runScheduledFit('trailing')
+    }, FIT_MIN_INTERVAL_MS - since)
+  }
 }
 
 /**

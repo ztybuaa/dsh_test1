@@ -293,7 +293,7 @@ describe('票 #18 · 历史是引擎说的，不是账本猜的', () => {
     console.log('RAW 那一格向宿主问过什么: ' + JSON.stringify(mounted.rpcCalls))
     expect(raw.toolbarPresent, '那一格必须在页面上真的画出来了').toBe(1)
     expect(mounted.rpcCalls, '那一格至少向宿主问过一次状态').toContain('desktop-view-state')
-    expect(raw.order).toEqual(['back', 'forward', 'reload', 'zoom-out', 'zoom-reset', 'zoom-in', 'restart'])
+    expect(raw.order).toEqual(['back', 'forward', 'reload', 'zoom-out', 'zoom-reset', 'zoom-in', 'auto', 'restart'])
     // **这一条就是票面要的那句话**：读的是 DOM 的 `disabled` 属性本身。
     expect(raw.backDisabled, '宿主答 canGoBack: true，那一格就不许还是灰的').toBe(false)
     // 量具自检：没有前进分支时它照旧是灰的 —— 否则上面那一条可能只是"这个属性永远是 false"。

@@ -67,6 +67,10 @@ var COPY = {
       '普通浏览器标签页里它没有东西可显示。',
     ready: '桌面外壳已就位：这一格交给原生浏览器视图。',
     missing: '这一格没有量到矩形（可能被折叠或切走了）。',
+    // 票 #19：缩放读数上那两个词。面板必须让人**看得出来**现在是谁在管这个缩放，
+    // 否则"自动适配没动"与"自动适配不在管"在界面上长得一模一样。
+    zoomAuto: '自动',
+    zoomManual: '手动',
   },
   en: {
     noShell:
@@ -75,6 +79,8 @@ var COPY = {
       'browser tab has nothing to put here.',
     ready: 'The desktop shell is here: the native browser view takes this pane.',
     missing: 'This pane reports no rectangle (collapsed or switched away).',
+    zoomAuto: 'auto',
+    zoomManual: 'manual',
   },
 }
 
@@ -89,6 +95,18 @@ function copy() {
   var table = COPY[language()]
   return table !== undefined ? table : COPY.en
 }
+
+/**
+ * 栏宽变化之后，工具条那个读数最多隔多久重读一次（票 #19）。
+ *
+ * 为什么要有这一条：自动适配是**外壳**按新栏宽改的缩放，而面板上那个数只在"按下某个按钮"
+ * 或"页面刚打开"时读过。拖动侧边栏之后不重读的话，画面已经 52% 了，读数还写着 `自动 100%`
+ * —— 那正是票面说的"不许让人看不出来"的反面。
+ *
+ * 为什么要节流：拖动时面板每一帧都上报一次几何，而每一次重读都要走宿主一个来回
+ * （HTTP + 一次页面读回），400ms 一次既跟得上手，又不会把宿主刷满。
+ */
+var PANEL_REFRESH_MIN_MS = 400
 
 /**
  * The client context, kept where the toolbar can reach it.
@@ -172,7 +190,8 @@ async function callView(ctx, action) {
  * is not covered by its own controls. It also **loses the race on purpose** where it should:
  * the status line is the only thing it says, and it says it from the host's read-back.
  *
- * @param {{ctx: object, hasShell: boolean}} props - the plugin context, and whether the shell is here.
+ * @param {{ctx: object, hasShell: boolean, geometryTick?: number}} props - the plugin context, whether
+ *   the shell is here, and a counter that goes up whenever the pane's own rectangle changed.
  * @returns {import('react').ReactElement} the toolbar element.
  */
 function Toolbar(props) {
@@ -182,13 +201,14 @@ function Toolbar(props) {
     ok: null,
     url: '',
     zoom: undefined,
+    zoomMode: undefined,
     canGoBack: false,
     canGoForward: false,
     message: '',
     busy: false,
   })
 
-  /** Ask the host what is true right now, and show that. */
+  /** 读一次"外壳现在说什么"，并把结果落到那一行上。 */
   var refresh = react.useCallback(function () {
     void callView(props.ctx, 'state').then(function (next) {
       setState(function (previous) {
@@ -222,6 +242,45 @@ function Toolbar(props) {
   // render: a render that started a request would start one per re-render.
   react.useEffect(function () {
     refresh()
+  }, [])
+
+  /**
+   * 栏宽变了 ⇒ 那个读数要重读（票 #19）。
+   *
+   * 这一格自己**知道**栏宽什么时候变：面板矩形一变就上报一次，而外壳正是拿那个矩形决定
+   * 视图多大、并（在自动模式下）按新宽度重新适配页面。所以几何一动就要问一次
+   * "现在是多少、谁在管"，否则读数会停在上一次按下的那个数上。
+   *
+   * 节流到 {@link PANEL_REFRESH_MIN_MS}，并且**补最后一次**：拖动中间隔多久都行，
+   * 但停下来之后那一次必须发出去 —— 那才是最终状态。
+   */
+  var lastReadAt = react.useRef(0)
+  var pendingRead = react.useRef(0)
+  react.useEffect(
+    function () {
+      if (props.geometryTick === undefined || props.geometryTick === 0) return
+      var since = Date.now() - lastReadAt.current
+      if (since >= PANEL_REFRESH_MIN_MS) {
+        lastReadAt.current = Date.now()
+        refresh()
+        return
+      }
+      if (pendingRead.current !== 0) return
+      pendingRead.current = setTimeout(function () {
+        pendingRead.current = 0
+        lastReadAt.current = Date.now()
+        refresh()
+      }, PANEL_REFRESH_MIN_MS - since)
+    },
+    [props.geometryTick],
+  )
+
+  // 面板走了就把排着的那次读撤掉：一个卸载之后再打出去的请求只会写到一个已经不存在的状态上。
+  react.useEffect(function () {
+    return function () {
+      if (pendingRead.current !== 0) clearTimeout(pendingRead.current)
+      pendingRead.current = 0
+    }
   }, [])
 
   // Keyboard shortcuts. Registered on the window because the panel is one element among
@@ -285,6 +344,13 @@ function Toolbar(props) {
     )
   }
 
+  // 票 #19：那个读数带上"谁在管"（自动 / 手动）。词来自本文件前面那张文案表 ——
+  // `src/toolbar.js` 一行文案都不带，它只回答"该怎么拼"。
+  var zoomText = toolbar.zoomReading(state.zoom, state.zoomMode, {
+    auto: copy().zoomAuto,
+    manual: copy().zoomManual,
+  })
+
   return react.createElement(
     'div',
     {
@@ -306,7 +372,7 @@ function Toolbar(props) {
     react.createElement(
       'span',
       {
-        'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
+        'data-dsh-view-zoom': zoomText,
         style: {
           marginLeft: 'auto',
           font: '11px/1.3 system-ui',
@@ -320,7 +386,7 @@ function Toolbar(props) {
         },
         title: toolbar.statusText(state),
       },
-      toolbar.zoomLabel(state.zoom) + ' \u00b7 ' + toolbar.statusText(state),
+      zoomText + ' \u00b7 ' + toolbar.statusText(state),
     ),
   )
 }
@@ -344,6 +410,11 @@ function Panel(props) {
   /** 被测量的那一块（`data-dsh-desktop-view-panel` 那个 div）：原生画面就摆在这里。 */
   var bodyRef = react.useRef(null)
   var [report, setReport] = react.useState({ rect: null, state: 'detached' })
+  /**
+   * 面板矩形变过几次（票 #19）。工具条拿它当"栏宽可能变了"的信号：拖动侧边栏时它每一帧都涨，
+   * 而工具条那边节流之后才去重读缩放读数。涨这个数不额外引起渲染 —— 上报本来就会 setReport。
+   */
+  var [geometryTick, setGeometryTick] = react.useState(0)
 
   // The observer outlives every render, so it is created once and its `element` is
   // re-read on every measurement: React may replace the DOM node without the
@@ -357,6 +428,9 @@ function Panel(props) {
       },
       onReport: function (rect, state) {
         setReport({ rect: rect, state: state })
+        setGeometryTick(function (previous) {
+          return previous + 1
+        })
         DshPanelRect.deliver(rect)
       },
     })
@@ -416,7 +490,7 @@ function Panel(props) {
         position: 'relative',
       },
     },
-    hasShell ? react.createElement(Toolbar, { ctx: clientContext, hasShell: hasShell }) : null,
+    hasShell ? react.createElement(Toolbar, { ctx: clientContext, hasShell: hasShell, geometryTick: geometryTick }) : null,
     react.createElement(
       'div',
       {

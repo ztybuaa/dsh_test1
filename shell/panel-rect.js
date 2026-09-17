@@ -144,6 +144,23 @@
    * Duplicate reports are suppressed: the shell must be able to treat every message
    * as a real change without doing its own diffing.
    *
+   * ## 谁负责什么（票 #19 之前这里有一句话是假的）
+   *
+   * 三条线各管一段，一条都不能少：
+   *
+   *   1. **`ResizeObserver`** —— 元素**自己的盒子**变了（拖分栏条就是这一种）。它必须真的
+   *      挂上去：观察者是在**第一次渲染时**建的，而那一刻 React 的 DOM 引用还没挂上
+   *      （`elementRef.current === null`），所以"建观察者的时候就 `observe` 一次"这条线
+   *      **从来没有生效过**（票 #19 第二条评论里的那个缺陷）。现在观察者在每次测量前把
+   *      自己**重新指向**当前那个节点（{@link pointObserverAt}），于是元素换了、节点后挂上
+   *      都跟得上，注释与代码是同一句话。
+   *   2. **窗口 resize** —— 视口变了，元素可能跟着变（百分比宽度）。
+   *   3. **每帧一次测量**（`tick`）—— 前两条都看不见的那些变化：把一个 `display: none` 的
+   *      祖先打开**不会**改变元素的盒子尺寸，`ResizeObserver` 因此不响。它是**安全网**，
+   *      不是主要机制：主要机制是 1 与 2。反过来说，谁把 `tick` 拿掉，1 与 2 仍然兜得住。
+   *
+   * 三条线都只是**测量**：它们不产生任何新的副作用，重复的报告由下面的 `sameRect` 挡掉。
+   *
    * @param {{element?: Element | null, onReport: (rect: PanelRect | null, state: PanelState) => void}} options
    *   `element` is read on every measurement, so a caller may point it at a new node;
    *   `onReport` is called synchronously once on attach and then on changes.
@@ -156,7 +173,26 @@
     var haveLast = false
     var stopped = false
     var observer = null
+    /** 观察者现在盯着的那个节点。null = 还没有节点可盯（第一次渲染时就是这样）。 */
+    var observed = null
     var frame = 0
+
+    /**
+     * 把观察者重新指向 `options.element` —— 它可能在两次测量之间换了节点。
+     *
+     * 这就是"元素只在建立观察者那一刻读一次"那个缺陷的修法：读数与观察**用同一个节点**，
+     * 而且每次测量前都对一次。节点还没挂上时什么都不做（下一次测量会再对一次）。
+     *
+     * @param {Element | null | undefined} element - 现在该盯的那个节点。
+     * @returns {void}
+     */
+    function pointObserverAt(element) {
+      if (observer === null) return
+      if (element === observed) return
+      if (observed !== null && observed !== undefined) observer.unobserve(observed)
+      observed = element
+      if (element !== null && element !== undefined) observer.observe(element)
+    }
 
     /**
      * Measure and report, unless nothing changed.
@@ -165,6 +201,7 @@
      */
     function report(force) {
       if (stopped) return
+      pointObserverAt(options.element)
       var current = measure(options.element)
       if (force !== true && haveLast && sameRect(last.rect, current.rect) && last.state === current.state) return
       last = current
@@ -185,12 +222,11 @@
       frame = hostGlobal.requestAnimationFrame(tick)
     }
 
-    var element = options.element
     if (typeof hostGlobal.ResizeObserver === 'function') {
       observer = new hostGlobal.ResizeObserver(function () {
         report(false)
       })
-      if (element !== null && element !== undefined) observer.observe(element)
+      pointObserverAt(options.element)
     }
     if (typeof hostGlobal.addEventListener === 'function') {
       hostGlobal.addEventListener('resize', function () {
@@ -206,6 +242,7 @@
       stop: function () {
         stopped = true
         if (observer !== null) observer.disconnect()
+        observed = null
         if (frame !== 0 && typeof hostGlobal.cancelAnimationFrame === 'function') hostGlobal.cancelAnimationFrame(frame)
         frame = 0
       },

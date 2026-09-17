@@ -176,6 +176,14 @@ export interface ViewPlacement {
   visible: boolean
   /** The rectangle the panel asked for, or null when it asked for none. */
   bounds: { x: number; y: number; width: number; height: number } | null
+  /**
+   * 面板**原样报上来的**那个矩形（未经窗口裁剪），或 null。
+   *
+   * 与 `bounds` 分开：`bounds` 是外壳决定要用的那个（已经被窗口裁过），而这一份是"面板说
+   * 这一格有多大"。票 #19 的用例要等"拖动真的把栏拖到了 620" —— 那个 620 是**报上来**的那个数，
+   * 而一件宽过窗口的矩形（比如 1240 的栏在 1226 的窗口里）被裁过之后就不是它了。
+   */
+  reported?: { x: number; y: number; width: number; height: number } | null
   /** What `view.getBounds()` actually answered after the placement ran. */
   applied: { x: number; y: number; width: number; height: number } | null
   /**

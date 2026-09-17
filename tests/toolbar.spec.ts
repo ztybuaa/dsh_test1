@@ -25,6 +25,7 @@ interface ToolbarApi {
     state: { canGoBack: boolean; canGoForward: boolean; busy: boolean; hasShell: boolean },
   ) => boolean
   zoomLabel: (zoom: unknown) => string
+  zoomReading: (zoom: unknown, mode: unknown, words?: { auto?: string; manual?: string }) => string
   statusText: (state: { url: string; zoom: unknown; message: string; ok: boolean | null }) => string
   actionForKey: (
     event: { key: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean },
@@ -57,6 +58,10 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
     console.log('RAW toolbar buttons: ' + JSON.stringify(toolbar.BUTTONS.map((button) => button.action)))
     // 票面原文：**后退 · 前进 · 刷新 · 缩放(− / 百分比 / +) · 重置 · 重新开始**。
     // "百分比"是状态行上那个标签（`zoomLabel`），另外六个是按钮。
+    //
+    // 票 #19 加了第七个：**`auto`**（把这一格交回自动适配）。它不是多加了一颗装饰按钮 ——
+    // 自动适配一旦被人指名过的缩放顶掉就不会自己回来（换页不丢缩放是 #13 钉住的语义），
+    // 没有这颗按钮，手动模式就是一个进得去出不来的状态。理由写在 `src/toolbar.js` 那一行上。
     expect(toolbar.ACTIONS).toEqual([
       'back',
       'forward',
@@ -64,6 +69,7 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
       'zoom-out',
       'zoom-reset',
       'zoom-in',
+      'auto',
       'restart',
     ])
   })
@@ -74,7 +80,7 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
     const { viewEndpointPath } = (await import('../src/view-rpc.ts')) as typeof import('../src/view-rpc.ts')
     for (const button of toolbar.BUTTONS) {
       const action = button.action === 'zoom-reset' ? 'zoom-reset' : button.action
-      const paths = ['back', 'forward', 'reload', 'restart', 'zoom-in', 'zoom-out', 'zoom-reset', 'state']
+      const paths = ['back', 'forward', 'reload', 'restart', 'zoom-in', 'zoom-out', 'zoom-reset', 'auto', 'state']
       if (!paths.includes(action)) continue
       expect(viewEndpointPath(action)).toBe(`/api/desktop-view-${action}`)
     }
@@ -109,6 +115,31 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
     expect(toolbar.zoomLabel(undefined)).toBe('\u2014')
     expect(toolbar.zoomLabel(Number.NaN)).toBe('\u2014')
     expect(toolbar.zoomLabel('1.5')).toBe('\u2014')
+  })
+
+  it('读数要说清是哪种模式（票 #19）：自动 78% / 手动 90%，而不知道就不带前缀', () => {
+    const words = { auto: '自动', manual: '手动' }
+    console.log(
+      'RAW 缩放读数的四种形状: ' +
+        JSON.stringify({
+          auto: toolbar.zoomReading(0.78, 'auto', words),
+          manual: toolbar.zoomReading(0.9, 'manual', words),
+          unknown: toolbar.zoomReading(0.9, undefined, words),
+          unreadable: toolbar.zoomReading(undefined, 'auto', words),
+        }),
+    )
+    // 票面原话：读数的样子要像 `自动 78%` / `手动 90%`，**不许让人看不出来**。
+    expect(toolbar.zoomReading(0.78, 'auto', words)).toBe('自动 78%')
+    expect(toolbar.zoomReading(0.9, 'manual', words)).toBe('手动 90%')
+    // 读不到模式 ⇒ 退回一个光秃秃的百分比，**不猜**：`90%` 说的是"这是 90%"，
+    // 而猜出来的 `自动 90%` 说的是"外壳在按栏宽适配它" —— 后者可能不成立。
+    expect(toolbar.zoomReading(0.9, undefined, words)).toBe('90%')
+    expect(toolbar.zoomReading(0.9, 'something-else', words)).toBe('90%')
+    // 连数都读不到时，模式也没有意义：一个 `—` 就够了。
+    expect(toolbar.zoomReading(undefined, 'auto', words)).toBe('\u2014')
+    expect(toolbar.zoomReading(Number.NaN, 'manual', words)).toBe('\u2014')
+    // 没有词表时也只显示百分比（这个词表刻意住在文案表里，见 `src/toolbar.js`）。
+    expect(toolbar.zoomReading(0.9, 'auto')).toBe('90%')
   })
 
   it('状态行永远说点什么，失败时那句话是主句', () => {

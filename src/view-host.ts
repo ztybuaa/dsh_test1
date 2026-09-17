@@ -63,6 +63,7 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
       url: state.url,
       title: state.title,
       zoom: state.zoom,
+      ...(state.zoomMode !== undefined ? { zoomMode: state.zoomMode } : {}),
       devicePixelRatio: state.devicePixelRatio ?? Number.NaN,
       innerWidth: state.innerWidth ?? Number.NaN,
       innerHeight: state.innerHeight ?? Number.NaN,
@@ -82,6 +83,17 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
     if (action === 'restart') {
       const restarted = await session.restart()
       return await readBack(true, `restarted at ${restarted.url} and reset the zoom to 100%`)
+    }
+    // 票 #19：「自动」——把这一格交回按栏宽自动适配。它没有目标值可给（那个值由外壳按
+    // 页面自己的溢出算），所以结果只能**读回来**：`useAutoZoom` 返回的是外壳在适配跑完之后
+    // 读回的那个数。
+    if (action === 'auto') {
+      const result = await session.useAutoZoom()
+      return await readBack(
+        true,
+        `handed this pane back to automatic fitting: the zoom is now ${Math.round(result.zoom * 100)}% ` +
+          `(layout viewport ${result.innerWidth}x${result.innerHeight} CSS px)`,
+      )
     }
     if (action === 'zoom-in' || action === 'zoom-out' || action === 'zoom-reset') {
       const before = session.zoomLevel()
@@ -126,8 +138,7 @@ async function runAction(session: AdoptedViewSession, action: ViewAction): Promi
         ok: false,
         message,
         reason: 'unreadable',
-      }
-    }
+      }    }
   }
 }
 

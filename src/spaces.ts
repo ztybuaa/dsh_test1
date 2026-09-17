@@ -1,7 +1,10 @@
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DOWNLOAD_JOURNAL_FILE } from './downloads.ts'
+import type { ZoomMode } from './navigation.ts'
 import { AdoptedViewSession } from './session.ts'
+
+export type { ZoomMode }
 
 /**
  * 任务空间：插件这一侧。
@@ -76,6 +79,13 @@ export interface SpaceRecord {
    * 或者这块视图的 webContents 已经不在了），**不**当成 1。
    */
   zoom?: number
+  /**
+   * 那个缩放**归谁管**（票 #19）：`auto` = 外壳按栏宽自动适配，`manual` = 人（或工具）指名的。
+   *
+   * 缺省 = 外壳没说（旧外壳不发布这个字段）。**不**当成 `auto`：那会把"不知道"渲染成
+   * "自动适配在管着"，而这两句话在面板上是两个不同的读数（一个有前缀，一个没有）。
+   */
+  zoomMode?: ZoomMode
   /** 外壳建这个空间时真的搬过来了什么，读回来的。 */
   inherited?: {
     sourceUrl: string
@@ -133,7 +143,25 @@ export interface SpaceChannel {
   stateFile: string
   /** 外壳写、插件读：它真正下载了什么、落在哪（与 stateFile **同方向**，ADR-0011）。 */
   downloadJournalFile: string
+  /**
+   * 外壳写、插件读：**每块视图最新的缩放读数**（票 #19）。
+   *
+   * 与 `stateFile` 同方向、同目录，但它只装"缩放多少、谁在管"这几样，每次变化立刻写一次。
+   * 分开的理由是**代价**：`state.json` 是整张空间表，发一版要列 CDP 目标、逐空间问
+   * `cookies.get({})`（实测 ~0.9 秒），而自动适配在拖动侧边栏时要跟着每一帧走。
+   */
+  zoomFile: string
 }
+
+/**
+ * 一块视图的缩放**归谁管**（票 #19）。
+ *
+ * `auto` = 外壳按栏宽自动适配（页面真的有横向溢出时才缩放，响应式页面一步都不动）；
+ * `manual` = 人（面板上的 `−` / `+` / `100%`）或工具指名要的那个值，外壳不再动它。
+ *
+ * 定义在 `src/navigation.ts`（缩放的词表在那里），这里转出去，好让读这份状态的人
+ * 不用同时认识两个模块。
+ */
 
 /** 默认空间的名字（外壳永远保留它，且它不可关闭）。 */
 export const DEFAULT_SPACE = 'default'
@@ -141,6 +169,8 @@ export const DEFAULT_SPACE = 'default'
 /** 通道里的两个文件名。与 `shell/spaces.js` 里的常量是同一份协议。 */
 const REQUEST_FILE_NAME = 'request.json'
 const STATE_FILE_NAME = 'state.json'
+/** 缩放最新读数（票 #19）。与 `shell/spaces.js` 的 `ZOOM_FILE_NAME` 是同一个名字。 */
+const ZOOM_FILE_NAME = 'zoom.json'
 /** 空间的四个动作。 */
 export type SpaceAction = 'list' | 'create' | 'use' | 'close'
 
@@ -192,6 +222,69 @@ export function spaceChannelFrom(dir: string | undefined): SpaceChannel | undefi
     requestFile: join(dir, REQUEST_FILE_NAME),
     stateFile: join(dir, STATE_FILE_NAME),
     downloadJournalFile: join(dir, DOWNLOAD_JOURNAL_FILE),
+    zoomFile: join(dir, ZOOM_FILE_NAME),
+  }
+}
+
+/**
+ * 外壳写的最新缩放读数（票 #19）里，一个空间那一条。
+ *
+ * 每一项都是**外壳读回来的**：`zoom` 来自 `webContents.getZoomFactor()`，`mode` 是外壳自己
+ * 那个状态机说的话。`fitPasses` / `fitChanges` 是自动适配跑了几轮、改了几次 —— 它们不是
+ * 缩放本身，而是"适配到底有没有在跑"这件事的读回（响应式页面那条断言就是"跑了，但一次没改"）。
+ */
+export interface ZoomReading {
+  /** `getZoomFactor()` 的读回值（1 = 100%）。 */
+  zoom: number
+  /** 现在归谁管。 */
+  mode: ZoomMode
+  /** 这块视图上跑过几轮自动适配。 */
+  fitPasses: number
+  /** 那几轮里一共改了几次缩放。 */
+  fitChanges: number
+  /**
+   * "这一页的溢出**缩放治不了**"这条结论的原文（票 #19），或缺席。
+   *
+   * 它是"自动适配在管着、但它决定不再动手"的唯一解释：没有它，一个不动的读数看起来就像坏了。
+   */
+  fitDeclined?: string
+  /** 这份读数是外壳什么时候写的（`Date.now()`）。 */
+  at: number
+}
+
+/**
+ * 读外壳写的 `zoom.json`（票 #19）。
+ *
+ * 与 {@link parseSpaceState} 一样"读不动就是没有"：一个正在被重写的文件、一个还没被写过的
+ * 文件、一个旧外壳根本不写的文件，全都答 `undefined` —— 调用方那时退回 `state.json` 里那个
+ * 更旧但同样真实的数，而不是编一个。
+ *
+ * @param raw - 文件内容。
+ * @param name - 要哪个空间。
+ * @returns 那份读数，或 undefined。
+ */
+export function parseZoomReading(raw: string, name: string): ZoomReading | undefined {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  if (value === null || typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  if (record.spaces === null || typeof record.spaces !== 'object') return undefined
+  const entry = (record.spaces as Record<string, unknown>)[name]
+  if (entry === null || typeof entry !== 'object') return undefined
+  const fields = entry as Record<string, unknown>
+  if (typeof fields.zoom !== 'number' || !Number.isFinite(fields.zoom) || fields.zoom <= 0) return undefined
+  if (fields.mode !== 'auto' && fields.mode !== 'manual') return undefined
+  return {
+    zoom: fields.zoom,
+    mode: fields.mode,
+    fitPasses: typeof fields.fitPasses === 'number' ? fields.fitPasses : 0,
+    fitChanges: typeof fields.fitChanges === 'number' ? fields.fitChanges : 0,
+    ...(typeof fields.fitDeclined === 'string' && fields.fitDeclined !== '' ? { fitDeclined: fields.fitDeclined } : {}),
+    at: typeof record.at === 'number' ? record.at : 0,
   }
 }
 
@@ -288,6 +381,9 @@ export function parseSpaceState(raw: string): SpaceState | undefined {
       ...(typeof space.zoom === 'number' && Number.isFinite(space.zoom) && space.zoom > 0
         ? { zoom: space.zoom }
         : {}),
+      // 与那个数一起读回来的还有"谁在管它"（票 #19）。认不出的值一律不当成某一种：
+      // 缺省会让面板只显示百分比，而那是诚实的 —— 它没说谎，只是没说全。
+      ...(space.zoomMode === 'auto' || space.zoomMode === 'manual' ? { zoomMode: space.zoomMode } : {}),
       ...(space.inherited !== undefined && space.inherited !== null
         ? { inherited: space.inherited as SpaceRecord['inherited'] }
         : {}),
@@ -343,14 +439,17 @@ export interface SpaceRequest {
   active: string
   /**
    * 期望存在的空间。每一项可以只是一个名字，也可以带上**这块视图期望的缩放**
-   * （`{name, zoom}`，票 #13）。
+   * （`{name, zoom}`，票 #13）与**谁管这个缩放**（`{name, mode}`，票 #19）。
    *
    * 为什么缩放挂在空间这一层，而不是单开一条通道：缩放本来就是**每块视图自己的属性**，
    * 而"每空间一块视图"正是这张表已经在表达的事实；单开一条通道就是拿一条通道干两件事。
    * 为什么只有被改动的那个空间带 `zoom`：这条请求是**期望状态的快照**，把没打算动的空间
    * 也写上一个值，就等于"外壳按这个值把它改回去"，用户用 Ctrl+滚轮在别处调过的缩放会被抹掉。
+   *
+   * `mode` 的出现理由与 `zoom` 一样：它是**这块视图自己**的状态。只有被指名的那一个空间带它，
+   * 所以"把这一格交回自动适配"不会顺手把别的空间也交回去。
    */
-  spaces: Array<string | { name: string; zoom: number }>
+  spaces: Array<string | { name: string; zoom?: number; mode?: ZoomMode }>
 }
 
 /**
@@ -417,23 +516,26 @@ export function planRequest(
 }
 
 /**
- * 把"给某一个空间换缩放"算成一条请求（票 #13）。
+ * 把"给某一个空间换缩放"算成一条请求（票 #13），票 #19 起它还能只换**模式**。
  *
  * 与 {@link planRequest} 分开，是因为它服务的是**另一件事**：`planRequest` 管的是
- * "有哪些空间、当前是哪个"，而这条只管"这块视图的缩放该是多少"。混进 `planRequest`
+ * "有哪些空间、当前是哪个"，而这条只管"这块视图的缩放该是多少、归谁管"。混进 `planRequest`
  * 会把 `browser_space` 的动作表也拖上一个 `zoom` 参数，那不是这张票要的形状。
  *
  * 纯函数：不碰文件、不连外壳，所以"给不存在的空间设缩放"这类判断能不起外壳被单独读回。
  *
  * @param state - 最近一次读到的实际状态。
  * @param name - 要改缩放的空间名。
- * @param zoom - 期望的缩放值（范围由 `src/navigation.ts` 的 `normalizeZoom` 负责，这里只管名字）。
+ * @param zoom - 期望的缩放值（范围由 `src/navigation.ts` 的 `normalizeZoom` 负责，这里只管名字）；
+ *   `undefined` = 只改模式（`mode: 'auto'` 时是"把这一格交回自动适配"，不指定新的缩放值）。
+ * @param mode - 谁管这个缩放（缺省 `manual`：指名要一个值，语义上就是这个值我说了算）。
  * @returns 请求，或一条能直接给模型看的错误。
  */
 export function planZoom(
   state: SpaceState,
   name: string,
-  zoom: number,
+  zoom: number | undefined,
+  mode: ZoomMode = 'manual',
 ): { request: SpaceRequest } | { error: string } {
   const wanted = name.trim()
   if (!state.spaces.some((space) => space.name === wanted)) {
@@ -448,8 +550,12 @@ export function planZoom(
     request: {
       id: state.requestId + 1,
       active: state.active,
-      // 只有这一个空间带 `zoom`，其余原样是名字（理由见 {@link SpaceRequest.spaces}）。
-      spaces: state.spaces.map((space) => (space.name === wanted ? { name: space.name, zoom } : space.name)),
+      // 只有这一个空间带 `zoom`/`mode`，其余原样是名字（理由见 {@link SpaceRequest.spaces}）。
+      spaces: state.spaces.map((space) =>
+        space.name === wanted
+          ? { name: space.name, ...(zoom !== undefined ? { zoom } : {}), mode }
+          : space.name,
+      ),
     },
   }
 }
@@ -521,6 +627,7 @@ export class SpaceManager {
       requestFile: join(options.dir, REQUEST_FILE_NAME),
       stateFile: join(options.dir, STATE_FILE_NAME),
       downloadJournalFile: join(options.dir, DOWNLOAD_JOURNAL_FILE),
+      zoomFile: join(options.dir, ZOOM_FILE_NAME),
     }
     this.timeoutMs = options.timeoutMs
     this.maxElements = options.maxElements
@@ -553,6 +660,41 @@ export class SpaceManager {
       return parseSpaceState(readFileSync(this.channel.stateFile, 'utf8'))
     } catch {
       return undefined
+    }
+  }
+
+  /**
+   * 这个空间**现在**缩放多少、谁在管（票 #19）。
+   *
+   * 读的是 `zoom.json`（外壳每次缩放/模式/适配变化立刻写的那份小文件），不是 `state.json`：
+   * 那一版是整张空间表，发布一次 ~0.9 秒（ADR-0013 实测），而自动适配会在拖动侧边栏时
+   * 连续改缩放 —— 面板上那个读数（"自动 78%"）要跟得上，就不能等下一次发布。
+   *
+   * 读不到那份小文件时（旧外壳、还没写过）**退回**表里那条记录：那个数同样是外壳读回来的，
+   * 只是可能旧一点。两条路都读不到就是 `undefined` —— "没人答得出来"与"缩放是 100%"
+   * 是两句话，不许混成一句。
+   *
+   * @param name - 空间名。
+   * @returns 缩放读数，或 undefined。
+   */
+  zoomReading(name: string): ZoomReading | undefined {
+    let fresh: ZoomReading | undefined
+    try {
+      fresh = parseZoomReading(readFileSync(this.channel.zoomFile, 'utf8'), name)
+    } catch {
+      fresh = undefined
+    }
+    if (fresh !== undefined) return fresh
+    const record = this.readState()?.spaces.find((space) => space.name === name)
+    if (record === undefined || record.zoom === undefined) return undefined
+    return {
+      zoom: record.zoom,
+      // 表里没写模式时**不猜**：这里给 `manual` 是"外壳没说谁在管，那就当没人自动管它"，
+      // 而不是"自动适配在管" —— 后者会让面板显示一个它证明不了的前缀。
+      mode: record.zoomMode ?? 'manual',
+      fitPasses: 0,
+      fitChanges: 0,
+      at: 0,
     }
   }
 
@@ -611,7 +753,14 @@ export class SpaceManager {
       // 而做与读回走的是同一条既有通道（ADR-0013）。会话拿到的是一个绑到**这个空间**上的口子，
       // 所以"缩哪个视图"这件事不需要再传一次空间名。
       zoomPort: {
-        setZoom: async (value: number) => (await this.setZoom(record.name, value)).zoom,
+        setZoom: async (value: number, mode?: ZoomMode) => (await this.setZoom(record.name, value, mode)).zoom,
+        useAutoZoom: async () => (await this.useAutoZoom(record.name)).zoom,
+        // 票 #19：自动适配会在**没人请求**的时候改缩放（外壳按栏宽自己算），所以"现在是多少、
+        // 谁在管"必须能**随时读回来**，而不是只认本会话自己写下去过的那个值。
+        reading: async () => {
+          const reading = this.zoomReading(record.name)
+          return reading === undefined ? undefined : { zoom: reading.zoom, mode: reading.mode }
+        },
       },
       // 领养时的缩放用外壳**已经发布的读回值**当起点：会话手里那个数不许比外壳知道的更自信。
       ...(record.zoom !== undefined ? { zoom: record.zoom } : {}),
@@ -675,12 +824,44 @@ export class SpaceManager {
    *
    * @param name - 空间名。
    * @param zoom - 期望的缩放值。
+   * @param mode - 谁管这个缩放（缺省 `manual`：指名要一个值 = 这个值我说了算，票 #19）。
    * @returns 外壳读回来的缩放值，以及它发布的那条空间记录。
    * @throws 没有这个空间、外壳拒绝了请求、或外壳没发布读回值时。
    */
-  async setZoom(name: string, zoom: number): Promise<{ zoom: number; space: SpaceRecord }> {
+  async setZoom(name: string, zoom: number, mode: ZoomMode = 'manual'): Promise<{ zoom: number; space: SpaceRecord }> {
+    return await this.requestZoom(name, zoom, mode)
+  }
+
+  /**
+   * 把一个空间交回**自动适配**（票 #19 的「自动」那颗按钮）。
+   *
+   * 与 {@link setZoom} 的差别只在"要不要给一个缩放值"：交回自动时那个值由**外壳按栏宽算**，
+   * 插件给不了也不该给。外壳答回来的仍然是它读回的那个数（`getZoomFactor()`），而它是在
+   * **适配跑完之后**才发布的 —— 所以这里拿到的就是适配的结果，不是适配之前的 100%。
+   *
+   * @param name - 空间名。
+   * @returns 外壳读回来的缩放值，以及它发布的那条空间记录。
+   * @throws 与 {@link setZoom} 同一组原因。
+   */
+  async useAutoZoom(name: string): Promise<{ zoom: number; space: SpaceRecord }> {
+    return await this.requestZoom(name, undefined, 'auto')
+  }
+
+  /**
+   * 两条缩放请求共用的那一段：算请求、写下去、等外壳处理完、读回**它发布的那条记录**。
+   *
+   * @param name - 空间名。
+   * @param zoom - 期望的缩放值；`undefined` = 只改模式。
+   * @param mode - 谁管这个缩放。
+   * @returns 外壳读回来的缩放值与记录。
+   */
+  private async requestZoom(
+    name: string,
+    zoom: number | undefined,
+    mode: ZoomMode,
+  ): Promise<{ zoom: number; space: SpaceRecord }> {
     const before = this.requireState()
-    const planned = planZoom(before, name, zoom)
+    const planned = planZoom(before, name, zoom, mode)
     if ('error' in planned) throw new Error(planned.error)
     this.writeRequest(planned.request)
     const after = await this.awaitRequest(planned.request.id)

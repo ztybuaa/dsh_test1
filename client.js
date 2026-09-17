@@ -170,6 +170,23 @@ window.__ModuleLoader__.load({
 		   * Duplicate reports are suppressed: the shell must be able to treat every message
 		   * as a real change without doing its own diffing.
 		   *
+		   * ## 谁负责什么（票 #19 之前这里有一句话是假的）
+		   *
+		   * 三条线各管一段，一条都不能少：
+		   *
+		   *   1. **`ResizeObserver`** —— 元素**自己的盒子**变了（拖分栏条就是这一种）。它必须真的
+		   *      挂上去：观察者是在**第一次渲染时**建的，而那一刻 React 的 DOM 引用还没挂上
+		   *      （`elementRef.current === null`），所以"建观察者的时候就 `observe` 一次"这条线
+		   *      **从来没有生效过**（票 #19 第二条评论里的那个缺陷）。现在观察者在每次测量前把
+		   *      自己**重新指向**当前那个节点（{@link pointObserverAt}），于是元素换了、节点后挂上
+		   *      都跟得上，注释与代码是同一句话。
+		   *   2. **窗口 resize** —— 视口变了，元素可能跟着变（百分比宽度）。
+		   *   3. **每帧一次测量**（`tick`）—— 前两条都看不见的那些变化：把一个 `display: none` 的
+		   *      祖先打开**不会**改变元素的盒子尺寸，`ResizeObserver` 因此不响。它是**安全网**，
+		   *      不是主要机制：主要机制是 1 与 2。反过来说，谁把 `tick` 拿掉，1 与 2 仍然兜得住。
+		   *
+		   * 三条线都只是**测量**：它们不产生任何新的副作用，重复的报告由下面的 `sameRect` 挡掉。
+		   *
 		   * @param {{element?: Element | null, onReport: (rect: PanelRect | null, state: PanelState) => void}} options
 		   *   `element` is read on every measurement, so a caller may point it at a new node;
 		   *   `onReport` is called synchronously once on attach and then on changes.
@@ -182,7 +199,26 @@ window.__ModuleLoader__.load({
 		    var haveLast = false
 		    var stopped = false
 		    var observer = null
+		    /** 观察者现在盯着的那个节点。null = 还没有节点可盯（第一次渲染时就是这样）。 */
+		    var observed = null
 		    var frame = 0
+
+		    /**
+		     * 把观察者重新指向 `options.element` —— 它可能在两次测量之间换了节点。
+		     *
+		     * 这就是"元素只在建立观察者那一刻读一次"那个缺陷的修法：读数与观察**用同一个节点**，
+		     * 而且每次测量前都对一次。节点还没挂上时什么都不做（下一次测量会再对一次）。
+		     *
+		     * @param {Element | null | undefined} element - 现在该盯的那个节点。
+		     * @returns {void}
+		     */
+		    function pointObserverAt(element) {
+		      if (observer === null) return
+		      if (element === observed) return
+		      if (observed !== null && observed !== undefined) observer.unobserve(observed)
+		      observed = element
+		      if (element !== null && element !== undefined) observer.observe(element)
+		    }
 
 		    /**
 		     * Measure and report, unless nothing changed.
@@ -191,6 +227,7 @@ window.__ModuleLoader__.load({
 		     */
 		    function report(force) {
 		      if (stopped) return
+		      pointObserverAt(options.element)
 		      var current = measure(options.element)
 		      if (force !== true && haveLast && sameRect(last.rect, current.rect) && last.state === current.state) return
 		      last = current
@@ -211,12 +248,11 @@ window.__ModuleLoader__.load({
 		      frame = hostGlobal.requestAnimationFrame(tick)
 		    }
 
-		    var element = options.element
 		    if (typeof hostGlobal.ResizeObserver === 'function') {
 		      observer = new hostGlobal.ResizeObserver(function () {
 		        report(false)
 		      })
-		      if (element !== null && element !== undefined) observer.observe(element)
+		      pointObserverAt(options.element)
 		    }
 		    if (typeof hostGlobal.addEventListener === 'function') {
 		      hostGlobal.addEventListener('resize', function () {
@@ -232,6 +268,7 @@ window.__ModuleLoader__.load({
 		      stop: function () {
 		        stopped = true
 		        if (observer !== null) observer.disconnect()
+		        observed = null
 		        if (frame !== 0 && typeof hostGlobal.cancelAnimationFrame === 'function') hostGlobal.cancelAnimationFrame(frame)
 		        frame = 0
 		      },
@@ -367,6 +404,13 @@ window.__ModuleLoader__.load({
 		    { action: 'zoom-out', label: '\u2212', title: 'zoom out', shortcut: null },
 		    { action: 'zoom-reset', label: '100%', title: 'reset the zoom to 100%', shortcut: null },
 		    { action: 'zoom-in', label: '+', title: 'zoom in', shortcut: null },
+		    // 票 #19：把这一格**交回自动适配**（按栏宽自己缩放）。
+		    //
+		    // 为什么必须有这颗按钮，而不是"换页/重新开始之后自动回来"：换页不丢缩放是 #13 定下的
+		    // 语义（同源换页、换站点都实测过），而这条语义与"换页就把控制权交回自动"是矛盾的 ——
+		    // 二者只能留一个，留下的那个是**已经在验收里钉住**的那个。于是回到自动必须是一个
+		    // **说得出口的动作**，否则手动模式就是一个人进得去出不来的状态。
+		    { action: 'auto', label: 'auto', title: 'fit the page to the pane (let the pane decide the zoom)', shortcut: null },
 		    { action: 'restart', label: 'restart', title: 'go back to the page this pane started on', shortcut: null },
 		  ]
 		
@@ -413,6 +457,35 @@ window.__ModuleLoader__.load({
 		  function zoomLabel(zoom) {
 		    if (typeof zoom !== 'number' || !isFinite(zoom)) return '\u2014'
 		    return Math.round(zoom * 100) + '%'
+		  }
+		
+		  /**
+		   * 面板上那个缩放读数，**带上是哪种模式**（票 #19）。
+		   *
+		   * 票面原话是"工具条的读数要说清当前是哪种模式（如 `自动 78%` / `手动 90%`），不许让人看不出来"。
+		   * 所以这句话有两个来源，而且**两个都不能猜**：
+		   *
+		   *  - 数：外壳读回来的 `getZoomFactor()`（读不到就是 `—`，见 {@link zoomLabel}）；
+		   *  - 词：调用方给的**文案表**（`{auto, manual}`）。这个词表**刻意不在这个文件里** ——
+		   *    这个文件一行文案都不带（连按钮的 title 都是英文硬编码的既有事实，见文件头），
+		   *    而"自动/手动"是要给用户看的、要跟着语言走的那两个词，所以它们与别的文案住在一起。
+		   *
+		   * 读不到模式时**退回一个光秃秃的百分比**，不编一个前缀：`78%` 说的是"这是 78%"，
+		   * 而猜出来的 `自动 78%` 说的是"外壳在按栏宽适配它" —— 后者可能不成立，而面板上那句话
+		   * 一旦不成立，用户就再也分不清"没适配"和"适配了但没动"了。
+		   *
+		   * @param {unknown} zoom - 外壳读回来的缩放值。
+		   * @param {unknown} mode - `auto` / `manual` / 别的什么（读不到就是别的什么）。
+		   * @param {{auto?: string, manual?: string}} [words] - 那两个词。
+		   * @returns {string} 要显示的那一句。
+		   */
+		  function zoomReading(zoom, mode, words) {
+		    var percent = zoomLabel(zoom)
+		    if (percent === '\u2014') return percent
+		    var table = words !== undefined && words !== null ? words : {}
+		    if (mode === 'auto' && typeof table.auto === 'string') return table.auto + ' ' + percent
+		    if (mode === 'manual' && typeof table.manual === 'string') return table.manual + ' ' + percent
+		    return percent
 		  }
 		
 		  /**
@@ -470,6 +543,7 @@ window.__ModuleLoader__.load({
 		    TOOLBAR_HEIGHT_PX: TOOLBAR_HEIGHT_PX,
 		    isEnabled: isEnabled,
 		    zoomLabel: zoomLabel,
+		    zoomReading: zoomReading,
 		    statusText: statusText,
 		    actionForKey: actionForKey,
 		  }
@@ -547,6 +621,10 @@ window.__ModuleLoader__.load({
 	      '普通浏览器标签页里它没有东西可显示。',
 	    ready: '桌面外壳已就位：这一格交给原生浏览器视图。',
 	    missing: '这一格没有量到矩形（可能被折叠或切走了）。',
+	    // 票 #19：缩放读数上那两个词。面板必须让人**看得出来**现在是谁在管这个缩放，
+	    // 否则"自动适配没动"与"自动适配不在管"在界面上长得一模一样。
+	    zoomAuto: '自动',
+	    zoomManual: '手动',
 	  },
 	  en: {
 	    noShell:
@@ -555,6 +633,8 @@ window.__ModuleLoader__.load({
 	      'browser tab has nothing to put here.',
 	    ready: 'The desktop shell is here: the native browser view takes this pane.',
 	    missing: 'This pane reports no rectangle (collapsed or switched away).',
+	    zoomAuto: 'auto',
+	    zoomManual: 'manual',
 	  },
 	}
 	
@@ -569,6 +649,18 @@ window.__ModuleLoader__.load({
 	  var table = COPY[language()]
 	  return table !== undefined ? table : COPY.en
 	}
+	
+	/**
+	 * 栏宽变化之后，工具条那个读数最多隔多久重读一次（票 #19）。
+	 *
+	 * 为什么要有这一条：自动适配是**外壳**按新栏宽改的缩放，而面板上那个数只在"按下某个按钮"
+	 * 或"页面刚打开"时读过。拖动侧边栏之后不重读的话，画面已经 52% 了，读数还写着 `自动 100%`
+	 * —— 那正是票面说的"不许让人看不出来"的反面。
+	 *
+	 * 为什么要节流：拖动时面板每一帧都上报一次几何，而每一次重读都要走宿主一个来回
+	 * （HTTP + 一次页面读回），400ms 一次既跟得上手，又不会把宿主刷满。
+	 */
+	var PANEL_REFRESH_MIN_MS = 400
 	
 	/**
 	 * The client context, kept where the toolbar can reach it.
@@ -652,7 +744,8 @@ window.__ModuleLoader__.load({
 	 * is not covered by its own controls. It also **loses the race on purpose** where it should:
 	 * the status line is the only thing it says, and it says it from the host's read-back.
 	 *
-	 * @param {{ctx: object, hasShell: boolean}} props - the plugin context, and whether the shell is here.
+	 * @param {{ctx: object, hasShell: boolean, geometryTick?: number}} props - the plugin context, whether
+	 *   the shell is here, and a counter that goes up whenever the pane's own rectangle changed.
 	 * @returns {import('react').ReactElement} the toolbar element.
 	 */
 	function Toolbar(props) {
@@ -662,13 +755,14 @@ window.__ModuleLoader__.load({
 	    ok: null,
 	    url: '',
 	    zoom: undefined,
+	    zoomMode: undefined,
 	    canGoBack: false,
 	    canGoForward: false,
 	    message: '',
 	    busy: false,
 	  })
 	
-	  /** Ask the host what is true right now, and show that. */
+	  /** 读一次"外壳现在说什么"，并把结果落到那一行上。 */
 	  var refresh = react.useCallback(function () {
 	    void callView(props.ctx, 'state').then(function (next) {
 	      setState(function (previous) {
@@ -702,6 +796,45 @@ window.__ModuleLoader__.load({
 	  // render: a render that started a request would start one per re-render.
 	  react.useEffect(function () {
 	    refresh()
+	  }, [])
+	
+	  /**
+	   * 栏宽变了 ⇒ 那个读数要重读（票 #19）。
+	   *
+	   * 这一格自己**知道**栏宽什么时候变：面板矩形一变就上报一次，而外壳正是拿那个矩形决定
+	   * 视图多大、并（在自动模式下）按新宽度重新适配页面。所以几何一动就要问一次
+	   * "现在是多少、谁在管"，否则读数会停在上一次按下的那个数上。
+	   *
+	   * 节流到 {@link PANEL_REFRESH_MIN_MS}，并且**补最后一次**：拖动中间隔多久都行，
+	   * 但停下来之后那一次必须发出去 —— 那才是最终状态。
+	   */
+	  var lastReadAt = react.useRef(0)
+	  var pendingRead = react.useRef(0)
+	  react.useEffect(
+	    function () {
+	      if (props.geometryTick === undefined || props.geometryTick === 0) return
+	      var since = Date.now() - lastReadAt.current
+	      if (since >= PANEL_REFRESH_MIN_MS) {
+	        lastReadAt.current = Date.now()
+	        refresh()
+	        return
+	      }
+	      if (pendingRead.current !== 0) return
+	      pendingRead.current = setTimeout(function () {
+	        pendingRead.current = 0
+	        lastReadAt.current = Date.now()
+	        refresh()
+	      }, PANEL_REFRESH_MIN_MS - since)
+	    },
+	    [props.geometryTick],
+	  )
+	
+	  // 面板走了就把排着的那次读撤掉：一个卸载之后再打出去的请求只会写到一个已经不存在的状态上。
+	  react.useEffect(function () {
+	    return function () {
+	      if (pendingRead.current !== 0) clearTimeout(pendingRead.current)
+	      pendingRead.current = 0
+	    }
 	  }, [])
 	
 	  // Keyboard shortcuts. Registered on the window because the panel is one element among
@@ -765,6 +898,13 @@ window.__ModuleLoader__.load({
 	    )
 	  }
 	
+	  // 票 #19：那个读数带上"谁在管"（自动 / 手动）。词来自本文件前面那张文案表 ——
+	  // `src/toolbar.js` 一行文案都不带，它只回答"该怎么拼"。
+	  var zoomText = toolbar.zoomReading(state.zoom, state.zoomMode, {
+	    auto: copy().zoomAuto,
+	    manual: copy().zoomManual,
+	  })
+	
 	  return react.createElement(
 	    'div',
 	    {
@@ -786,7 +926,7 @@ window.__ModuleLoader__.load({
 	    react.createElement(
 	      'span',
 	      {
-	        'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
+	        'data-dsh-view-zoom': zoomText,
 	        style: {
 	          marginLeft: 'auto',
 	          font: '11px/1.3 system-ui',
@@ -800,7 +940,7 @@ window.__ModuleLoader__.load({
 	        },
 	        title: toolbar.statusText(state),
 	      },
-	      toolbar.zoomLabel(state.zoom) + ' \u00b7 ' + toolbar.statusText(state),
+	      zoomText + ' \u00b7 ' + toolbar.statusText(state),
 	    ),
 	  )
 	}
@@ -824,6 +964,11 @@ window.__ModuleLoader__.load({
 	  /** 被测量的那一块（`data-dsh-desktop-view-panel` 那个 div）：原生画面就摆在这里。 */
 	  var bodyRef = react.useRef(null)
 	  var [report, setReport] = react.useState({ rect: null, state: 'detached' })
+	  /**
+	   * 面板矩形变过几次（票 #19）。工具条拿它当"栏宽可能变了"的信号：拖动侧边栏时它每一帧都涨，
+	   * 而工具条那边节流之后才去重读缩放读数。涨这个数不额外引起渲染 —— 上报本来就会 setReport。
+	   */
+	  var [geometryTick, setGeometryTick] = react.useState(0)
 	
 	  // The observer outlives every render, so it is created once and its `element` is
 	  // re-read on every measurement: React may replace the DOM node without the
@@ -837,6 +982,9 @@ window.__ModuleLoader__.load({
 	      },
 	      onReport: function (rect, state) {
 	        setReport({ rect: rect, state: state })
+	        setGeometryTick(function (previous) {
+	          return previous + 1
+	        })
 	        DshPanelRect.deliver(rect)
 	      },
 	    })
@@ -896,7 +1044,7 @@ window.__ModuleLoader__.load({
 	        position: 'relative',
 	      },
 	    },
-	    hasShell ? react.createElement(Toolbar, { ctx: clientContext, hasShell: hasShell }) : null,
+	    hasShell ? react.createElement(Toolbar, { ctx: clientContext, hasShell: hasShell, geometryTick: geometryTick }) : null,
 	    react.createElement(
 	      'div',
 	      {

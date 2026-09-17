@@ -688,6 +688,112 @@ ${crossTag}
 }
 
 /**
+ * 票 #19 的固定宽度夹具页：**内容写死 1200px**，页面最右端一块纯红标。
+ *
+ * 它就是用户抱怨的那类页面（统计年鉴、文库这类固定宽度排版的文档站）：在 620 的栏里
+ * 它**重排不了**，只能被裁掉右半边。所以"整页自动可见"这句话在它身上才量得出来 ——
+ * 红标（x=1150..1195）在不在画面里，就是"整页进来没有"。
+ *
+ * 颜色与尺寸与 `tests/zoom-pixels.spec.ts` 里那张页**逐字相同**（条子 `#4a6fa5`、
+ * 红标 `#ff0000` 45×120），所以 `tests/fixtures/window-capture/main.cjs` 那支真窗口量具
+ * 不用改一行就能量它。
+ *
+ * `fitFacts()` 让"这一页现在到底什么样"从**页面自己**读回来：布局视口（`innerWidth`）、
+ * 内容宽度（`scrollWidth`）、内容盒宽度（`clientWidth`）、dpr、以及红标的位置。
+ */
+const FIXED_WIDTH_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>fixed-width-page</title>
+<style>
+  html, body { margin: 0; }
+  #bar { width: 1200px; height: 200px; background: #4a6fa5; color: #fff; font: 20px system-ui; position: relative; }
+  #marker { position: absolute; left: 1150px; top: 40px; width: 45px; height: 120px; background: #ff0000; }
+</style></head>
+<body>
+  <div id="bar">a 1200px-wide column, like a fixed-width document site<span id="marker"></span></div>
+  <script>
+    window.fitFacts = function () {
+      var root = document.documentElement
+      return JSON.stringify({
+        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        scrollWidth: root.scrollWidth, clientWidth: root.clientWidth,
+        barWidth: document.getElementById('bar').getBoundingClientRect().width,
+        markerLeft: document.getElementById('marker').getBoundingClientRect().left,
+        scrollX: window.scrollX,
+      })
+    }
+  </script>
+</body></html>`
+
+/**
+ * 票 #19 的**响应式**夹具页：宽度全是百分比，任何栏宽下都**没有横向溢出**。
+ *
+ * 它的存在是为了那一条"极其重要"的禁止事项：自动适配**不许**把一个本来正常的响应式页面
+ * 缩放掉。它在规则下是恒等的（`scrollWidth` 跟着 `clientWidth` 走 ⇒ `ratio == 1` ⇒ 一步都不动），
+ * 而这条是被量出来的（`tests/fit-to-pane.spec.ts`：拖很多次栏宽，`fitChanges` 必须是 0）。
+ *
+ * 那条蓝条的**高度**按窗口高度的百分比给，所以它自己也会随栏宽重排 —— 一个"会重排的页面"
+ * 该有的样子。
+ */
+const FLUID_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>fluid-page</title>
+<style>
+  html, body { margin: 0; }
+  #bar { width: 100%; height: 200px; background: #4a6fa5; color: #fff; font: 20px system-ui; }
+  #columns { display: flex; width: 100%; }
+  #columns div { flex: 1 1 0; height: 80px; background: #2f6fb0; }
+</style></head>
+<body>
+  <div id="bar">a page that lays itself out for whatever width it is given</div>
+  <div id="columns"><div>one</div><div>two</div><div>three</div></div>
+  <script>
+    window.fitFacts = function () {
+      var root = document.documentElement
+      return JSON.stringify({
+        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        scrollWidth: root.scrollWidth, clientWidth: root.clientWidth,
+        barWidth: document.getElementById('bar').getBoundingClientRect().width,
+        scrollX: window.scrollX,
+      })
+    }
+  </script>
+</body></html>`
+
+/**
+ * 票 #19 的**"缩放治不了"的溢出**夹具页：内容永远比视口宽 40px。
+ *
+ * `width: calc(100% + 40px)` 让"内容宽度 − 视口宽度"在 CSS 像素里是一个**常数**：缩得越小，
+ * 视口越大，内容也跟着变大，差还是 40px。真实世界里同一个形状的有 `width: 100vw` 配一条
+ * 纵向滚动条（`100vw` 含滚动条宽度，而内容盒不含）。
+ *
+ * 它存在的理由是那张票点名"极其重要"的那条禁止事项：**不许把本来正常的页面也缩放掉**。
+ * 一个只会"缩一点看看"的适配会在这张页面上每拖一次栏就白缩一点，几十次之后页面明显变小；
+ * 正确的行为是**试一次、发现治不了、把缩放放回原处、此后不再碰这一页**。
+ */
+const UNFIXABLE_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>unfixable-overflow-page</title>
+<style>
+  html, body { margin: 0; }
+  #over { width: calc(100% + 40px); height: 200px; background: #2f6fb0; color: #fff; font: 20px system-ui; }
+</style></head>
+<body>
+  <div id="over">always 40px wider than the viewport, at every zoom</div>
+  <script>
+    window.fitFacts = function () {
+      var root = document.documentElement
+      return JSON.stringify({
+        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        scrollWidth: root.scrollWidth, clientWidth: root.clientWidth,
+        barWidth: document.getElementById('over').getBoundingClientRect().width,
+        markerLeft: 0, scrollX: window.scrollX,
+      })
+    }
+  </script>
+</body></html>`
+
+/**
  * Path -> {body, type, status, headers}. Every interactive page exposes the same `#hit` / `#out` pair.
  *
  * `status` is optional and defaults to 200; the T5 routes are the only ones that use it,
@@ -722,6 +828,11 @@ const ROUTES = {
   }),
   '/slow': () => ({ slow: SLOW_PAGE, type: 'text/html; charset=utf-8' }),
   '/panel': () => ({ body: PANEL_PAGE, type: 'text/html; charset=utf-8' }),
+  // 票 #19：一张重排不了的固定宽度页，与一张怎么给宽度都行的响应式页。自动适配的全部验收
+  // 都在这两张页上量（"整页自动可见"用前者，"一步都不动"用后者）。
+  '/fixed-width': () => ({ body: FIXED_WIDTH_PAGE, type: 'text/html; charset=utf-8' }),
+  '/fluid': () => ({ body: FLUID_PAGE, type: 'text/html; charset=utf-8' }),
+  '/unfixable': () => ({ body: UNFIXABLE_PAGE, type: 'text/html; charset=utf-8' }),
   '/panel-rect.js': () => ({ body: PANEL_RECT_JS, type: 'text/javascript; charset=utf-8' }),
   // T9：对话框 / 上传 / 下载 / iframe 四条长尾能力各自的夹具页。
   '/dialogs': () => ({ body: DIALOG_PAGE, type: 'text/html; charset=utf-8' }),

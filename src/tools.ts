@@ -17,6 +17,7 @@ import type {
 } from './session.ts'
 import { cutText } from './session.ts'
 import type { SpaceAction, SpaceCommandOutcome } from './spaces.ts'
+import type { ZoomMode } from './navigation.ts'
 
 /** Canonical output of `browser_navigate`: where the view ended up. */
 const navigationSchema = {
@@ -677,18 +678,35 @@ async function historyFields(session: AdoptedViewSession): Promise<{ canGoBack: 
 
 /** `action: "state"`：不改任何东西，把三件事读回来。 */
 async function viewState(session: AdoptedViewSession, action: string, message: string): Promise<ViewCommandValue> {
-  const state = await session.historyState()
-  const zoom = session.zoomLevel()
+  // 缩放与历史都从**一次读回**里取（票 #19 改的这一处）：自动适配会在没人请求的时候改缩放，
+  // 所以"现在是多少"不能报会话记的那个数。`displayState()` 当场问外壳，`zoomLevel()` 不会。
+  const state = await session.displayState()
+  const zoom = state.zoom
   return {
     action,
     ok: true,
-    url: session.url(),
-    title: '',
-    message: `${message} — ${session.url()} at ${Math.round(zoom * 100)}%`,
+    url: state.url,
+    title: state.title,
+    message: `${message} — ${state.url} at ${Math.round(zoom * 100)}%${zoomModeWords(state.zoomMode)}`,
     zoom,
-    canGoBack: state.back > 0,
-    canGoForward: state.forward > 0,
+    canGoBack: state.history.back > 0,
+    canGoForward: state.history.forward > 0,
   }
+}
+
+/**
+ * 把"谁在管这个缩放"接在百分比后面（票 #19）。
+ *
+ * 读不到模式时是空串，不是猜一个：一个没有前缀的 `78%` 说的是"这是 78%"，而一个猜出来的
+ * `78% (automatic)` 说的是"外壳在按栏宽适配它" —— 后者是一句可能不成立的话。
+ *
+ * @param mode - 外壳说的模式，或 undefined。
+ * @returns 要接在百分比后面的那半句（含前导空格），或空串。
+ */
+function zoomModeWords(mode: ZoomMode | undefined): string {
+  if (mode === 'auto') return ' (fitted to the pane automatically)'
+  if (mode === 'manual') return ' (set by hand)'
+  return ''
 }
 
 /**
