@@ -396,22 +396,24 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
   })
 
   it('票 #13：请求里那块视图可以带上 zoom；只有**被改动的那一个**带，形状不对的拒绝', () => {
-    // 一项可以只是名字，也可以是 `{name, zoom}`；归一化之后 zoom 单独成一张表。
-    // 票 #19 起那一项还带**谁管这个缩放**（`mode`）：一个指名要某个值的请求，缺省就是
-    // `manual`（"这个值我说了算"）—— 旧插件不认识这个字段，于是它的行为与从前一模一样。
-    const named = shellSpaces.parseRequest({
+    // 一项可以只是名字，也可以是**一条缩放命令**。票 #19 重新打开之后，命令有两种写法，而它们的
+    // 区别就是那张票的根因所在（见下一条用例与 `shell/spaces.js` 的 `ZOOM_COMMAND_KIND`）：
+    //
+    //  - **不带标签**（旧插件，形状与 #13 时代逐字节相同）：`{name, zoom}` ⇒ 缺省 `manual`；
+    //  - **带标签**（新客户端）：`{name, kind: 'zoom', zoom, mode}` —— 而带标签就必须说清 mode。
+    const legacy = shellSpaces.parseRequest({
       id: 9,
       active: 'default',
       spaces: ['default', { name: 'task-1', zoom: 0.5 }],
     })
-    console.log('RAW parseRequest with a zoom: ' + JSON.stringify(named))
-    expect(named.ok).toBe(true)
-    if (!named.ok) return
-    expect(named.request.spaces).toEqual(['default', 'task-1'])
-    expect(named.request.zooms).toEqual([{ name: 'task-1', zoom: 0.5, mode: 'manual' }])
+    console.log('RAW parseRequest with a legacy zoom: ' + JSON.stringify(legacy))
+    expect(legacy.ok).toBe(true)
+    if (!legacy.ok) return
+    expect(legacy.request.spaces).toEqual(['default', 'task-1'])
+    expect(legacy.request.zooms).toEqual([{ name: 'task-1', zoom: 0.5, mode: 'manual' }])
 
-    // 票 #19：「把这一格交回自动适配」是一件**没有缩放值**的事（那个值由外壳按栏宽算），
-    // 所以带 `mode: 'auto'` 的那一项可以不带 `zoom`。两样一起给也可以（形状允许）。
+    // 带标签的那一种：#19 第一次落地时的新插件发的 `{name, mode: 'auto'}` 照旧接受（发布出去的
+    // 客户端还可能是那一版），而 `kind` 只是把"这是一条命令"说得更明白。
     const auto = shellSpaces.parseRequest({ id: 12, active: 'default', spaces: ['default', { name: 'task-1', mode: 'auto' }] })
     console.log('RAW parseRequest handing the pane back to auto: ' + JSON.stringify(auto))
     expect(auto.ok).toBe(true)
@@ -419,7 +421,7 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     const both = shellSpaces.parseRequest({
       id: 13,
       active: 'default',
-      spaces: ['default', { name: 'task-1', zoom: 1, mode: 'auto' }],
+      spaces: ['default', { name: 'task-1', kind: 'zoom', zoom: 1, mode: 'auto' }],
     })
     expect(both.ok).toBe(true)
     if (both.ok) expect(both.request.zooms).toEqual([{ name: 'task-1', zoom: 1, mode: 'auto' }])
@@ -456,6 +458,53 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     }
   })
 
+  it('票 #19 重开：带标签的命令**必须自己说清模式**，认不出的标签一律拒绝', () => {
+    // 这条规矩就是那个 bug 的解药。同一种形状 `{zoom, mode}` 既可能是"命令"，也可能是
+    // "我读到的状态、原样还给你"；带标签的写法把前者钉死，而**缺 mode 一律拒绝**堵掉了
+    // "悄悄补一个 manual"这条让自动适配在启动瞬间被关掉的路。
+    const noMode = shellSpaces.parseRequest({
+      id: 20,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', kind: 'zoom', zoom: 1 }],
+    })
+    console.log('RAW 带标签却没说是哪种模式: ' + JSON.stringify(noMode))
+    expect(noMode.ok).toBe(false)
+    if (!noMode.ok) {
+      expect(noMode.error).toContain('must say which mode')
+      // 理由要说清**为什么**：一个只知道"非法"的人修不了它。
+      expect(noMode.error).toContain('echoed back')
+    }
+    // 同理：带标签、mode 认不出来 —— 拒绝，而不是当成 manual。
+    const badMode = shellSpaces.parseRequest({
+      id: 21,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', kind: 'zoom', zoom: 1, mode: 'Manual' }],
+    })
+    expect(badMode.ok).toBe(false)
+    // 认不出的**标签**也拒绝：一个"悄悄当成旧形状"的外壳会让新客户端以为命令生效了。
+    const badKind = shellSpaces.parseRequest({
+      id: 22,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', kind: 'scale', zoom: 1 }],
+    })
+    console.log('RAW 认不出的标签: ' + JSON.stringify(badKind))
+    expect(badKind.ok).toBe(false)
+    if (!badKind.ok) expect(badKind.error).toContain('legacy form')
+    // 而两种正当写法各自归一化到同一份形状（外壳内部只有一种读法）。
+    const labelled = shellSpaces.parseRequest({
+      id: 23,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', kind: 'zoom', zoom: 0.5, mode: 'manual' }],
+    })
+    const legacy = shellSpaces.parseRequest({
+      id: 24,
+      active: 'default',
+      spaces: ['default', { name: 'task-1', zoom: 0.5 }],
+    })
+    expect(labelled.ok && legacy.ok).toBe(true)
+    if (labelled.ok && legacy.ok) expect(labelled.request.zooms).toEqual(legacy.request.zooms)
+  })
+
   it('票 #13：协议的形状变了，版本号跟着加一（两边能明确地对不上）', () => {
     console.log('RAW SPACE_PROTOCOL: ' + JSON.stringify({ shell: shellSpaces.SPACE_PROTOCOL, channel: shellSpaces.spaceChannel('C:\\p').protocol }))
     // 请求里多了可选的 `zoom`、state 里多了每条记录的 `zoom` —— 加一。
@@ -476,17 +525,27 @@ describe('T7 — 空间命名与生命周期里那点纯逻辑（不起外壳）
     const planned = planZoom(state, 'default', 0.5)
     console.log('RAW planZoom: ' + JSON.stringify(planned))
     if ('error' in planned) throw new Error(planned.error)
-    // id 单调加一、当前空间不动、**只有** default 带上 zoom 与 mode —— 其余原样是名字。
+    // id 单调加一、当前空间不动、**只有** default 带上命令 —— 其余原样是名字。
+    // 而那条命令**带标签**（`kind: 'zoom'`，票 #19 重开）并且**总是**带 `mode`：
+    // 命令不许靠缺省值表达自己是什么意思，那正是把自动适配在启动瞬间关掉的那条路。
     expect(planned.request.id).toBe(5)
     expect(planned.request.active).toBe('task-1')
-    expect(planned.request.spaces).toEqual([{ name: 'default', zoom: 0.5, mode: 'manual' }, 'task-1'])
+    expect(planned.request.spaces).toEqual([{ name: 'default', kind: 'zoom', zoom: 0.5, mode: 'manual' }, 'task-1'])
     // 票 #19：交回自动是一个**没有缩放值**的请求（那个值由外壳按栏宽算），
     // 所以那一项只有 `mode` —— 而它照旧只挂在被指名的那个空间上。
     const automatic = planZoom(state, 'default', undefined, 'auto')
     console.log('RAW planZoom 交回自动: ' + JSON.stringify(automatic))
     if ('error' in automatic) throw new Error(automatic.error)
-    expect(automatic.request.spaces).toEqual([{ name: 'default', mode: 'auto' }, 'task-1'])
+    expect(automatic.request.spaces).toEqual([{ name: 'default', kind: 'zoom', mode: 'auto' }, 'task-1'])
     expect(automatic.request.id).toBe(5)
+    // 插件这一侧**永远**不会发出不带标签的缩放命令（那条路只留给旧插件，见 `shell/spaces.js`）。
+    for (const request of [planned.request, automatic.request]) {
+      for (const entry of request.spaces) {
+        if (typeof entry === 'string') continue
+        expect(entry.kind, 'the plugin must never rely on the legacy default').toBe('zoom')
+        expect(['auto', 'manual']).toContain(entry.mode)
+      }
+    }
 
     // 不认识的空间：说得清有哪几个。
     const refused = planZoom(state, 'ghost', 0.5)
