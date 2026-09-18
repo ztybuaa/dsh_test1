@@ -165,7 +165,7 @@ export function apply(ctx) {
       stateRecord: record(state.value),
       stateRequestId: typeof state.value?.requestId === 'number' ? state.value.requestId : null,
       stateCause: typeof state.value?.cause === 'string' ? state.value.cause : null,
-      /** 最新读数（外壳每次缩放/模式/适配都改写它）：`mode`、`modeCause`、两个适配计数。 */
+      /** 最新读数（外壳每次缩放/适配都改写它）：`mode`（兼容位，永远是 auto）与两个适配计数。 */
       zoomReading: zoom.value?.spaces?.[active] ?? null,
       zoomCause: typeof zoom.value?.cause === 'string' ? zoom.value.cause : null,
       /** 插件写下去的那条请求，**原样**（有没有人在启动时写过命令，看这里）。 */

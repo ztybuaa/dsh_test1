@@ -211,8 +211,8 @@ const state = {
   /**
    * 自动适配（票 #19）的运行状态。
    *
-   * 它只记**这一轮跑到哪了**，不记策略：什么时候该动、动到多少是 `shell/fit.js` 的事，
-   * "现在归谁管"是每条空间记录上的 `zoomMode`。
+   * 它只记**这一轮跑到哪了**，不记策略：什么时候该动、动到多少是 `shell/fit.js` 的事。
+   * 票 #20b 起"现在归谁管"这个问题没有了 —— 适配永远开着，缩放只有一个主子。
    */
   fit: {
     /** 已经排上的尾随那一轮（节流窗口结束时跑）。 */
@@ -441,6 +441,10 @@ function applyPlacement(cause) {
   //     不经过"面板 → 宿主 → 请求文件 → 150ms 轮询"那条实测 ~1 秒的路（ADR-0013 诚实清单）；
   //   - 可见性/空间切换也走这里，于是"切到另一个空间"同样会被适配一次；
   //   - 响应式页面在 `shell/fit.js` 的规则下是恒等的（`ratio == 1`），一步都不会动。
+  //
+  // 票 #20b：**请**不等于**跑**。`requestFit` 会先看"这一格的几何真的变了吗"——
+  // 一次 `settle`、一次同样的矩形再报一遍、宿主自己那一页刷新，都会走到这里，而它们**不该**
+  // 把用户刚按下的一次缩放改回去（见 {@link fitKeyOf}）。`decision.visible === false` 时连请都不请。
   if (decision.visible) requestFit(cause ?? 'report')
   return record
 }
@@ -641,21 +645,19 @@ function createSpace(name) {
     contentsGoneAt: undefined,
     // 插件请求过的缩放（这块视图**期望**是多少）。undefined = 从没被请求过 ——
     // 那时 `spaceRecord` 发布的是 Electron 读回来的当前值，而这里不插手。
+    //
+    // 票 #20b：它现在**只是"现在的值"**。以前它同时还意味着"从此归手动管"（`zoomMode`），
+    // 于是自动适配要一直让位到有人按「自动」为止。那一整套（模式、让位、交回）都被删掉了：
+    // 适配永远开着，一次手动缩放只是"下一次几何变化或换页之前的值"。
     zoom: undefined,
-    /**
-     * 这块视图的缩放**现在归谁管**（票 #19）：`auto` = 外壳按栏宽自动适配，`manual` = 人
-     * （或工具）指名要的那个值，外壳不再动它。新视图从 `auto` 开始 —— 用户要的就是
-     * "不用我按 −"。
-     */
-    zoomMode: 'auto',
-    /**
-     * 这个模式是**谁**改成现在这样的（票 #19 重开）。建视图时是 `boot`：那时没有任何人碰过
-     * 这一格，而这句话必须能在 `zoom.json` 里读回来 —— 否则"启动时就是 manual"与"用户按过
-     * 100%"在读数上一模一样，本票当初就是被这一点骗过去的。见 {@link writeZoomFile} 的说明。
-     */
-    modeCause: 'boot',
     /** 这块视图上跑过几轮自动适配（一轮 = 一次"读、算、可能改"的循环）。诊断与证据用。 */
     fitPasses: 0,
+    /**
+     * 这块视图**已经被适配过（或被一次指名缩放定住）的那个矩形**的指纹（票 #20b）。
+     *
+     * 同一个矩形上不再重跑适配 —— 见 {@link fitKeyOf} 与 {@link requestFit}。
+     */
+    fitKey: undefined,
     /** 那几轮里一共改了几次缩放。响应式页面的断言就是"栏宽变了而这个是 0"。 */
     fitChanges: 0,
     /** 最近一轮适配的原始记录（每一步读了什么、算了什么、停在哪），写进 `zoom.json`。 */
@@ -689,54 +691,54 @@ function createSpace(name) {
     zoomToken: 0,
   }
   state.spaces.set(name, entry)
-  // 缩放**跟着视图走**，不跟着网站走（票 #13 定下的语义）。
+  // 换页之后缩放怎么办（票 #13 起、#20b 定稿）：**重新适配**。
   //
-  // 为什么不跟着网站走：Chromium 自己的缩放是按**站点**记的，所以换一个站点就回到该站点的
-  // 默认值（实测：`127.0.0.1` 上设的 50%，走到 `localhost` 就没了）。而用户要的是
-  // "这一格能不能适应侧边栏的大小" —— 一个点了链接就失效的缩放不是那个意思。这张票的框架
-  // 本来就是"每空间一块视图 ⇒ 缩放是**每块视图**自己的属性"，所以这里在每次主文档导航之后
-  // 把它重新按上去。
+  // 为什么"跟着视图走、不跟着网站走"：Chromium 自己的缩放是按**站点**记的，换一个站点就回到该
+  // 站点的默认值（实测：`127.0.0.1` 上设的 50%，走到 `localhost` 就没了）。用户要的是"这一格
+  // 能不能适应侧边栏的大小"，所以缩放的**期望值**由外壳持有，而不是由 Chromium 按站点记。
   //
-  // 代价写在 ADR-0013 里：用户自己用 Ctrl+滚轮调过的缩放会被下一次导航覆盖回这里的期望值。
-  // 一个属性只能有一个主子，这是"跟视图走"这条选择的必然代价。
+  // 票 #19 曾把这条规则一分为二：`manual` 时换页把期望值按回去（"换页不丢缩放"），`auto` 时换页
+  // 先回到 100% 再重新适配。**票 #20b 把 `manual` 那一支删掉了**，因为用户把"手动 / 自动"这一整套
+  // 都要掉了：适配永远开着，一次手动缩放只是"现在的值"，**换页就会被重新适配**。留下的就是原来
+  // 那支 `auto`，理由一字不变：
   //
-  // 票 #19 把这条规则一分为二（见 `shell/fit.js` 与 ADR-0014）：
-  //   - `manual`：与上面那段一字不差 —— 把期望值按回去，换页也不丢（这是 #13 定下的语义，
-  //     也是"手动缩放优先"那条验收）；
-  //   - `auto`：换页就是**换了一页文档**，而自动适配是按这一页的宽度算的，所以先回到 100%
-  //     再重新适配。不这么做的话，一个响应式页面会停在"上一页是固定宽度文档"留下的 52% 上：
-  //     它没有横向溢出，而适配规则（按定义）对没有溢出的页面一步都不动 —— 那个 52% 就永远
-  //     回不来了。这是本票唯一一处要"先退回去再算"的地方，理由就在这一句。
+  //   换页就是**换了一页文档**，而自动适配是按这一页的宽度算的，所以先回到 100% 再重新适配。
+  //   不这么做的话，一个响应式页面会停在"上一页是固定宽度文档"留下的 52% 上：它没有横向溢出，
+  //   而适配规则（按定义）对没有溢出的页面一步都不动 —— 那个 52% 就永远回不来了。
+  //
+  // 被删掉的那一支还有一个**实测过的**代价，写在这里免得下一个人以为是漏了：用户自己用
+  // Ctrl+滚轮调过的缩放，从此也不会被"按回去"了（它会在下一次几何变化或换页时被适配覆盖）。
+  // 这是"一个属性只能有一个主子"这条选择的必然代价 —— 而这个主子现在是适配（ADR-0013/0014、
+  // 票 #20b 的用户原话："直接自动就完事了"）。
   view.webContents.on('did-navigate', () => {
     const current = state.spaces.get(name)
     if (current === undefined) return
     const contents = liveContents(current)
     if (contents === undefined) return
-    if (current.zoomMode === 'auto') {
-      // 这块视图还没显示过时不插手（第一次装载，或这一格还没被切到前台）：那时它占的
-      // 还是 `--bounds` 那个**占位矩形**，对着它算出来的适配没有意义。
-      if (current.view.getVisible() !== true) return
-      // 换页了：那个"这一页曾经有多宽"属于**上一份文档**，留着它会让新页面按旧宽度被缩放；
-      // 那条"缩放治不了它的溢出"的结论与它用的样本同理。
-      current.fitContentWidth = 0
-      current.fitSample = undefined
-      current.fitDeclined = undefined
-      current.zoomToken += 1
-      if (Math.abs(contents.getZoomFactor() - 1) > 1e-6) contents.setZoomFactor(1)
-      current.zoom = 1
-      writeZoomFile('navigation')
-      requestFit('navigation')
-      return
-    }
-    if (current.zoom === undefined) return
-    if (Math.abs(contents.getZoomFactor() - current.zoom) > 1e-6) contents.setZoomFactor(current.zoom)
+    // 这块视图还没显示过时不插手（第一次装载，或这一格还没被切到前台）：那时它占的
+    // 还是 `--bounds` 那个**占位矩形**，对着它算出来的适配没有意义。等到它真的被摆到
+    // 面板报的那块矩形上时，`applyPlacement` 会请一轮适配。
+    if (current.view.getVisible() !== true) return
+    // 换页了：那个"这一页曾经有多宽"属于**上一份文档**，留着它会让新页面按旧宽度被缩放；
+    // 那条"缩放治不了它的溢出"的结论与它用的样本同理。
+    current.fitContentWidth = 0
+    current.fitSample = undefined
+    current.fitDeclined = undefined
+    current.zoomToken += 1
+    if (Math.abs(contents.getZoomFactor() - 1) > 1e-6) contents.setZoomFactor(1)
+    current.zoom = 1
+    writeZoomFile('navigation')
+    // 票 #20b：这个原因字符串**指名道姓**是"视图那一页换页了"（与宿主自己那一页的
+    // `applyPlacement('navigation')` 不是一回事），而它是 {@link requestFit} 里**唯一**会无视
+    // "几何没变"那条闸门的两种原因之一 —— 票面原话："换页时也适配"。
+    requestFit('view-navigation')
   })
   // 装载完之后再确认一次：`did-navigate` 是**提交**那一刻，文档可能还没排完版（图片、字体、
   // 脚本都还在路上）。适配是幂等的，多跑一轮只会更准。
   view.webContents.on('did-finish-load', () => {
     const current = state.spaces.get(name)
     if (current === undefined || current.view.getVisible() !== true) return
-    requestFit('load')
+    requestFit('view-load')
   })
   attachDownloadHandling(viewSession)
   return entry
@@ -1044,10 +1046,12 @@ function spaceRecord(entry, contents, identity, cookieCount) {
     // 插件侧拿它当"缩放真的生效了"的唯一证据（`SpaceManager.setZoom`）。视图没了就没有这个
     // 字段：那时没人回答得出来，缺省比编一个 1 诚实。
     ...(live ? { zoom: contents.getZoomFactor() } : {}),
-    // 这个缩放**现在归谁管**（票 #19）：`auto` = 外壳按栏宽自动适配，`manual` = 人指名要的。
-    // 它与 `zoom` 一起发布，因为一个数离开它的主子就没有意义（"78%，但谁说了算？"）。
-    // 最新的读数在 `zoom.json` 里（那张表的发布代价太大，跟不上一次拖动）。
-    ...(live ? { zoomMode: entry.zoomMode } : {}),
+    // 这个缩放**现在归谁管**（票 #19 加的，票 #20b 之后是一个**兼容位**）：它永远是 `auto`，
+    // 因为适配永远开着 —— 一次手动缩放只是"现在的值"，下一次几何变化或换页就会被重新适配。
+    //
+    // 为什么还写它：**旧插件在读它**（`SpaceManager.zoomReading` 会解析 `mode`，`state.json` 的
+    // 这一条也是），而票 #20b 明令"解析必须继续容忍它、兼容不许破"。新面板一个字节都不看它。
+    ...(live ? { zoomMode: 'auto' } : {}),
     // 视图没了这件事**显式写明**，不静默省略：读表的人要能看见"这个空间现在动不了、为什么"。
     ...(live ? {} : { destroyed: true, contentsGoneAt: entry.contentsGoneAt }),
     ...(entry.inherited !== undefined ? { inherited: entry.inherited } : {}),
@@ -1194,9 +1198,13 @@ async function applySpaceRequest(raw) {
         // 记录到 plan 里是为了让它出现在发布的 `lastRequest` 里（诊断用）。
         plan.zoom = parsed.request.zooms
         for (const request of parsed.request.zooms) {
-          // `auto` 那一种是"把这一格交回自动适配"（票 #19）：它要**等这一轮适配跑完**再发布 ——
-          // 发布出去的那个 zoom 是 `getZoomFactor()` 的读回值，而适配正是它紧接着的来源。
-          // 不等它，按一下「自动」得到的回答会是"自动 100%"，而画面已经是 52% 了。
+          // 一条**指名了缩放值**的请求 ⇒ 把这个值按上去（`applyZoom`）。票 #20b 之后它不再
+          // 意味着"从此归人管"—— 那层语义没有了。
+          //
+          // `mode: 'auto'` 那一种是旧客户端（面板上那颗已经删掉的「自动」、以及旧插件）发的
+          // "现在就重新适配一次"：它要**等这一轮适配跑完**再发布 —— 发布出去的那个 zoom 是
+          // `getZoomFactor()` 的读回值，而适配正是它紧接着的来源。不等它，那一按得到的回答会是
+          // 适配**之前**的数，而画面已经变了。票面明令兼容不许破，所以这一支照旧。
           if (request.mode === 'auto') await handBackToAuto(request.name, 'auto-request')
           else applyZoom(request.name, request.zoom)
         }
@@ -1213,7 +1221,7 @@ async function applySpaceRequest(raw) {
 }
 
 /**
- * 把一块视图缩放到某个值（票 #13）。
+ * 把一块视图缩放到某个值（票 #13；票 #19 起它同时是一个"命令"；票 #20b 起它**只是**一个值）。
  *
  * 两件事决定了它长这样：
  *
@@ -1231,13 +1239,15 @@ async function applySpaceRequest(raw) {
  * 读回由 {@link spaceRecord} 里的 `contents.getZoomFactor()` 负责：这里**只改**，不记录改了
  * 多少 —— 发布出去的那个数必须是 Electron 说的，不是我们写下去的。
  *
- * 票 #19 起它同时是"**人接管了缩放**"这件事的落点：一个指名要某个缩放值的请求，语义上就是
- * "这个值我说了算"，所以这里的视图从此是 `manual` —— 栏宽再变，外壳也不会去改它
- * （票面那条"手动缩放优先"的验收）。把这一格交回自动适配的是另一个动作
- * （{@link handBackToAuto}，面板上那颗「自动」）。
+ * **票 #20b：这里不再有"人接管了缩放"这件事。** 票 #19 时这里会把这块视图标成 `manual`，
+ * 从此自动适配一直让位（栏宽再变也不动它），要交回去得靠面板上那颗「自动」。用户把那一整套
+ * 要去掉了（"这个手动、自动我觉得反而是多此一举，直接自动就完事了"），所以这里现在只做一件事：
+ * **把这个值按上去**。它活到下一次几何变化或换页为止 —— 那时适配会重新算它（见
+ * `did-navigate` 与 `requestFit`）。这也是"面板上的 `−`/`+`/档位只是'现在的值'"这句代码注释的
+ * 全部含义，别再引入第二套状态机。
  *
  * @param {string} name - 空间名（已经由 {@link spaces.parseRequest} 校验过形状）。
- * @param {number | undefined} zoom - 期望的缩放值；只改模式时可以缺席。
+ * @param {number | undefined} zoom - 期望的缩放值；旧插件发得出"只改模式"那种请求，那时它是 undefined。
  * @throws 空间不存在、或它的视图已经没有 webContents 时（原因会写进 state）。
  */
 function applyZoom(name, zoom) {
@@ -1252,55 +1262,62 @@ function applyZoom(name, zoom) {
   }
   if (zoom !== undefined) {
     contents.setZoomFactor(zoom)
-    // 记住**期望值**：主文档导航之后要把它重新按上去（Chromium 的缩放是按站点记的，
-    // 换站点会回到那个站点的默认值）。读回仍然走 `getZoomFactor()`。
+    // 记住**期望值**：一个"用户刚按过的值"是这一格现在的状态，读回仍然走 `getZoomFactor()`。
+    // 票 #20b 之后它不再被换页重新按回去（换页重新适配），保留它只是为了 `spaceRecord` 与
+    // 那些"这块视图期望是多少"的读回有一个来源。
     entry.zoom = zoom
   }
-  entry.zoomMode = 'manual'
-  // 谁改的，一并记下来（写进 `zoom.json` 的 `modeCause`）。这一条**只**能由"有人指名要了一个
-  // 缩放值"触发 —— 它从来不因为"外壳发布了一条状态"而发生（见 `shell/spaces.js` 的 `parseRequest`）。
-  entry.modeCause = 'zoom-request'
+  // 票 #20b：这一按把**这个矩形**定住了 —— 在栏宽真的再变一次（或换页）之前，同一块矩形上的
+  // 摆放事件不许把适配又跑起来、把这个值改回去。理由与实测见 {@link fitKeyOf} 与
+  // {@link requestFit}：全量跑的时候 `tests/zoom-pixels.spec.ts` 就是在这里红的
+  // （一次 `settle` 摆放跟着把 100% 又改回 51.7%）。
+  entry.fitKey = fitKeyOf(entry)
   // 正在跑的那一轮适配立刻作废：它是照着旧状态算的，照着它写下去就是把用户刚按的值抹掉。
+  // 这条**留着**：它不是模式，而是"别用一份过期的计算覆盖一个刚到的新值"（见 `zoomToken`）。
   entry.zoomToken += 1
   writeZoomFile('zoom-request')
 }
 
 /**
- * 把一块视图交回自动适配（票 #19）。
+ * 把一块视图**现在就重新适配一次**（票 #19 的「自动」；票 #20b 之后它只剩这一个意思）。
+ *
+ * 票 #19 时它是"把手动接管交回自动适配"：模式先归 `auto`，再重新算。**票 #20b 之后没有模式了**
+ * —— 适配永远开着 —— 所以这个函数不再切换任何状态，它就是"别等下一次几何变化，现在就重算"。
+ * 留着它是因为**旧插件与旧客户端还在发这个动作**（`mode: 'auto'` 的请求、`desktop-view-auto`
+ * 端点），而票面明令兼容不许破；面板上那颗 `auto` 按钮已经删了（没有模式可以交还）。
  *
  * 三件事，顺序是有理由的：
- *  1. 模式先归 `auto`，并且**先回到 100%** —— 自动适配算的是"这一页在这个栏宽里该是多少"，
- *     而它只在页面**溢出**时才动手（响应式页面一步都不动，票面点名要求的那条）。所以若不先回
- *     100%，一个没有溢出的页面会永远停在上一页/上一次手工留下的那个值上，而那个值是谁留下的
- *     已经没人说得清了；
- *  2. 立刻写一次 `zoom.json`：面板上那个读数（"自动 100% → 自动 52%"）要跟着走；
+ *  1. **先回到 100%** —— 自动适配算的是"这一页在这个栏宽里该是多少"，而它只在页面**溢出**时才
+ *     动手（响应式页面一步都不动，票面点名要求的那条）。所以若不先回 100%，一个没有溢出的页面
+ *     会永远停在上一页/上一次手工留下的那个值上，而那个值是谁留下的已经没人说得清了；
+ *  2. 立刻写一次 `zoom.json`：面板上那个读数要跟着走；
  *  3. **等这一轮适配跑完**再返回 —— 调用方（{@link applySpaceRequest}）紧接着就要发布整张
  *     空间表，而表里那个 `zoom` 是读回来的值；不等它，那一按的答案就会是适配**之前**的数。
  *
  * @param {string} name - 空间名。
- * @param {string} cause - 为什么交回自动（诊断用）。
+ * @param {string} cause - 为什么要重算（诊断与证据用）。
  * @returns {Promise<void>} 适配跑完就 resolve。
  */
 async function handBackToAuto(name, cause) {
   const entry = state.spaces.get(name)
-  if (entry === undefined) throw new Error(`cannot hand "${name}" back to automatic fitting: there is no such space`)
+  if (entry === undefined) throw new Error(`cannot re-fit "${name}": there is no such space`)
   const contents = liveContents(entry)
   if (contents === undefined) {
     throw new Error(
-      `cannot hand "${name}" back to automatic fitting: its view has no webContents any more ` +
+      `cannot re-fit "${name}": its view has no webContents any more ` +
         '(it was destroyed), so there is nothing to fit',
     )
   }
-  entry.zoomMode = 'auto'
-  // 谁改的，一并记下来（写进 `zoom.json` 的 `modeCause`）：交回自动只可能来自那颗「自动」。
-  entry.modeCause = 'auto-request'
-  // "交回自动"是用户明确要的 ⇒ 之前那条"缩放治不了这一页"的结论与它的样样本一起作废，重新试一次。
+  // "重新适配"是用户明确要的 ⇒ 之前那条"缩放治不了这一页"的结论与它的样本一起作废，重新试一次。
   // 试还是治不了的话，下一轮会再判定一次（并且依旧放回 100%，不会留下任何缩小）。
   entry.fitDeclined = undefined
   entry.fitSample = undefined
   entry.zoomToken += 1
   if (Math.abs(contents.getZoomFactor() - 1) > 1e-6) contents.setZoomFactor(1)
   entry.zoom = 1
+  // 这一轮是**明确要求**跑的（不是"几何变了"推出来的）：`fitKey` 也跟着更新，好让随后那些
+  // "同一个矩形"的摆放事件不至于再排一轮（见 {@link fitKeyOf}）。
+  entry.fitKey = fitKeyOf(entry)
   writeZoomFile(cause)
   await runScheduledFit(cause, name)
 }
@@ -1327,13 +1344,10 @@ function writeZoomFile(cause) {
     if (contents === undefined) continue
     readings[entry.name] = {
       zoom: contents.getZoomFactor(),
-      mode: entry.zoomMode,
-      // **谁把它改成现在这个模式的**（票 #19 重开）。`mode` 只说"现在归谁管"，不说
-      // "谁让它归谁管" —— 而那个区别正是这张票重新打开时缺的那一条证据：一个 start 时就是
-      // `manual` 的读数，看起来与"用户按过 100%"一模一样，谁也答不出到底是哪一次动作干的。
-      // 现在它在文件里：`boot` = 外壳建这块视图时的缺省，`zoom-request` = 有人指名要了一个值，
-      // `auto-request` = 面板上那颗「自动」交回来的。看一行就知道这一格是不是**从来没人碰过**。
-      ...(entry.modeCause !== undefined ? { modeCause: entry.modeCause } : {}),
+      // **兼容位**（票 #19 加的，票 #20b 之后永远是 `auto`）：适配永远开着，所以"谁在管这个缩放"
+      // 这个问题只有一个答案。旧插件会解析这个字段（`parseZoomReading` 里 `mode` 不是 `auto`/
+      // `manual` 就整条读不动），所以它必须继续写着 —— 但外壳这一侧已经没有任何状态机在后面。
+      mode: 'auto',
       fitPasses: entry.fitPasses,
       fitChanges: entry.fitChanges,
       // "缩放治不了这一页的溢出"这条结论**说出来**：它是"适配在管着、但它决定不动手"的
@@ -1412,11 +1426,19 @@ async function waitForRelaidOut(contents, before, timeoutMs) {
  *
  * @param {string} cause - 谁请的这一轮（诊断与证据用）。
  * @param {string} [name] - 哪个空间；缺省是当前空间。
+ * @param {number} [requiredToken] - 这一轮**为哪一个** `zoomToken` 请来的（票 #20b）；对不上就
+ *   什么都不做地返回，缺省 = 不带凭据（明确要求跑的那种）。
  * @returns {Promise<void>} 一轮跑完就 resolve。
  */
-async function runFitPass(cause, name) {
+async function runFitPass(cause, name, requiredToken) {
   const entry = state.spaces.get(name ?? state.activeSpace)
-  if (entry === undefined || entry.zoomMode !== 'auto') return
+  // 票 #20b：这里原来还有一条 `entry.zoomMode !== 'auto'` 的闸门（"人指名过缩放，适配让位"）。
+  // 那条闸门就是被删掉的那个状态机本身 —— 现在只剩"这一格存在吗"。
+  if (entry === undefined) return
+  // 而**凭据**这条闸门是新的（见 {@link runScheduledFit}）：这一轮是照着"请它的那一刻"那个缩放值
+  // 算的，而请它到跑它之间可能隔着一次"有人指名改缩放"。对不上就整个作废 —— 一次都不许写。
+  // 这不是模式：`requiredToken === undefined` 时（明确要求跑的那种，比如「自动」按钮）照跑。
+  if (requiredToken !== undefined && entry.zoomToken !== requiredToken) return
   const contents = liveContents(entry)
   if (contents === undefined) return
   // 这份文档已经被判定"缩放治不了它的溢出"（见 `shell/fit.js` 的 `contentTracksViewport`）：
@@ -1424,15 +1446,17 @@ async function runFitPass(cause, name) {
   if (entry.fitDeclined !== undefined) return
   const startedAt = Date.now()
   /**
-   * 这一轮的"代次"。任何人指名改缩放、或把它交回自动，都会让这个数 +1，于是**正在跑的这一轮
+   * 这一轮的"代次"。任何人指名改缩放、或要求重新适配，都会让这个数 +1，于是**正在跑的这一轮
    * 立刻作废**：它算出来的目标是照着旧状态算的，照着它写下去就等于把用户刚按的那个值抹掉。
-   * 实测过这个 bug：面板上按 `100%` 之后，一次在飞的一轮把它又改回 0.5167，而模式已经是 manual。
+   * 实测过这个 bug：面板上按 `100%` 之后，一次在飞的一轮把它又改回 0.5167。
+   *
+   * 票 #20b：这条闸门**留着**，它与模式无关 —— 它挡的是"用一份过期的计算覆盖一个刚到的新值"。
    */
   const token = entry.zoomToken
   const steps = []
   let changed = 0
   for (let step = 1; step <= fit.MAX_STEPS; step += 1) {
-    if (entry.zoomToken !== token || entry.zoomMode !== 'auto') {
+    if (entry.zoomToken !== token) {
       steps.push({ step, aborted: 'a zoom request arrived while this pass was running' })
       break
     }
@@ -1486,7 +1510,7 @@ async function runFitPass(cause, name) {
     }
     // 落笔之前再确认一次"没人在这中间插过手"（见上面 token 的说明）：这一次检查与 `setZoomFactor`
     // 之间只剩下同步的几行，窗口从"一次页面往返"缩到微秒级。
-    if (entry.zoomToken !== token || entry.zoomMode !== 'auto') {
+    if (entry.zoomToken !== token) {
       steps.push({ step, aborted: 'a zoom request arrived while this pass was running' })
       break
     }
@@ -1526,27 +1550,69 @@ async function runFitPass(cause, name) {
 }
 
 /**
+ * 一块视图**现在占的那个矩形**的指纹（票 #20b）。
+ *
+ * 它回答的是"几何真的变了吗"这个问题 —— 而这句话正是票面对一次手动缩放的寿命的定义：
+ * **"下一次几何变化或换页会被重新适配"**。它的机械形态就是：**同一个矩形上不再重跑适配**。
+ *
+ * 为什么非要有它（这是全量跑的时候抓到的第二处，不是推理）：一次 `settle` 摆放、一次
+ * `space-activate`、宿主自己那一页刷新，都会请一轮适配，而它们的矩形常常**没变**。票 #19 时
+ * 那些请求被模式闸门挡住（人一按就 `manual`，适配整个让位）；模式删掉之后它们就照着"人按之前的
+ * 算法"重算，把用户刚按下的值改回去 —— 实测：`tests/zoom-pixels.spec.ts` 里 `resetZoom()` 之后
+ * 400ms，页面已经被改回 51.7%，"100% 时红标不该在画面里"读到 5400 个红像素；
+ * `tests/fit-to-pane.spec.ts` 的"换页之前（手动 100%）"读到页面已经不溢出了。两处同时红。
+ *
+ * 读数来自 `view.getBounds()`（Electron 读回的那个矩形）：它对**每个空间**都成立，不依赖
+ * "哪一块是当前空间"，所以在后台空间上按的那一下也记得住。
+ *
+ * @param {object} entry - 空间记录。
+ * @returns {string} 指纹；视图没了就是 `gone`。
+ */
+function fitKeyOf(entry) {
+  if (liveContents(entry) === undefined) return 'gone'
+  const bounds = entry.view.getBounds()
+  return `${bounds.x},${bounds.y},${bounds.width},${bounds.height}`
+}
+
+/**
  * 跑一轮适配，并且保证**同一时刻只有一轮**。
  *
  * 拖动时请求会连着来，而一轮本身是异步的（两次 `executeJavaScript` 往返）。所以：
  * 正在跑的时候来的请求只把 `pending` 立起来，跑完立刻再跑一轮（对着那时最新的几何）。
  *
+ * **票 #20b：排队的那一轮必须带着"它是为哪一刻的缩放值请来的"这条凭据。**
+ *
+ * 理由是这条链路上一个**实测踩到**的入口：一次拖动排下的尾随那一轮，可能在用户按下 `100%`
+ * **之后**才真的跑起来。票 #19 时它被模式闸门挡住（"人接管了 ⇒ 适配让位"），而模式删掉之后
+ * 它就照着旧值算、把用户刚按的那个数覆盖掉 —— 全量跑的时候两条用例同时红（`fit-to-pane` 的
+ * "换页之前（手动 100%）"读到页面已经不溢出了，`zoom-pixels` 的"100% 时红标不该在画面里"
+ * 读到了 5400 个红像素）。所以 `pending` 从 `true` 变成"**最新的那一次请求的 `zoomToken`**"，
+ * 而每一轮开跑前先对一次：对不上就整个作废（如实记在 `DSH_SHELL FIT` 的那一行里都做不到 ——
+ * 它压根不开跑，这正是"什么都不做"该有的样子）。
+ *
  * @param {string} cause - 谁请的。
  * @param {string} [name] - 哪个空间。
+ * @param {number} [token] - 这一轮是为**哪一个** `zoomToken` 请来的；缺省 = 不带凭据（明确要求跑）。
  * @returns {Promise<void>} 这一串跑完（或直接被挡掉）就 resolve。
  */
-async function runScheduledFit(cause, name) {
+async function runScheduledFit(cause, name, token) {
   if (state.fit.running) {
-    // 已经有一轮在跑：它会看到最新几何（下面那个 do/while），这里不叠第二轮。
-    state.fit.pending = true
+    // 已经有一轮在跑：它会看到最新几何（下面那个 do/while），这里不叠第二轮 —— 但把**这一次**
+    // 请求的凭据记下来，跑完对着它再跑一轮。
+    state.fit.pending = token === undefined ? true : token
     return
   }
   state.fit.running = true
   try {
+    let required = token
+    let pending = false
     do {
+      pending = state.fit.pending
       state.fit.pending = false
-      await runFitPass(cause, name)
-    } while (state.fit.pending === true && state.shuttingDown !== true)
+      await runFitPass(cause, name, required)
+      // 排着的那一轮要是带了凭据（一个数），就用它；只立了个 `true` 就沿用这一轮那个。
+      required = typeof pending === 'number' ? pending : token
+    } while (pending !== false && state.shuttingDown !== true)
   } finally {
     state.fit.running = false
     state.fit.lastAt = Date.now()
@@ -1554,38 +1620,56 @@ async function runScheduledFit(cause, name) {
 }
 
 /**
- * 请外壳跑一轮自动适配（票 #19 的触发口）。
+ * 请外壳跑一轮自动适配（票 #19 的触发口；票 #20b 起它是**唯一**的缩放主子）。
  *
  * 触发它的是"视图的几何刚刚变了"（{@link applyPlacement}）与"页面换了/装载完了"
  * （`did-navigate` / `did-finish-load`）。**不是**面板那条请求通道 —— 那条路上一次要 ~1 秒
  * （ADR-0013 实测），拖动侧边栏时那就是废的。
  *
- * 两个闸门：
- *   - `zoomMode !== 'auto'`：人（或工具）指名过缩放，自动适配**让位**；
- *   - 视图没显示（面板没报矩形、被折叠、切走了）：那一刻没有"栏宽"可言。
+ * 闸门只剩一个（票 #20b 删掉了 `zoomMode !== 'auto'` 那一条）：**视图没显示**（面板没报矩形、
+ * 被折叠、切走了）—— 那一刻没有"栏宽"可言，算了也没地方画。
+ *
+ * 另加两条**凭据**（票 #20b，两处都是全量跑时实测踩到的，见 {@link fitKeyOf} 与
+ * {@link runScheduledFit}）：
+ *
+ *  1. **几何真的变了**：同一个矩形上的摆放事件（`settle` / `space-activate` / 宿主自己刷新）不再
+ *     重跑适配 —— 否则用户刚按下的那个值会被改回去。换页是例外：`view-navigation` / `view-load`
+ *     永远重算（票面原话"换页时也适配"）；
+ *  2. **请它的时候那个 `zoomToken`**：真的开跑之前再对一次，对不上（这中间有人指名改过缩放）
+ *     就整轮作废。
  *
  * @param {string} cause - 谁请的（诊断与证据用）。
  */
 function requestFit(cause) {
   if (state.shuttingDown) return
   const entry = activeEntry()
-  if (entry === undefined || entry.zoomMode !== 'auto') return
+  if (entry === undefined) return
   if (entry.view.getVisible() !== true) return
+  // 换页：矩形没变也要重算（页面是新的，"刚好塞得下"要重新算一遍）。
+  const pageChanged = cause === 'view-navigation' || cause === 'view-load'
+  const key = fitKeyOf(entry)
+  // 几何没变 ⇒ 这一格已经"定住了"（适配跑过，或者刚被一次指名缩放定住）：什么都不做。
+  if (pageChanged !== true && entry.fitKey === key) return
+  // 记下"这个矩形已经交给适配了" —— 在它被跑（或被一次缩放作废）之前，同一个矩形不再排第二轮。
+  entry.fitKey = key
+  const token = entry.zoomToken
   if (state.fit.running) {
-    state.fit.pending = true
+    state.fit.pending = token
     return
   }
   const since = Date.now() - state.fit.lastAt
   if (since >= FIT_MIN_INTERVAL_MS) {
-    void runScheduledFit(cause)
+    void runScheduledFit(cause, undefined, token)
     return
   }
   // 还在节流窗口里：排一轮到窗口末尾。**尾随那一轮是必须的** —— 只延迟不补的话，
   // 一次拖动的最后那几帧（也就是最终栏宽）就再也没人看过了。
+  // 票 #20b：它带着**请它的时候**那个 `zoomToken`（见上面那段），所以"排下之后用户按了 100%"
+  // 会让它作废，而不是把那个值改回去。
   if (state.fit.timer === undefined) {
     state.fit.timer = setTimeout(() => {
       state.fit.timer = undefined
-      void runScheduledFit('trailing')
+      void runScheduledFit('trailing', undefined, token)
     }, FIT_MIN_INTERVAL_MS - since)
   }
 }

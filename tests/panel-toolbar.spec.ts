@@ -274,16 +274,19 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
     expect(Number(factsReset.innerWidth)).toBe(Number(factsBefore.innerWidth))
     expect(Math.abs((await viewDpr()) - before)).toBeLessThan(0.02)
 
-    // 票 #19：那颗「自动」按钮走的就是这条通道（`desktop-view-auto`）。
-    // 夹具页是响应式的（没有横向溢出），所以适配"跑了但一步都不动" —— 结果是 100% + `auto`。
+    // 票 #19 加的「自动」端点（`desktop-view-auto`）：**票 #20b 之后面板不再渲染那颗按钮**
+    // （适配永远开着，没有模式可以交还），但这个端点为旧客户端留着，语义是"现在就重新适配一次"。
+    // 夹具页是响应式的（没有横向溢出），所以适配"跑了但一步都不动" —— 结果是 100%。
     const handedBack = await callPanelChannel('auto', { cookie })
     const valueAuto = valueOf(handedBack, 'auto')
-    console.log('RAW 「自动」 over the panel channel: ' + JSON.stringify(valueAuto))
+    console.log('RAW 旧客户端那颗「自动」 over the panel channel: ' + JSON.stringify(valueAuto))
     expect(handedBack.status).toBe(200)
     expect(valueAuto.ok).toBe(true)
-    expect(valueAuto.zoomMode, 'the answer must say who is in charge of the zoom now').toBe('auto')
+    expect(valueAuto.zoomMode, 'the published mode is a compatibility constant: always auto').toBe('auto')
     expect(Number(valueAuto.zoom)).toBe(1)
-    expect(String(valueAuto.message)).toContain('automatic fitting')
+    expect(String(valueAuto.message), 'the answer says what really happened: the pane was fitted again').toContain(
+      'fitted this pane to the pane again',
+    )
     // 票 #20 C：宿主那句话仍然在（它是诊断通道的一半），而**用户看的那一行**由面板决定
     // 只显示"模式 + 百分比" —— 那一条由 `tests/toolbar-panel.spec.ts` 从 DOM 上读回。
     // 这里顺带钉住：`state` 那条纯读回的那句诊断话术**还在回答里**（没被删掉）。
@@ -402,8 +405,10 @@ describe('票 #13 · 面板那条通道（真外壳 + 真 DSH 宿主）', () => 
     expect(Number(value.zoom)).toBeCloseTo(1.5, 6)
     // 页面自己报的 dpr 跟着变（与 `−`/`+` 走的是同一条路、同一套读回）。
     expect(await viewDpr()).toBeGreaterThan(1)
-    // 它同时是一次"指名了一个值" ⇒ 归手动管（票 #19 的语义在两条路上一致）。
-    expect(value.zoomMode).toBe('manual')
+    // **票 #20b 翻转的一条**：指名一个值**不再**意味着"从此归人管"。外壳这一侧没有模式了
+    // （适配永远开着），所以它照旧读回 `auto` —— 那个数是"现在的值"，下一次几何变化或换页
+    // 就会被重新适配（`tests/fit-to-pane.spec.ts` 从真外壳那一侧量这件事）。
+    expect(value.zoomMode, 'a named value no longer hands the pane to a person').toBe('auto')
 
     // 表外的值：拒，而且说得出是哪个值不在表里。
     const offTable = await callPanelChannel('zoom-to', { cookie, payload: { zoom: 0.83 } })

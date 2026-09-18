@@ -26,7 +26,7 @@ interface ToolbarApi {
     state: { canGoBack: boolean; canGoForward: boolean; busy: boolean; hasShell: boolean },
   ) => boolean
   zoomLabel: (zoom: unknown) => string
-  zoomReading: (zoom: unknown, mode: unknown, words?: { auto?: string; manual?: string }) => string
+  zoomReading: (zoom: unknown, ...rest: unknown[]) => string
   zoomPresetFactor: (percent: unknown) => number | null
   currentPreset: (zoom: unknown) => number | null
   parseAddress: (input: unknown) => { ok: true; url: string } | { ok: false; reason: string }
@@ -35,12 +35,13 @@ interface ToolbarApi {
   readingText: (
     state: {
       zoom: unknown
-      zoomMode: unknown
+      /** 票 #20b：外壳**仍然**会发这个字段（旧插件在读它），而面板已经不看它了。 */
+      zoomMode?: unknown
       loading?: unknown
       message?: string
       ok?: boolean | null
     },
-    words?: { auto?: string; manual?: string; loading?: string },
+    words?: { loading?: string },
   ) => string
   titleForTab: (title: unknown, fallback: string) => string
   travelHint: (target: unknown, prefix?: string) => string | undefined
@@ -74,11 +75,11 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
   it('票面点名的那些按钮一个不少，而且顺序是人读的顺序', () => {
     console.log('RAW toolbar buttons: ' + JSON.stringify(toolbar.BUTTONS.map((button) => button.action)))
     // 票面原文：**后退 · 前进 · 刷新 · 缩放(− / 百分比 / +) · 重置 · 重新开始**。
-    // "百分比"是状态行上那个标签（`zoomLabel`），另外六个是按钮。
     //
-    // 票 #19 加了第七个：**`auto`**（把这一格交回自动适配）。它不是多加了一颗装饰按钮 ——
-    // 自动适配一旦被人指名过的缩放顶掉就不会自己回来（换页不丢缩放是 #13 钉住的语义），
-    // 没有这颗按钮，手动模式就是一个进得去出不来的状态。理由写在 `src/toolbar.js` 那一行上。
+    // 票 #20b 把票 #19 加的那颗 **`auto`** 删掉了：它当初唯一的用处是"把手动缩放交回自动适配"，
+    // 而 #20b 把"手动 = 一个出不来的状态"那件事整个去掉了 —— 适配永远开着，一次手动缩放只是
+    // "现在的值"。没有模式可以交还，那颗按钮就没有任何意思了，**而且它会出现在用户眼前**
+    // （用户的原话："这个手动、自动我觉得反而是多此一举，直接自动就完事了"）。
     expect(toolbar.ACTIONS).toEqual([
       'back',
       'forward',
@@ -86,21 +87,44 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
       'zoom-out',
       'zoom-reset',
       'zoom-in',
-      'auto',
       'restart',
     ])
+    // 一个**正面的**反面断言：不在一张表里还不够，得让它"没有第二个名字"。
+    expect(toolbar.ACTIONS, 'the pane has no mode left to hand back, so no button may offer one').not.toContain('auto')
+    expect(JSON.stringify(toolbar.BUTTONS)).not.toContain('auto')
+  })
+
+  it('票 #20b 要求 3：工具条上**没有第二颗控件**的文字是一个百分比（那句话只能出现一次）', () => {
+    // 这一条是"数出现次数"那件事的纯逻辑半边。读数是 `100%`（或 `78%`…），而票 #20 D 的重置
+    // 按钮当时**标签就是 `100%`** —— 于是同一句话在工具条上会有两个来源，用户自己那把尺子
+    // （"同一句话只许出现一次，数出来必须是 1"）就会数到 2。它现在叫 `reset`。
+    console.log('RAW 按钮的标签: ' + JSON.stringify(toolbar.BUTTONS.map((button) => button.label)))
+    for (const button of toolbar.BUTTONS) {
+      expect(button.label, `“${button.label}” 是一个读数，不是一颗按钮的名字`).not.toMatch(/^\d+(\.\d+)?%$/)
+    }
+    // 也没有 `自动` / `手动` 这种词混进按钮里。
+    for (const button of toolbar.BUTTONS) {
+      expect(`${button.label} ${button.title}`).not.toMatch(/自动|手动/)
+    }
   })
 
   it('端点的命名空间与宿主那半边对得上（一个错字就是 404，不是另一个按钮）', async () => {
     // 客户端把动作叫 `desktop-view-<action>`，宿主把路由注册在 `/<channel>/desktop-view-<action>`。
     // 两边是同一组名字，这里是它们唯一的交叉点之一。
     const { viewEndpointPath } = (await import('../src/view-rpc.ts')) as typeof import('../src/view-rpc.ts')
-    for (const button of toolbar.BUTTONS) {
-      const action = button.action === 'zoom-reset' ? 'zoom-reset' : button.action
-      const paths = ['back', 'forward', 'reload', 'restart', 'zoom-in', 'zoom-out', 'zoom-reset', 'auto', 'state']
-      if (!paths.includes(action)) continue
-      expect(viewEndpointPath(action)).toBe(`/api/desktop-view-${action}`)
+    // `auto` 还在这张表里（**端点没删**：旧客户端仍在调它，票面明令兼容不许破），只是面板不再
+    // 渲染那颗按钮 —— 所以这里它照样要能路由。
+    const paths = ['back', 'forward', 'reload', 'restart', 'zoom-in', 'zoom-out', 'zoom-reset', 'auto', 'state']
+    for (const action of paths) {
+      expect(viewEndpointPath(action as never)).toBe(`/api/desktop-view-${action}`)
     }
+    // 而面板请求的每一个动作都必须是宿主认得的名字（`auto` 现在不在面板那一侧了）。
+    const { VIEW_ACTIONS } = (await import('../src/view-rpc.ts')) as typeof import('../src/view-rpc.ts')
+    for (const action of toolbar.ACTIONS) {
+      if (action === 'zoom-reset' || action === 'zoom-in' || action === 'zoom-out') continue
+      expect(VIEW_ACTIONS as readonly string[]).toContain(action)
+    }
+    expect(VIEW_ACTIONS as readonly string[]).toContain('auto')
   })
 
   it('后退/前进没有可去的一页时是灰的；其余按钮**永远**不因为"不知道"而变灰', () => {
@@ -134,29 +158,28 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
     expect(toolbar.zoomLabel('1.5')).toBe('\u2014')
   })
 
-  it('读数要说清是哪种模式（票 #19）：自动 78% / 手动 90%，而不知道就不带前缀', () => {
-    const words = { auto: '自动', manual: '手动' }
+  it('票 #20b 要求 1：读数**只有百分比**，外壳仍发的 `mode` 一个字都不许变出前缀来', () => {
     console.log(
-      'RAW 缩放读数的四种形状: ' +
+      'RAW 缩放读数的形状（票 #20b 之后）: ' +
         JSON.stringify({
-          auto: toolbar.zoomReading(0.78, 'auto', words),
-          manual: toolbar.zoomReading(0.9, 'manual', words),
-          unknown: toolbar.zoomReading(0.9, undefined, words),
-          unreadable: toolbar.zoomReading(undefined, 'auto', words),
+          plain: toolbar.zoomReading(0.78),
+          withOldModeArgument: toolbar.zoomReading(0.9, 'auto'),
+          withOldWordsToo: toolbar.zoomReading(0.9, 'manual', { auto: '自动', manual: '手动' }),
+          unreadable: toolbar.zoomReading(undefined),
         }),
     )
-    // 票面原话：读数的样子要像 `自动 78%` / `手动 90%`，**不许让人看不出来**。
-    expect(toolbar.zoomReading(0.78, 'auto', words)).toBe('自动 78%')
-    expect(toolbar.zoomReading(0.9, 'manual', words)).toBe('手动 90%')
-    // 读不到模式 ⇒ 退回一个光秃秃的百分比，**不猜**：`90%` 说的是"这是 90%"，
-    // 而猜出来的 `自动 90%` 说的是"外壳在按栏宽适配它" —— 后者可能不成立。
-    expect(toolbar.zoomReading(0.9, undefined, words)).toBe('90%')
-    expect(toolbar.zoomReading(0.9, 'something-else', words)).toBe('90%')
-    // 连数都读不到时，模式也没有意义：一个 `—` 就够了。
-    expect(toolbar.zoomReading(undefined, 'auto', words)).toBe('\u2014')
-    expect(toolbar.zoomReading(Number.NaN, 'manual', words)).toBe('\u2014')
-    // 没有词表时也只显示百分比（这个词表刻意住在文案表里，见 `src/toolbar.js`）。
+    // 票面原话："工具条上不再出现 `手动` / `自动` 前缀（读数只留百分比）"。
+    expect(toolbar.zoomReading(0.78)).toBe('78%')
+    expect(toolbar.zoomReading(1)).toBe('100%')
+    // **兼容那一半**：外壳（含旧外壳）仍然会在回答里带 `mode`，而面板这一侧多给两个参数也**不会**
+    // 变出一个前缀来 —— 这几条就是"解析继续容忍它、而语义里去掉了它"的读回。
     expect(toolbar.zoomReading(0.9, 'auto')).toBe('90%')
+    expect(toolbar.zoomReading(0.9, 'manual')).toBe('90%')
+    expect(toolbar.zoomReading(0.9, 'manual', { auto: '自动', manual: '手动' })).toBe('90%')
+    // 读不到那个数时仍然是 `—`，不是 `100%`（票 #19 定下的规矩，没动）。
+    expect(toolbar.zoomReading(undefined)).toBe('\u2014')
+    expect(toolbar.zoomReading(Number.NaN)).toBe('\u2014')
+    expect(toolbar.zoomReading('0.9', 'auto')).toBe('\u2014')
   })
 
   it('状态行只说用户要的：成功时**不显示**宿主的诊断话术，失败时才说为什么（票 #20 C）', () => {
@@ -183,8 +206,8 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
     expect(toolbar.diagnosticText({})).not.toBe('')
   })
 
-  it('整行读数 = 模式 + 百分比（票 #20 C），必要时加"加载中"（F）与"为什么没成"', () => {
-    const words = { auto: '自动', manual: '手动', loading: '加载中' }
+  it('整行读数 = 百分比（票 #20b），必要时加"加载中"（F）与"为什么没成"（C）', () => {
+    const words = { loading: '加载中' }
     const reading = (state: Record<string, unknown>): string => toolbar.readingText(state as never, words)
     console.log(
       'RAW 读数的几种形状: ' +
@@ -195,18 +218,23 @@ describe('票 #13 · 面板工具条（纯判断）', () => {
           unreadable: reading({ zoom: undefined, zoomMode: undefined }),
         }),
     )
-    // 票面原话："读数只留用户要的信息（模式 + 百分比）"。
-    expect(reading({ zoom: 1, zoomMode: 'auto' })).toBe('自动 100%')
-    expect(reading({ zoom: 0.9, zoomMode: 'manual' })).toBe('手动 90%')
+    // 票 #20b：那句话里只剩百分比。**注意 `zoomMode` 还照旧喂进去**：外壳仍在发它（旧插件读它），
+    // 而这一条钉住的是"面板不再拿它做任何事"。
+    expect(reading({ zoom: 1, zoomMode: 'auto' })).toBe('100%')
+    expect(reading({ zoom: 0.9, zoomMode: 'manual' })).toBe('90%')
+    expect(reading({ zoom: 0.9, zoomMode: undefined })).toBe('90%')
     // 加载中是真的加一段（票 #20 F 的第一条）。
-    expect(reading({ zoom: 0.78, zoomMode: 'auto', loading: true })).toBe('自动 78% · 加载中')
+    expect(reading({ zoom: 0.78, zoomMode: 'auto', loading: true })).toBe('78% · 加载中')
     // 页面没在加载时不加那一段：`loading` 缺席或 false 都不说话。
-    expect(reading({ zoom: 0.78, zoomMode: 'auto', loading: false })).toBe('自动 78%')
-    expect(reading({ zoom: 0.78, zoomMode: 'auto' })).toBe('自动 78%')
+    expect(reading({ zoom: 0.78, zoomMode: 'auto', loading: false })).toBe('78%')
     // 失败时那句"为什么"接在后面。
-    expect(reading({ zoom: 1, zoomMode: 'manual', ok: false, message: 'nope' })).toBe('手动 100% · ✗ nope')
+    expect(reading({ zoom: 1, zoomMode: 'manual', ok: false, message: 'nope' })).toBe('100% · ✗ nope')
     // 读不到缩放时是 `—`，不编一个数（票 #20 之前就钉住的规矩）。
     expect(reading({ zoom: undefined, zoomMode: undefined })).toBe('\u2014')
+    // 那一行里**一个模式词都没有**（这是"去掉手动/自动"最直接的一条读回）。
+    for (const state of [{ zoom: 1, zoomMode: 'auto' }, { zoom: 0.9, zoomMode: 'manual' }, { zoom: 1, zoomMode: 'auto', loading: true }]) {
+      expect(reading(state)).not.toMatch(/自动|手动|auto|manual/)
+    }
   })
 
   it('地址栏的规则：只写主机名补 https://，回环主机补 http://，别的协议说得清是拒（票 #20 A）', () => {

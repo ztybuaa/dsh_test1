@@ -261,7 +261,9 @@ describe('票 #19 · 栏一变，整页自己进来了（真窗口像素）', ()
     expect(reading?.zoom ?? 1).toBeLessThan(1)
     expect(reading?.fitChanges ?? 0).toBeGreaterThan(0)
 
-    // ── 反证：**同一个栏宽**下按一次 `100%`（手动接管）⇒ 红标必须回到看不见 ──
+    // ── 反证（票 #20b 改过的半边）：**同一个栏宽**下按一次 `100%` ⇒ 红标必须回到看不见。
+    //     "手动缩放保留，但语义降级成'现在的值'"这句话的可见形态就是这一条：值是 100%，
+    //     而这一页在 620 的栏里就是被裁掉的。 ──
     const reset = await session.resetZoom()
     await new Promise((settle) => setTimeout(settle, 500))
     const atManual = await capture('narrow-manual')
@@ -269,29 +271,41 @@ describe('票 #19 · 栏一变，整页自己进来了（真窗口像素）', ()
     expect(reset.zoom).toBe(1)
     expect(
       atManual.red?.count ?? 0,
-      'with the fit standing down (a manual 100%), the same pane must show the page cut off — otherwise the reading above proves nothing',
+      'at a hand-set 100% the same pane must show the page cut off — otherwise the reading above proves nothing',
     ).toBe(0)
-    // 而手动之后**栏宽再变也不许把它改回去**（票面那条"手动缩放优先"的像素版）。
+    // ── **票 #20b 的翻转**：栏宽再变一次，适配必须**重新接手**（票 #19 时这里量的是相反的结论：
+    //     "手动之后栏宽再变也不许把它改回去"）。用户把那一整套去掉了（"直接自动就完事了"），
+    //     所以现在的结果是：红标**又回到画面里**，因为这一页被重新适配到了 620 的栏里。 ──
     await dragPane(NARROW, 900, 8)
     await dragPane(900, NARROW, 8)
     await waitForPaneWidth(NARROW)
+    await waitForFit()
     await new Promise((settle) => setTimeout(settle, 400))
     const afterManualDrag = await capture('narrow-manual-dragged')
-    const manualReading = spaces.zoomReading('default')
-    console.log('RAW 手动模式下又拖了一轮: ' + JSON.stringify({ reading: manualReading, facts: await facts() }))
-    expect(manualReading?.mode).toBe('manual')
-    expect(manualReading?.zoom, 'a manual zoom must survive pane drags, on pixels too').toBeCloseTo(1, 3)
-    expect(afterManualDrag.red?.count ?? 0, 'the page must still be cut off: the fit was told to stand down').toBe(0)
+    const refittedReading = spaces.zoomReading('default')
+    console.log('RAW 手动之后又拖了一轮: ' + JSON.stringify({ reading: refittedReading, facts: await facts() }))
+    expect(refittedReading?.mode, 'the published mode is a compatibility constant: always auto').toBe('auto')
+    expect(refittedReading?.zoom ?? 1, 'a pane change re-fits even after a hand-set value').toBeLessThan(1)
+    expect(
+      afterManualDrag.red?.count ?? 0,
+      'the fit must take the page back after a pane change — the marker is visible again',
+    ).toBeGreaterThan(0)
 
-    // ── 再交回自动：红标又回来了（同一段栏宽，第三次读数） ──
+    // ── `useAutoZoom()`（旧客户端那颗「自动」走的端点，票 #20b 之后它的意思是"现在就重新适配
+    //     一次"）：在同一段栏宽上按一次 100% 把页面切掉，再请它重新适配 ⇒ 红标又回来了。
+    //     端点留着、语义收窄，这一条是那条兼容承诺在**像素**上的读回。 ──
+    await session.resetZoom()
+    await new Promise((settle) => setTimeout(settle, 300))
+    const atCutOff = await capture('narrow-cut-off-again')
+    expect(atCutOff.red?.count ?? 0, 'the hand-set 100% must cut the page off again before we ask for a re-fit').toBe(0)
     await session.useAutoZoom()
     await waitForFit()
     await new Promise((settle) => setTimeout(settle, 300))
     const atAutoAgain = await capture('narrow-auto-again')
-    console.log('RAW 交回自动之后: ' + JSON.stringify({ reading: spaces.zoomReading('default'), facts: await facts() }))
+    console.log('RAW 请它重新适配之后: ' + JSON.stringify({ reading: spaces.zoomReading('default'), facts: await facts() }))
     expect(
       atAutoAgain.red?.count ?? 0,
-      'handing the pane back to automatic fitting must bring the whole page in again',
+      'asking the shell to re-fit must bring the whole page in again',
     ).toBeGreaterThan(0)
   }, 300_000)
 })

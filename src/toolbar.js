@@ -39,15 +39,22 @@
     { action: 'forward', label: '\u2192', title: 'forward', shortcut: 'ArrowRight' },
     { action: 'reload', label: '\u21bb', title: 'reload', shortcut: 'F5' },
     { action: 'zoom-out', label: '\u2212', title: 'zoom out', shortcut: null },
-    { action: 'zoom-reset', label: '100%', title: 'reset the zoom to 100%', shortcut: null },
+    // 票 #20b：**这颗按钮的标签原来是 `100%`，现在是 `reset`**，而这是一条验收要求逼出来的，
+    // 不是口味问题。读数去掉了 `手动`/`自动` 前缀之后，工具条上那句读数就是 `100%`；而标签为
+    // `100%` 的它会在同一行里**第二次**说出那句话 —— 票面要求"那句话只许出现一次，且要能数出
+    // 次数（必须是 1）"，所以同一句话不能同时是一颗动作按钮的名字。动作一个没少：它仍然把缩放
+    // 送回 100%，那句话仍在 `title` 上（"reset the zoom to 100%"）。
+    // 词形与旁边的 `restart` 一致（都是词，不是百分比）—— 见 `tests/toolbar-panel.spec.ts` 里
+    // 那条"数出现次数"的断言。
+    { action: 'zoom-reset', label: 'reset', title: 'reset the zoom to 100%', shortcut: null },
     { action: 'zoom-in', label: '+', title: 'zoom in', shortcut: null },
-    // 票 #19：把这一格**交回自动适配**（按栏宽自己缩放）。
+    // 票 #20b：**这里原来有一颗 `auto` 按钮（票 #19 加的），现在没有了。**
     //
-    // 为什么必须有这颗按钮，而不是"换页/重新开始之后自动回来"：换页不丢缩放是 #13 定下的
-    // 语义（同源换页、换站点都实测过），而这条语义与"换页就把控制权交回自动"是矛盾的 ——
-    // 二者只能留一个，留下的那个是**已经在验收里钉住**的那个。于是回到自动必须是一个
-    // **说得出口的动作**，否则手动模式就是一个人进得去出不来的状态。
-    { action: 'auto', label: 'auto', title: 'fit the page to the pane (let the pane decide the zoom)', shortcut: null },
+    // 它当初存在的唯一理由是"手动缩放是一个进得去出不来的状态"：一旦有人指名过缩放值，自动适配
+    // 就永远让位（#19 的语义），所以必须有一颗按钮把控制权交回去。票 #20b 把那条让位规则整个
+    // 去掉了 —— 适配**永远开着**，一次手动缩放只是"现在的值"，下一次几何变化或换页都会被重新
+    // 适配（见 `shell/main.js` 的 `applyZoom` 与 `did-navigate`）。没有模式可以交还，于是那颗
+    // 按钮没有意义了。**通道那头那个动作端点还在**（旧客户端仍在调它），但面板不再渲染它。
     { action: 'restart', label: 'restart', title: 'go back to the page this pane started on', shortcut: null },
   ]
 
@@ -97,32 +104,25 @@
   }
 
   /**
-   * 面板上那个缩放读数，**带上是哪种模式**（票 #19）。
+   * 面板上那个缩放读数（票 #20b：**只有百分比，没有模式前缀**）。
    *
-   * 票面原话是"工具条的读数要说清当前是哪种模式（如 `自动 78%` / `手动 90%`），不许让人看不出来"。
-   * 所以这句话有两个来源，而且**两个都不能猜**：
+   * 票 #19 时这里长这样：`zoomReading(zoom, mode, words)` —— 按外壳说的模式拼出 `自动 78%` /
+   * `手动 90%`，读不到模式就退回光秃秃的百分比。**票 #20b 把模式这一整套去掉了**：适配永远开着，
+   * 所以"谁在管这个缩放"不再是一个会变的事实，前缀因此只会是一句废话（还会跟旁边那颗动作按钮
+   * 抢同一句话，见 {@link BUTTONS} 里 `zoom-reset` 那一段）。
    *
-   *  - 数：外壳读回来的 `getZoomFactor()`（读不到就是 `—`，见 {@link zoomLabel}）；
-   *  - 词：调用方给的**文案表**（`{auto, manual}`）。这个词表**刻意不在这个文件里** ——
-   *    这个文件一行文案都不带（连按钮的 title 都是英文硬编码的既有事实，见文件头），
-   *    而"自动/手动"是要给用户看的、要跟着语言走的那两个词，所以它们与别的文案住在一起。
+   * 外壳**仍然会发布** `mode`/`zoomMode`（旧插件在读它，兼容不许破，见 `shell/main.js` 的
+   * `writeZoomFile`），但面板这一侧**一个字节都不用它**：这个函数只收一个数，多给一个参数也
+   * 不会变出前缀来（`tests/toolbar.spec.ts` 有一条断言专门钉这件事）。
    *
-   * 读不到模式时**退回一个光秃秃的百分比**，不编一个前缀：`78%` 说的是"这是 78%"，
-   * 而猜出来的 `自动 78%` 说的是"外壳在按栏宽适配它" —— 后者可能不成立，而面板上那句话
-   * 一旦不成立，用户就再也分不清"没适配"和"适配了但没动"了。
+   * 读不到那个数时仍然是 `—`，不是 `100%`：{@link zoomLabel} 的规矩没变 —— 面板上那句话
+   * 一旦不成立，用户就再也分不清"没读数"和"读到了 100%"。
    *
    * @param {unknown} zoom - 外壳读回来的缩放值。
-   * @param {unknown} mode - `auto` / `manual` / 别的什么（读不到就是别的什么）。
-   * @param {{auto?: string, manual?: string}} [words] - 那两个词。
-   * @returns {string} 要显示的那一句。
+   * @returns {string} 要显示的那一句（就是一个百分比，或 `—`）。
    */
-  function zoomReading(zoom, mode, words) {
-    var percent = zoomLabel(zoom)
-    if (percent === '\u2014') return percent
-    var table = words !== undefined && words !== null ? words : {}
-    if (mode === 'auto' && typeof table.auto === 'string') return table.auto + ' ' + percent
-    if (mode === 'manual' && typeof table.manual === 'string') return table.manual + ' ' + percent
-    return percent
+  function zoomReading(zoom) {
+    return zoomLabel(zoom)
   }
 
   /**
@@ -167,20 +167,20 @@
   }
 
   /**
-   * 那行读数整个的样子（票 #20 C 定的形状）：**模式 + 百分比**，必要时再加两样东西。
+   * 那行读数整个的样子（票 #20 C 定的形状，票 #20b 把模式前缀去掉了）：**百分比**，必要时再加两样。
    *
    *  - 页面还在加载 ⇒ 加一个"加载中"（票 #20 F 的第一条）；
    *  - 上一次动作没成 ⇒ 加那句"为什么"（{@link statusText}）。
    *
    * 三样之间用 ` · ` 连起来。URL **不在**这一行里 —— 它的位置让给了地址栏（票面 C 的原话）。
    *
-   * @param {{zoom: unknown, zoomMode: unknown, loading?: unknown, message?: string, ok?: boolean|null}} state
-   * @param {{auto?: string, manual?: string, loading?: string}} [words] - 那几个词（住在文案表里）。
+   * @param {{zoom: unknown, loading?: unknown, message?: string, ok?: boolean|null}} state
+   * @param {{loading?: string}} [words] - 要显示的那几个词（住在文案表里）。
    * @returns {string} 要显示的那一行。
    */
   function readingText(state, words) {
     var table = words !== undefined && words !== null ? words : {}
-    var parts = [zoomReading(state.zoom, state.zoomMode, table)]
+    var parts = [zoomReading(state.zoom)]
     if (state.loading === true && typeof table.loading === 'string' && table.loading !== '') parts.push(table.loading)
     var note = statusText(state)
     if (note !== '') parts.push(note)
