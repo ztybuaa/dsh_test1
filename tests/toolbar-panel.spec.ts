@@ -79,6 +79,8 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
         url: 'http://fixture.test/view',
         title: 'Fixture page',
         zoom: 1,
+        // 票 #20b：这个字段**故意照旧喂进去**。外壳仍然会发它（旧插件在读它，票面明令兼容不许破），
+        // 而面板这一侧一个字节都不许用它 —— "读数是 `100%` 而不是 `自动 100%`"这件事由此可反证。
         zoomMode: 'auto',
         ok: true,
         ...options.rpcValue,
@@ -95,8 +97,46 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
       const reading = document.querySelector('[data-dsh-view-reading]')
       const zoom = document.querySelector('[data-dsh-view-zoom]')
       const toolbar = document.querySelector('[data-dsh-view-toolbar]') as HTMLElement | null
+      const measured = document.querySelector('[data-dsh-desktop-view-panel]') as HTMLElement | null
       const back = document.querySelector('[data-dsh-view-action="back"]') as HTMLElement | null
       const forward = document.querySelector('[data-dsh-view-action="forward"]') as HTMLElement | null
+      /**
+       * 工具条里**每一个叶子节点**的文字（票 #20b 要求 3 的那把尺子）。
+       *
+       * 为什么是叶子：用户自己量那一遍用的就是这个办法（他贴出来的证据就是两行叶子：
+       * `BUTTON[data-dsh-view-zoom-menu]` 与 `SPAN[data-dsh-view-reading]`，都写着同一句话）。
+       * 数整棵树的 `textContent` 会把每一层祖先都数一遍，那样"出现几次"就没有意义了。
+       */
+      const leaves: Array<{ tag: string; text: string; action: string | null }> = []
+      const mainLeaves: Array<{ tag: string; text: string; action: string | null }> = []
+      /**
+       * 收一遍叶子节点的文字。
+       *
+       * @param skipPresets - 展开的档位那一排**不算第一行**：它是一串"可以选哪个"的选项，其中一个
+       *   选项的名字本来就叫 `100%`（真浏览器的缩放菜单也这么列）。用户量的是"**第一行**里那句话
+       *   出现了几次"，所以两个名单分开收：`leaves` 是整条工具条，`mainLeaves` 是那排选项之外的第一行。
+       */
+      const collect = (skipPresets: boolean): Array<{ tag: string; text: string; action: string | null }> => {
+        const found: Array<{ tag: string; text: string; action: string | null }> = []
+        const walk = (node: Element): void => {
+          if (skipPresets && node.hasAttribute('data-dsh-view-zoom-presets')) return
+          if (node.children.length === 0) {
+            found.push({
+              tag: node.tagName,
+              text: (node.textContent ?? '').trim(),
+              action: node.getAttribute('data-dsh-view-action'),
+            })
+            return
+          }
+          for (const child of Array.from(node.children)) walk(child)
+        }
+        if (toolbar !== null) walk(toolbar)
+        return found
+      }
+      if (toolbar !== null) {
+        leaves.push(...collect(false))
+        mainLeaves.push(...collect(true))
+      }
       return {
         address:
           address === null ? null : { value: address.value, title: address.title, placeholder: address.placeholder },
@@ -105,9 +145,39 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
         diagnostic: reading?.getAttribute('data-dsh-view-diagnostic') ?? null,
         zoomAttribute: zoom?.getAttribute('data-dsh-view-zoom') ?? null,
         toolbarHeight: toolbar === null ? null : Math.round(toolbar.getBoundingClientRect().height),
+        /** 工具条那一行的下边缘：被测量的那一块的**上边缘**必须紧贴着它。 */
+        toolbarBottom: toolbar === null ? null : Math.round(toolbar.getBoundingClientRect().bottom),
+        /** 面板矩形（外壳把原生画面摆在这一块上）的上边缘 —— 几何读回里最要紧的那个数。 */
+        measuredTop: measured === null ? null : Math.round(measured.getBoundingClientRect().top),
         declaredHeight: toolbar === null ? null : toolbar.style.height,
+        toolbarText: (toolbar?.textContent ?? '').trim(),
+        leafTexts: leaves.map((leaf) => leaf.text),
+        /** 第一行（不含展开的那排档位选项）的叶子文字 —— 票 #20b 要求 3 数的就是这一份。 */
+        mainLeafTexts: mainLeaves.map((leaf) => leaf.text),
+        leafTags: leaves.map((leaf) => `${leaf.tag}${leaf.action === null ? '' : `[${leaf.action}]`}=${leaf.text}`),
+        autoButtons: document.querySelectorAll('[data-dsh-view-action="auto"]').length,
+        readingElements: document.querySelectorAll('[data-dsh-view-reading]').length,
+        menuElements: document.querySelectorAll('[data-dsh-view-zoom-menu]').length,
         backTitle: back?.getAttribute('title') ?? null,
         forwardTitle: forward?.getAttribute('title') ?? null,
+      }
+    })
+
+  /**
+   * 只读**几何**：工具条高度、它的下边缘、被测量的那一块的上边缘（票 #20b 要求 2 的读回口）。
+   *
+   * 刻意不读 `data-dsh-view-zoom-menu` 那个属性：票面明写"断言要读回几何，不是读自己的状态变量"
+   * —— 一个"菜单以为自己关了但其实还占着一行"的实现必须在这三个数上露馅。
+   */
+  const geometry = async (): Promise<{ height: number; bottom: number; measuredTop: number; presets: number }> =>
+    await page.evaluate(() => {
+      const toolbar = document.querySelector('[data-dsh-view-toolbar]') as HTMLElement | null
+      const measured = document.querySelector('[data-dsh-desktop-view-panel]') as HTMLElement | null
+      return {
+        height: toolbar === null ? -1 : Math.round(toolbar.getBoundingClientRect().height),
+        bottom: toolbar === null ? -1 : Math.round(toolbar.getBoundingClientRect().bottom),
+        measuredTop: measured === null ? -1 : Math.round(measured.getBoundingClientRect().top),
+        presets: document.querySelectorAll('[data-dsh-view-zoom-preset]').length,
       }
     })
 
@@ -178,12 +248,14 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
     expect(after.address?.value).toBe('http://fixture.test/two')
   }, 120_000)
 
-  it('C · 用户看得见的那行只有模式 + 百分比；诊断话术还在，只是换了通道', async () => {
+  it('C · 用户看得见的那行只有百分比（票 #20b 之后连模式前缀都没有了）；诊断话术还在，只是换了通道', async () => {
     await mount({
       rpcValue: {
         url: 'https://flights.ctrip.com/online/list/oneway',
         title: '航班',
         zoom: 1,
+        // **照旧喂一个 `mode` 进去**：外壳仍在发它（旧插件读它，兼容不许破），而面板不许拿它
+        // 做任何事 —— 这一条与 `tests/toolbar.spec.ts` 的纯逻辑那半边是同一句话的两处读回。
         zoomMode: 'manual',
         message: 'nothing was changed',
         ok: true,
@@ -195,8 +267,10 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
         JSON.stringify({ reading: seen.reading, diagnostic: seen.diagnostic, zoom: seen.zoomAttribute }),
     )
     // 票面点名的两句都不许出现在用户可见文本里：
-    expect(String(seen.reading)).toBe('手动 100%')
+    expect(String(seen.reading)).toBe('100%')
     expect(seen.readingText).not.toContain('nothing was changed')
+    // 票 #20b：那句读数里**没有** `手动` / `自动` 前缀（用户要的那一条），
+    expect(String(seen.reading)).not.toMatch(/自动|手动/)
     // URL 那半条也缩掉了（它的位置让给了地址栏）。
     expect(seen.readingText).not.toContain('ctrip')
     // 而诊断**没有被删**：它在这两个通道里读得回来。
@@ -206,12 +280,13 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
     expect(seen.address?.value).toBe('https://flights.ctrip.com/online/list/oneway')
   }, 120_000)
 
-  it('D · 点百分比给出标准档位；选一个 ⇒ 发出去的是带 zoom 的 zoom-to；菜单长高一行', async () => {
+  it('D · 点百分比给出标准档位；选一个 ⇒ 发出去的是带 zoom 的 zoom-to；菜单**自己收**（几何读回）', async () => {
     await mount()
     const closed = await surface()
-    console.log('RAW 票 #20 D 菜单关着: ' + JSON.stringify({ height: closed.toolbarHeight, declared: closed.declaredHeight }))
+    const idle = await geometry()
+    console.log('RAW 票 #20 D 菜单关着: ' + JSON.stringify({ height: closed.toolbarHeight, declared: closed.declaredHeight, idle }))
 
-    const opened = await clickIn(page, '[data-dsh-view-zoom-menu]')
+    await clickIn(page, '[data-dsh-view-zoom-menu]')
     const presets = await attributesOf(page, '[data-dsh-view-zoom-preset]', 'data-dsh-view-zoom-preset')
     const currents = await attributesOf(page, '[data-dsh-view-zoom-preset]', 'data-dsh-view-zoom-current')
     console.log(
@@ -227,24 +302,131 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
     // 现在的缩放是 100% ⇒ 正好有一档被标成"你在这儿"。
     expect(currents.filter((value) => value === 'yes')).toHaveLength(1)
     expect(currents[presets.indexOf('100')]).toBe('yes')
-    expect(opened.calls).toContain('desktop-view-state')
 
-    // 菜单展开时工具条长高一行 —— 于是被测量的那一块自动变矮，**原生画面不会盖住菜单**
-    // （浮层一定会被它盖住，因为画面是另一块 OS 级的视图）。菜单关着时高度就是那个常量。
+    // 菜单展开时工具条长高一行，而且**被测量的那一块跟着往下走** —— 于是原生画面不会盖住菜单
+    // （浮层一定会被它盖住，因为画面是另一块 OS 级的视图）。两个数都是几何，不是状态变量。
     const open = await surface()
+    const opened = await geometry()
     console.log(
       'RAW 票 #20 D 展开之后: ' +
-        JSON.stringify({ closed: closed.toolbarHeight, open: open.toolbarHeight, declared: open.declaredHeight }),
+        JSON.stringify({ closed: closed.toolbarHeight, open: open.toolbarHeight, opened, declared: open.declaredHeight }),
     )
-    expect(closed.toolbarHeight).toBe(34)
-    expect(Number(open.toolbarHeight)).toBeGreaterThan(34)
+    expect(idle.height).toBe(34)
+    expect(idle.measuredTop, '空闲时被测量的那一块紧接工具条下面（正好是那一行 34px）').toBe(34)
+    expect(open.toolbarHeight).toBeGreaterThan(34)
     expect(open.declaredHeight).toBe('auto')
+    expect(opened.measuredTop, '展开的那一行把面板矩形整个推下去').toBe(opened.bottom)
+    expect(opened.measuredTop).toBeGreaterThan(34)
 
     const picked = await clickIn(page, '[data-dsh-view-zoom-preset="125"]')
     const zoomTo = picked.payloads.filter((entry) => entry.endpoint === 'desktop-view-zoom-to')
-    console.log('RAW 票 #20 D 选了 125%: ' + JSON.stringify(zoomTo))
+    const afterPick = await geometry()
+    console.log('RAW 票 #20 D 选了 125% 之后: ' + JSON.stringify({ zoomTo, afterPick }))
     expect(zoomTo.length, '选一个档位必须发出一条 zoom-to').toBe(1)
     expect(zoomTo[0].payload.zoom).toBeCloseTo(1.25, 10)
+    // **选中一个档位就收**（票 #20b 要求 2 的第一条收法）：读回来的是几何 —— 工具条回到一行，
+    // 面板矩形的上边缘回到 34。
+    expect(afterPick.height, '选完档位之后工具条必须回到一行').toBe(34)
+    expect(afterPick.measuredTop, '选完档位之后面板矩形必须回到那一行下面').toBe(34)
+    expect(afterPick.presets, '档位那一排必须真的从页面上消失').toBe(0)
+  }, 120_000)
+
+  it('票 #20b 要求 2：空闲**严格一行**，而展开之后点工具条以外 / 按 Esc 都得自己收（读几何）', async () => {
+    // 真机上量到的现象（用户那台机器）：工具条高 **61px = 34 + 26**，第二行就是档位。
+    // 代码里 `menuOpen` 的初值是 `false`，所以问题不在"默认展开"，而在**展开之后不收**：
+    // 点别处不收、Esc 也不收，于是那一行常驻 —— 用户的抱怨"不用去把上面的聊天栏弄乱了"。
+    await mount()
+    const idle = await geometry()
+    console.log('RAW 票 #20b 空闲: ' + JSON.stringify(idle))
+    expect(idle.height, '空闲时工具条严格一行').toBe(34)
+    expect(idle.measuredTop).toBe(34)
+    expect(idle.presets).toBe(0)
+
+    // ── 收法一：点到**工具条以外**（真鼠标事件，落在面板那一块上面） ──
+    await clickIn(page, '[data-dsh-view-zoom-menu]')
+    const opened = await geometry()
+    expect(opened.height).toBeGreaterThan(34)
+    expect(opened.measuredTop, '展开的那一行真的把面板矩形推下去了（否则下面那条断言没有意义）').toBeGreaterThan(34)
+    await page.mouse.click(220, 300)
+    await new Promise((settle) => setTimeout(settle, 300))
+    const afterOutside = await geometry()
+    console.log('RAW 票 #20b 点工具条以外之后: ' + JSON.stringify(afterOutside))
+    expect(afterOutside.height, '点到工具条以外必须自己收（几何）').toBe(34)
+    expect(afterOutside.measuredTop, '面板矩形回到那一行下面').toBe(34)
+    expect(afterOutside.presets).toBe(0)
+
+    // ── 收法二：`Esc` ──
+    await clickIn(page, '[data-dsh-view-zoom-menu]')
+    expect((await geometry()).height).toBeGreaterThan(34)
+    await page.keyboard.press('Escape')
+    await new Promise((settle) => setTimeout(settle, 300))
+    const afterEscape = await geometry()
+    console.log('RAW 票 #20b 按 Esc 之后: ' + JSON.stringify(afterEscape))
+    expect(afterEscape.height, '按 Esc 必须自己收（几何）').toBe(34)
+    expect(afterEscape.measuredTop).toBe(34)
+    expect(afterEscape.presets).toBe(0)
+
+    // ── 收法三：**再点一次那颗按钮**（它自己就是开关；这一条是前两条的对照，证明"展开"这件事
+    //     没被前面两次收法弄坏） ──
+    await clickIn(page, '[data-dsh-view-zoom-menu]')
+    expect((await geometry()).height).toBeGreaterThan(34)
+    await clickIn(page, '[data-dsh-view-zoom-menu]')
+    const afterToggle = await geometry()
+    console.log('RAW 票 #20b 再点一次那颗按钮: ' + JSON.stringify(afterToggle))
+    expect(afterToggle.height).toBe(34)
+    expect(afterToggle.measuredTop).toBe(34)
+
+    // ── 而**点在工具条里面**（那排档位自己）不算"点别处"：菜单不许因为按了别处就抖掉。
+    //    这一条量的是"判据是**落点**，不是'有没有发生过点击'"。 ──
+    await clickIn(page, '[data-dsh-view-zoom-menu]')
+    await clickIn(page, '[data-dsh-view-zoom-preset="150"]')
+    const afterInside = await geometry()
+    console.log('RAW 票 #20b 在工具条里面选了一档: ' + JSON.stringify(afterInside))
+    expect(afterInside.height).toBe(34)
+  }, 120_000)
+
+  it('票 #20b 要求 3：那句话在工具条**第一行**里只出现一次，而且数的就是文本出现次数', async () => {
+    await mount()
+    const idle = await surface()
+    const sentence = String(idle.reading)
+    // 用户自己贴出来的那份证据（票面最后一条评论）：同一句话出现在**两个**叶子上 ——
+    // `BUTTON[data-dsh-view-zoom-menu]` 与 `SPAN[data-dsh-view-zoom][data-dsh-view-reading]`。
+    // 现在它只许出现在一个叶子上 —— 这里数的是**叶子的文字**，不是任何状态变量。
+    const occurrences = idle.mainLeafTexts.filter((text) => text === sentence)
+    console.log(
+      'RAW 票 #20b 那句话在第一行出现了几次: ' +
+        JSON.stringify({
+          sentence,
+          occurrences: occurrences.length,
+          leaves: idle.leafTags,
+          toolbarText: idle.toolbarText,
+        }),
+    )
+    expect(sentence, '量具自检：读数必须是一句真话（一个百分比），否则"数 0 次"也会绿').toBe('100%')
+    expect(occurrences.length, '那句话在工具条里只许出现一次').toBe(1)
+    // 一个元素上同时挂着"读数"与"菜单开关"这两个身份（票面要的是"只出现一次"，不是"再多一颗 ▾"）。
+    expect(idle.readingElements, '带 data-dsh-view-reading 的元素只有一个').toBe(1)
+    expect(idle.menuElements, '带 data-dsh-view-zoom-menu 的元素只有一个').toBe(1)
+
+    // 整条工具条上**一个模式词都没有**，也没有那颗 `auto` 按钮（票 #20b 要求 1 的 DOM 读回）。
+    expect(idle.toolbarText).not.toMatch(/自动|手动|auto/)
+    expect(idle.autoButtons).toBe(0)
+    // 而工具条第一行上除那句话本身之外，**没有第二个叶子的文字是一个百分比** —— 那一颗标签为
+    // `100%` 的重置按钮正是这样第二处（它现在叫 `reset`，动作一个字没少）。
+    const percentages = idle.mainLeafTexts.filter((text) => /^\d+(\.\d+)?%$/.test(text))
+    console.log('RAW 票 #20b 第一行里像百分比的叶子: ' + JSON.stringify(percentages))
+    expect(percentages).toEqual([sentence])
+
+    // 展开档位菜单之后，**第一行**里那句读数还是只有一个。（菜单那一排是"可以选哪个"的选项，
+    // 其中一个选项的名字本来就叫 `100%` —— 真浏览器的缩放菜单也这么列；用户量的也是"第一行"。）
+    await clickIn(page, '[data-dsh-view-zoom-menu]')
+    const opened = await surface()
+    const openedMain = opened.mainLeafTexts.filter((text) => text === sentence)
+    console.log(
+      'RAW 票 #20b 展开之后: ' +
+        JSON.stringify({ firstRow: openedMain, wholeToolbar: opened.leafTexts.filter((text) => text === sentence) }),
+    )
+    expect(openedMain.length, '展开菜单不许让第一行多出第二句读数').toBe(1)
   }, 120_000)
 
   it('D · 档位之外的值页面上一个都没有（这条通道上没有"缩放到任意值"）', async () => {
@@ -356,27 +538,31 @@ describe('票 #20 · 那一格上的界面：地址栏 / 读数 / 档位 / 标�
         document.querySelector(`[data-dsh-view-action="${action}"]`)
       return {
         reading: document.querySelector('[data-dsh-view-reading]')?.getAttribute('data-dsh-view-reading') ?? null,
-        locked: ['back', 'forward', 'reload', 'zoom-in', 'zoom-out', 'zoom-reset', 'auto', 'restart'].map(
+        // 票 #20b：`auto` 不在这个表里了（那颗按钮已经删掉）—— 这一条同时钉住"它真的不在页面上"。
+        locked: ['back', 'forward', 'reload', 'zoom-in', 'zoom-out', 'zoom-reset', 'restart'].map(
           (action) => button(action)?.disabled ?? null,
         ),
+        autoButton: button('auto') === null ? 'absent' : 'present',
       }
     })
     console.log('RAW 票 #20 导航途中的那一格: ' + JSON.stringify(during))
     // 页面自己说它在加载（宿主那次读回里的 `loading`）⇒ 读数上写着"加载中"。
     expect(String(during.reading)).toContain('加载中')
     // 而按钮**一个都不许亮** —— 动作还在飞。
-    expect(during.locked).toEqual([true, true, true, true, true, true, true, true])
+    expect(during.locked).toEqual([true, true, true, true, true, true, true])
+    // 那颗 `auto` 按钮确实不在页面上（票 #20b：没有模式可以交还）。
+    expect(during.autoButton).toBe('absent')
 
     // 答完之后锁解开（否则导航一次之后这一格就废了），而两颗历史按钮回到**宿主说的**那样：
     // 后退亮着（它答 `canGoBack: true`）、前进灰着（它答 `canGoForward: false`）。
     await new Promise((settle) => setTimeout(settle, 900))
     const after = await page.evaluate(() =>
-      ['back', 'forward', 'reload', 'zoom-in', 'zoom-out', 'zoom-reset', 'auto', 'restart'].map(
+      ['back', 'forward', 'reload', 'zoom-in', 'zoom-out', 'zoom-reset', 'restart'].map(
         (action) => (document.querySelector(`[data-dsh-view-action="${action}"]`) as HTMLButtonElement | null)?.disabled ?? null,
       ),
     )
     console.log('RAW 票 #20 答完之后: ' + JSON.stringify(after))
-    expect(after).toEqual([false, true, false, false, false, false, false, false])
+    expect(after).toEqual([false, true, false, false, false, false, false])
   }, 120_000)
 
   it('工具条整体：地址栏与档位菜单都在**面板**里', async () => {

@@ -17,7 +17,6 @@ import type {
 } from './session.ts'
 import { cutText } from './session.ts'
 import type { SpaceAction, SpaceCommandOutcome } from './spaces.ts'
-import type { ZoomMode } from './navigation.ts'
 
 /** Canonical output of `browser_navigate`: where the view ended up. */
 const navigationSchema = {
@@ -687,26 +686,15 @@ async function viewState(session: AdoptedViewSession, action: string, message: s
     ok: true,
     url: state.url,
     title: state.title,
-    message: `${message} — ${state.url} at ${Math.round(zoom * 100)}%${zoomModeWords(state.zoomMode)}`,
+    // 票 #20b：这里原来还接一句"(fitted to the pane automatically)" / "(set by hand)"（票 #19 的
+    // `zoomModeWords`）。**那一句删掉了**，因为适配永远开着，"谁在管这个缩放"不再是一个会变的事实
+    // —— 而更要紧的是它会**说谎**：一个人刚按下 150% 之后，那句话仍会说"按栏宽自动适配的"。
+    // 留下的是一个光秃秃的百分比，那也正是面板上读数今天的样子（两处说的是同一件事）。
+    message: `${message} — ${state.url} at ${Math.round(zoom * 100)}%`,
     zoom,
     canGoBack: state.history.back > 0,
     canGoForward: state.history.forward > 0,
   }
-}
-
-/**
- * 把"谁在管这个缩放"接在百分比后面（票 #19）。
- *
- * 读不到模式时是空串，不是猜一个：一个没有前缀的 `78%` 说的是"这是 78%"，而一个猜出来的
- * `78% (automatic)` 说的是"外壳在按栏宽适配它" —— 后者是一句可能不成立的话。
- *
- * @param mode - 外壳说的模式，或 undefined。
- * @returns 要接在百分比后面的那半句（含前导空格），或空串。
- */
-function zoomModeWords(mode: ZoomMode | undefined): string {
-  if (mode === 'auto') return ' (fitted to the pane automatically)'
-  if (mode === 'manual') return ' (set by hand)'
-  return ''
 }
 
 /**

@@ -97,19 +97,19 @@ async function runAction(session: AdoptedViewSession, action: ViewAction, reques
       const landed = await session.goto(url)
       return await readBack(true, `navigated to ${landed.url}`)
     }
-    // 票 #19：「自动」——把这一格交回按栏宽自动适配。它没有目标值可给（那个值由外壳按
-    // 页面自己的溢出算），所以结果只能**读回来**：`useAutoZoom` 返回的是外壳在适配跑完之后
-    // 读回的那个数。
+    // 票 #19 的「自动」：**现在就重新适配一次**（票 #20b 之后适配永远开着，这个动作不再切换任何
+    // 状态，它是"别等下一次几何变化"）。它没有目标值可给（那个值由外壳按页面自己的溢出算），
+    // 所以结果只能**读回来**：`useAutoZoom` 返回的是外壳在适配跑完之后读回的那个数。
     if (action === 'auto') {
       const result = await session.useAutoZoom()
       return await readBack(
         true,
-        `handed this pane back to automatic fitting: the zoom is now ${Math.round(result.zoom * 100)}% ` +
+        `fitted this pane to the pane again: the zoom is now ${Math.round(result.zoom * 100)}% ` +
           `(layout viewport ${result.innerWidth}x${result.innerHeight} CSS px)`,
       )
     }
-    // 票 #20 D：档位菜单选了一个档位。与 `−`/`+` 走的是**同一个** `zoomTo(…, 'manual')`，
-    // 所以"指名了一个值 ⇒ 归手动管"这条语义两处一致（票 #19）。
+    // 票 #20 D：档位菜单选了一个档位。与 `−`/`+` 走的是**同一个** `zoomTo(…)`，所以"选了一个档位"
+    // 与"按了一次 +"是同一件事（票 #19 时它还意味着"归手动管"，票 #20b 起没有那个模式了）。
     if (action === 'zoom-to') {
       const before = session.zoomLevel()
       const wanted = parseZoomPreset(request.zoom)

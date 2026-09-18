@@ -67,10 +67,9 @@ var COPY = {
       '普通浏览器标签页里它没有东西可显示。',
     ready: '桌面外壳已就位：这一格交给原生浏览器视图。',
     missing: '这一格没有量到矩形（可能被折叠或切走了）。',
-    // 票 #19：缩放读数上那两个词。面板必须让人**看得出来**现在是谁在管这个缩放，
-    // 否则"自动适配没动"与"自动适配不在管"在界面上长得一模一样。
-    zoomAuto: '自动',
-    zoomManual: '手动',
+    // 票 #20b：票 #19 加在这里的 `zoomAuto` / `zoomManual` 两个词**被删掉了**。
+    // 读数上不再有模式前缀（适配永远开着，那个前缀只会是一句废话），所以那两个词没有任何使用者；
+    // 留在文案表里只会让下一个人以为"面板还会说出它们"。
     // 票 #20 A：地址栏。
     //
     // `addressHelp` 是那条**补协议**的规则本身，写在输入框的 title 上：规则要说得出口，
@@ -98,8 +97,7 @@ var COPY = {
       'browser tab has nothing to put here.',
     ready: 'The desktop shell is here: the native browser view takes this pane.',
     missing: 'This pane reports no rectangle (collapsed or switched away).',
-    zoomAuto: 'auto',
-    zoomManual: 'manual',
+    // 票 #20b：票 #19 的 `auto` / `manual` 两个词随模式一起删掉（见上面 zh 那一段的说明）。
     addressPlaceholder: 'Type an address, press Enter',
     addressHelp: 'A bare host gets https:// (example.com → https://example.com); a loopback host gets http:// (localhost:3000); http://, https://, file:// and about: are used as typed.',
     addressSend: 'open',
@@ -360,7 +358,6 @@ function Toolbar(props) {
     ok: null,
     url: '',
     zoom: undefined,
-    zoomMode: undefined,
     loading: undefined,
     canGoBack: false,
     canGoForward: false,
@@ -382,10 +379,18 @@ function Toolbar(props) {
   var [address, setAddress] = react.useState('')
   /** 上一次提交被拒的那句话。空串 = 没有出错。 */
   var [addressError, setAddressError] = react.useState('')
-  /** 档位菜单开着没有（票 #20 D）。 */
+  /** 档位菜单开着没有（票 #20 D）。它**必须自己会收**（票 #20b 的要求 2，见下面那个 effect）。 */
   var [menuOpen, setMenuOpen] = react.useState(false)
   /** 光标在地址栏里吗（决定读回要不要覆盖框里的字）。 */
   var editing = react.useRef(false)
+  /**
+   * 工具条那一行本身（票 #20b 的要求 2）。
+   *
+   * 它只有一个用途：回答"这一下按在工具条**里面**还是**外面**"。菜单展开之后必须有办法自己收
+   * 回去，而"点到别处"要判的就是这件事 —— 没有这个引用就只能靠"再点一次那颗按钮"，那正是
+   * 用户遇到的那个"卡在展开状态"。
+   */
+  var toolbarRef = react.useRef(null)
 
   /**
    * 把一次回答落到面板上 —— **所有**读回都从这里进。
@@ -417,7 +422,6 @@ function Toolbar(props) {
         // 一次失败的调用**没有读回任何东西**："读不到"不等于"地址是空的、缩放是未知的"。
         merged.url = previous.url
         merged.zoom = previous.zoom
-        merged.zoomMode = previous.zoomMode
         merged.loading = previous.loading
         merged.backTarget = previous.backTarget
         merged.forwardTarget = previous.forwardTarget
@@ -572,6 +576,54 @@ function Toolbar(props) {
     }
   }, [])
 
+  /**
+   * 档位菜单**展开之后自己会收**（票 #20b 的要求 2）。
+   *
+   * ## 为什么这一条是必须的，而不是"顺手加一下"
+   *
+   * 真机上量到过：用户那一格工具条高 **61px = 34 + 26**，第二行就是那排档位 —— 代码里
+   * `menuOpen` 的初值是 `false`，所以问题不在"默认展开"，而在**展开之后不收**：点别处不收、
+   * `Esc` 不收，菜单于是一直挂在那里，工具条永远是两行。用户的抱怨原文是"不用去把上面的聊天栏
+   * 弄乱了"，而"弄乱"的机制正是这多出来的一行 —— 它把被测量的那一块往下推，原生画面跟着让位。
+   *
+   * ## 三条收法，各自走一条**道理上不同**的路
+   *
+   *  - **选了一个档位**：那颗档位按钮自己的 `onClick` 就收了（它紧接着要发一条 zoom-to）；
+   *  - **点到工具条以外**：`pointerdown`（捕获阶段）。用捕获而不是冒泡，是因为"点别处"这件事
+   *    不该取决于那一页上有没有人 `stopPropagation`；判据是"落点不在 {@link toolbarRef} 里"。
+   *    **量出来的一个边界**：原生画面是另一块 `WebContentsView`，点在它上面的那一下**到不了**
+   *    这个页面（见报告里的诚实清单）—— 所以这里收的是"点 DSH 界面别处"，不是"点网页里"。
+   *  - **`Esc`**：与真浏览器的菜单同一条习惯。它同时 `preventDefault` + `stopPropagation`：
+   *    一次按键只该有一个效果，而菜单开着的时候，用户的意思显然是"把菜单收掉"。
+   *
+   * 两个听众**只在开着的时候挂着**（`[menuOpen]` 的依赖就是这件事），关着的时候页面上一个多余
+   * 的监听器都没有 —— 这个面板住在 DSH 的窗口里，它不该替整窗口的每一次点击接手。
+   */
+  react.useEffect(
+    function () {
+      if (menuOpen !== true) return undefined
+      function onPointerDown(event) {
+        var root = toolbarRef.current
+        var target = event.target
+        if (root !== null && root !== undefined && target !== null && target !== undefined && root.contains(target)) return
+        setMenuOpen(false)
+      }
+      function onKeyDown(event) {
+        if (event.key !== 'Escape') return
+        event.preventDefault()
+        event.stopPropagation()
+        setMenuOpen(false)
+      }
+      document.addEventListener('pointerdown', onPointerDown, true)
+      document.addEventListener('keydown', onKeyDown, true)
+      return function () {
+        document.removeEventListener('pointerdown', onPointerDown, true)
+        document.removeEventListener('keydown', onKeyDown, true)
+      }
+    },
+    [menuOpen],
+  )
+
   var words = copy()
   var children = []
   for (var index = 0; index < toolbar.BUTTONS.length; index++) {
@@ -676,19 +728,19 @@ function Toolbar(props) {
     },
   })
 
-  // 票 #19 + #20 C：读数只留用户要的信息（模式 + 百分比），必要时加"加载中"（F）与
+  // 票 #19 + #20 C + #20b：读数只留用户要的那一个数（**百分比**），必要时加"加载中"（F）与
   // "为什么这一按没成"。宿主那些诊断话术一个字都没删 —— 它们在同一次渲染的
   // `data-dsh-view-diagnostic` 与 tooltip 上（另一个通道，仍然读得到）。
+  //
+  // 票 #20b 删掉了这里的两个词（`auto` / `manual`）：适配永远开着，"谁在管这个缩放"不再是一个
+  // 会变的事实，前缀只会是一句废话。外壳**仍然在发布** `zoomMode`（旧插件在读它），
+  // 但面板这一侧连读都不读它了 —— 它甚至不进 `state`（见上面那份初值）。
   var readingState = Object.assign({}, state, { message: addressError !== '' ? addressError : state.message })
   if (addressError !== '') readingState.ok = false
-  var reading = toolbar.readingText(readingState, {
-    auto: words.zoomAuto,
-    manual: words.zoomManual,
-    loading: words.loading,
-  })
+  var reading = toolbar.readingText(readingState, { loading: words.loading })
   var diagnostic = toolbar.diagnosticText(readingState)
 
-  // 票 #20 D：那颗百分比现在是一颗**菜单按钮**。菜单展开时工具条长高一行（于是被测量的那一块
+  // 票 #20 D：那颗百分比是一颗**菜单按钮**。菜单展开时工具条长高一行（于是被测量的那一块
   // 自动变矮，外壳跟着把原生画面摆到新的矩形上）—— 不用浮层，因为浮层会被原生画面盖住。
   var currentPreset = toolbar.currentPreset(state.zoom)
   var presetItems = []
@@ -727,13 +779,41 @@ function Toolbar(props) {
     )
   }
 
+  /**
+   * 那行读数：**一个**控件，既是读数也是档位菜单的开关（票 #20b 的要求 3）。
+   *
+   * 票 #20 D 的代码在这里渲染了**两遍**同一句话：一颗 `<button data-dsh-view-zoom-menu>` 与一个
+   * `<span data-dsh-view-zoom data-dsh-view-reading>`，两个的孩子都是 `reading`。真机上量到的
+   * 就是它（用户附的证据，本轮又原样量了一遍）：
+   *
+   * ```
+   * BUTTON[data-dsh-view-zoom-menu=closed]                         → "自动 100%"
+   * SPAN  [data-dsh-view-zoom][data-dsh-view-reading][…diagnostic] → "自动 100%"
+   * ```
+   *
+   * 用户的原话是"同一个信息渲染了两遍……一个带框、旁边又一个"，而票面把这一条定成了验收：
+   * 那句话**只许出现一次**，并且要能**数**出来（必须是 1）。
+   *
+   * 所以这两个元素**合成一个 `<button>`**：它显示那句话，点它就是展开/收起档位（真浏览器也是
+   * 点百分比选档位），而诊断话术仍旧只挂在它的 `title` 与 `data-dsh-view-diagnostic` 上
+   * （票 #20 C 那条规矩一个字没改）。合成而不是"再放一颗 ▾ 按钮"，是因为代码里那段注释本来
+   * 写的就是这个意思 —— *"菜单关着时它既是读数也是菜单按钮"* —— 而实现多画了一个元素。
+   *
+   * `aria-label` 上是"点它能做什么"（文案表里那个词）。它**不是** `title`：`title` 的位置
+   * 让给诊断了，而一个只有一句话的按钮不该因为"那句话是诊断"就没有名字。
+   */
   var zoomControl = react.createElement(
     'button',
     {
       key: 'zoom-menu',
       type: 'button',
       'data-dsh-view-zoom-menu': menuOpen ? 'open' : 'closed',
-      title: words.zoomMenuTitle,
+      // `zoomLabel` 自己就把"读不到"渲染成 `—`（票 #19 的规矩），所以这里不再判一次。
+      'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
+      'data-dsh-view-reading': reading,
+      'data-dsh-view-diagnostic': diagnostic,
+      'aria-label': words.zoomMenuTitle,
+      title: diagnostic,
       disabled: props.hasShell !== true,
       onClick: function () {
         setMenuOpen(function (open) {
@@ -741,44 +821,25 @@ function Toolbar(props) {
         })
       },
       style: {
-        font: '11px/1 system-ui',
+        font: '11px/1.3 system-ui',
         height: '22px',
         padding: '0 6px',
         border: '1px solid var(--dsh-color-border, #d0d7de)',
         borderRadius: '4px',
         background: 'var(--dsh-color-surface, #fff)',
-        color: 'inherit',
-        cursor: 'pointer',
-        whiteSpace: 'nowrap',
-        flex: '0 0 auto',
-      },
-    },
-    reading,
-  )
-
-  // 那一行读数：菜单关着时它既是读数也是菜单按钮（真浏览器也是点百分比选档位）。
-  var readingSpan = react.createElement(
-    'span',
-    {
-      // `zoomLabel` 自己就把"读不到"渲染成 `—`（票 #19 的规矩），所以这里不再判一次。
-      'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
-      'data-dsh-view-reading': reading,
-      'data-dsh-view-diagnostic': diagnostic,
-      style: {
-        font: '11px/1.3 system-ui',
         whiteSpace: 'nowrap',
         overflow: 'hidden',
         textOverflow: 'ellipsis',
         flex: '0 1 auto',
+        cursor: 'pointer',
         opacity: state.ok === false || addressError !== '' ? 1 : 0.75,
         color: state.ok === false || addressError !== '' ? 'var(--dsh-color-danger, #b42318)' : 'inherit',
       },
-      title: diagnostic,
     },
     reading,
   )
 
-  // 行一：导航按钮 + 地址栏。行二（只在菜单展开时存在）：那一排标准档位。
+  // 行一：导航按钮 + 地址栏 + 那颗读数/菜单按钮。行二（只在菜单展开时存在）：那一排标准档位。
   var row = react.createElement(
     'div',
     {
@@ -794,7 +855,6 @@ function Toolbar(props) {
     children,
     addressField,
     zoomControl,
-    readingSpan,
   )
 
   var rows = [row]
@@ -823,9 +883,17 @@ function Toolbar(props) {
     'div',
     {
       'data-dsh-view-toolbar': 'ready',
+      // 票 #20b 的要求 2 靠这一个引用判"点在工具条里面还是外面"（见上面那个 effect）。
+      ref: toolbarRef,
       style: {
         // 菜单展开时长高一行（`height: auto` 让内容决定），于是被测量的那一块自动变矮 ——
         // 原生画面跟着让出那一行，菜单因此**不会**被它盖住（浮层一定会）。
+        //
+        // 票 #20b 的要求 2：**空闲时严格一行**。这一句本来就是对的（关着就是那个常量），
+        // 出问题的是"关不上" —— 展开之后点别处/按 Esc 都不收，于是一行变成常驻的两行。
+        // 那三条收法在 `menuOpen` 那个 effect 里；`tests/toolbar-panel.spec.ts` 与
+        // `tests/panel-toolbar-placement.spec.ts` 都**读回几何**（工具条高度、面板矩形上边缘）
+        // 来钉它，不读 `menuOpen` 这个状态变量本身。
         height: menuOpen ? 'auto' : toolbar.TOOLBAR_HEIGHT_PX + 'px',
         minHeight: toolbar.TOOLBAR_HEIGHT_PX + 'px',
         display: 'flex',

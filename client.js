@@ -402,15 +402,22 @@ window.__ModuleLoader__.load({
 		    { action: 'forward', label: '\u2192', title: 'forward', shortcut: 'ArrowRight' },
 		    { action: 'reload', label: '\u21bb', title: 'reload', shortcut: 'F5' },
 		    { action: 'zoom-out', label: '\u2212', title: 'zoom out', shortcut: null },
-		    { action: 'zoom-reset', label: '100%', title: 'reset the zoom to 100%', shortcut: null },
+		    // 票 #20b：**这颗按钮的标签原来是 `100%`，现在是 `reset`**，而这是一条验收要求逼出来的，
+		    // 不是口味问题。读数去掉了 `手动`/`自动` 前缀之后，工具条上那句读数就是 `100%`；而标签为
+		    // `100%` 的它会在同一行里**第二次**说出那句话 —— 票面要求"那句话只许出现一次，且要能数出
+		    // 次数（必须是 1）"，所以同一句话不能同时是一颗动作按钮的名字。动作一个没少：它仍然把缩放
+		    // 送回 100%，那句话仍在 `title` 上（"reset the zoom to 100%"）。
+		    // 词形与旁边的 `restart` 一致（都是词，不是百分比）—— 见 `tests/toolbar-panel.spec.ts` 里
+		    // 那条"数出现次数"的断言。
+		    { action: 'zoom-reset', label: 'reset', title: 'reset the zoom to 100%', shortcut: null },
 		    { action: 'zoom-in', label: '+', title: 'zoom in', shortcut: null },
-		    // 票 #19：把这一格**交回自动适配**（按栏宽自己缩放）。
+		    // 票 #20b：**这里原来有一颗 `auto` 按钮（票 #19 加的），现在没有了。**
 		    //
-		    // 为什么必须有这颗按钮，而不是"换页/重新开始之后自动回来"：换页不丢缩放是 #13 定下的
-		    // 语义（同源换页、换站点都实测过），而这条语义与"换页就把控制权交回自动"是矛盾的 ——
-		    // 二者只能留一个，留下的那个是**已经在验收里钉住**的那个。于是回到自动必须是一个
-		    // **说得出口的动作**，否则手动模式就是一个人进得去出不来的状态。
-		    { action: 'auto', label: 'auto', title: 'fit the page to the pane (let the pane decide the zoom)', shortcut: null },
+		    // 它当初存在的唯一理由是"手动缩放是一个进得去出不来的状态"：一旦有人指名过缩放值，自动适配
+		    // 就永远让位（#19 的语义），所以必须有一颗按钮把控制权交回去。票 #20b 把那条让位规则整个
+		    // 去掉了 —— 适配**永远开着**，一次手动缩放只是"现在的值"，下一次几何变化或换页都会被重新
+		    // 适配（见 `shell/main.js` 的 `applyZoom` 与 `did-navigate`）。没有模式可以交还，于是那颗
+		    // 按钮没有意义了。**通道那头那个动作端点还在**（旧客户端仍在调它），但面板不再渲染它。
 		    { action: 'restart', label: 'restart', title: 'go back to the page this pane started on', shortcut: null },
 		  ]
 		
@@ -460,32 +467,25 @@ window.__ModuleLoader__.load({
 		  }
 		
 		  /**
-		   * 面板上那个缩放读数，**带上是哪种模式**（票 #19）。
+		   * 面板上那个缩放读数（票 #20b：**只有百分比，没有模式前缀**）。
 		   *
-		   * 票面原话是"工具条的读数要说清当前是哪种模式（如 `自动 78%` / `手动 90%`），不许让人看不出来"。
-		   * 所以这句话有两个来源，而且**两个都不能猜**：
+		   * 票 #19 时这里长这样：`zoomReading(zoom, mode, words)` —— 按外壳说的模式拼出 `自动 78%` /
+		   * `手动 90%`，读不到模式就退回光秃秃的百分比。**票 #20b 把模式这一整套去掉了**：适配永远开着，
+		   * 所以"谁在管这个缩放"不再是一个会变的事实，前缀因此只会是一句废话（还会跟旁边那颗动作按钮
+		   * 抢同一句话，见 {@link BUTTONS} 里 `zoom-reset` 那一段）。
 		   *
-		   *  - 数：外壳读回来的 `getZoomFactor()`（读不到就是 `—`，见 {@link zoomLabel}）；
-		   *  - 词：调用方给的**文案表**（`{auto, manual}`）。这个词表**刻意不在这个文件里** ——
-		   *    这个文件一行文案都不带（连按钮的 title 都是英文硬编码的既有事实，见文件头），
-		   *    而"自动/手动"是要给用户看的、要跟着语言走的那两个词，所以它们与别的文案住在一起。
+		   * 外壳**仍然会发布** `mode`/`zoomMode`（旧插件在读它，兼容不许破，见 `shell/main.js` 的
+		   * `writeZoomFile`），但面板这一侧**一个字节都不用它**：这个函数只收一个数，多给一个参数也
+		   * 不会变出前缀来（`tests/toolbar.spec.ts` 有一条断言专门钉这件事）。
 		   *
-		   * 读不到模式时**退回一个光秃秃的百分比**，不编一个前缀：`78%` 说的是"这是 78%"，
-		   * 而猜出来的 `自动 78%` 说的是"外壳在按栏宽适配它" —— 后者可能不成立，而面板上那句话
-		   * 一旦不成立，用户就再也分不清"没适配"和"适配了但没动"了。
+		   * 读不到那个数时仍然是 `—`，不是 `100%`：{@link zoomLabel} 的规矩没变 —— 面板上那句话
+		   * 一旦不成立，用户就再也分不清"没读数"和"读到了 100%"。
 		   *
 		   * @param {unknown} zoom - 外壳读回来的缩放值。
-		   * @param {unknown} mode - `auto` / `manual` / 别的什么（读不到就是别的什么）。
-		   * @param {{auto?: string, manual?: string}} [words] - 那两个词。
-		   * @returns {string} 要显示的那一句。
+		   * @returns {string} 要显示的那一句（就是一个百分比，或 `—`）。
 		   */
-		  function zoomReading(zoom, mode, words) {
-		    var percent = zoomLabel(zoom)
-		    if (percent === '\u2014') return percent
-		    var table = words !== undefined && words !== null ? words : {}
-		    if (mode === 'auto' && typeof table.auto === 'string') return table.auto + ' ' + percent
-		    if (mode === 'manual' && typeof table.manual === 'string') return table.manual + ' ' + percent
-		    return percent
+		  function zoomReading(zoom) {
+		    return zoomLabel(zoom)
 		  }
 		
 		  /**
@@ -530,20 +530,20 @@ window.__ModuleLoader__.load({
 		  }
 		
 		  /**
-		   * 那行读数整个的样子（票 #20 C 定的形状）：**模式 + 百分比**，必要时再加两样东西。
+		   * 那行读数整个的样子（票 #20 C 定的形状，票 #20b 把模式前缀去掉了）：**百分比**，必要时再加两样。
 		   *
 		   *  - 页面还在加载 ⇒ 加一个"加载中"（票 #20 F 的第一条）；
 		   *  - 上一次动作没成 ⇒ 加那句"为什么"（{@link statusText}）。
 		   *
 		   * 三样之间用 ` · ` 连起来。URL **不在**这一行里 —— 它的位置让给了地址栏（票面 C 的原话）。
 		   *
-		   * @param {{zoom: unknown, zoomMode: unknown, loading?: unknown, message?: string, ok?: boolean|null}} state
-		   * @param {{auto?: string, manual?: string, loading?: string}} [words] - 那几个词（住在文案表里）。
+		   * @param {{zoom: unknown, loading?: unknown, message?: string, ok?: boolean|null}} state
+		   * @param {{loading?: string}} [words] - 要显示的那几个词（住在文案表里）。
 		   * @returns {string} 要显示的那一行。
 		   */
 		  function readingText(state, words) {
 		    var table = words !== undefined && words !== null ? words : {}
-		    var parts = [zoomReading(state.zoom, state.zoomMode, table)]
+		    var parts = [zoomReading(state.zoom)]
 		    if (state.loading === true && typeof table.loading === 'string' && table.loading !== '') parts.push(table.loading)
 		    var note = statusText(state)
 		    if (note !== '') parts.push(note)
@@ -843,10 +843,9 @@ window.__ModuleLoader__.load({
 	      '普通浏览器标签页里它没有东西可显示。',
 	    ready: '桌面外壳已就位：这一格交给原生浏览器视图。',
 	    missing: '这一格没有量到矩形（可能被折叠或切走了）。',
-	    // 票 #19：缩放读数上那两个词。面板必须让人**看得出来**现在是谁在管这个缩放，
-	    // 否则"自动适配没动"与"自动适配不在管"在界面上长得一模一样。
-	    zoomAuto: '自动',
-	    zoomManual: '手动',
+	    // 票 #20b：票 #19 加在这里的 `zoomAuto` / `zoomManual` 两个词**被删掉了**。
+	    // 读数上不再有模式前缀（适配永远开着，那个前缀只会是一句废话），所以那两个词没有任何使用者；
+	    // 留在文案表里只会让下一个人以为"面板还会说出它们"。
 	    // 票 #20 A：地址栏。
 	    //
 	    // `addressHelp` 是那条**补协议**的规则本身，写在输入框的 title 上：规则要说得出口，
@@ -874,8 +873,7 @@ window.__ModuleLoader__.load({
 	      'browser tab has nothing to put here.',
 	    ready: 'The desktop shell is here: the native browser view takes this pane.',
 	    missing: 'This pane reports no rectangle (collapsed or switched away).',
-	    zoomAuto: 'auto',
-	    zoomManual: 'manual',
+	    // 票 #20b：票 #19 的 `auto` / `manual` 两个词随模式一起删掉（见上面 zh 那一段的说明）。
 	    addressPlaceholder: 'Type an address, press Enter',
 	    addressHelp: 'A bare host gets https:// (example.com → https://example.com); a loopback host gets http:// (localhost:3000); http://, https://, file:// and about: are used as typed.',
 	    addressSend: 'open',
@@ -1136,7 +1134,6 @@ window.__ModuleLoader__.load({
 	    ok: null,
 	    url: '',
 	    zoom: undefined,
-	    zoomMode: undefined,
 	    loading: undefined,
 	    canGoBack: false,
 	    canGoForward: false,
@@ -1158,10 +1155,18 @@ window.__ModuleLoader__.load({
 	  var [address, setAddress] = react.useState('')
 	  /** 上一次提交被拒的那句话。空串 = 没有出错。 */
 	  var [addressError, setAddressError] = react.useState('')
-	  /** 档位菜单开着没有（票 #20 D）。 */
+	  /** 档位菜单开着没有（票 #20 D）。它**必须自己会收**（票 #20b 的要求 2，见下面那个 effect）。 */
 	  var [menuOpen, setMenuOpen] = react.useState(false)
 	  /** 光标在地址栏里吗（决定读回要不要覆盖框里的字）。 */
 	  var editing = react.useRef(false)
+	  /**
+	   * 工具条那一行本身（票 #20b 的要求 2）。
+	   *
+	   * 它只有一个用途：回答"这一下按在工具条**里面**还是**外面**"。菜单展开之后必须有办法自己收
+	   * 回去，而"点到别处"要判的就是这件事 —— 没有这个引用就只能靠"再点一次那颗按钮"，那正是
+	   * 用户遇到的那个"卡在展开状态"。
+	   */
+	  var toolbarRef = react.useRef(null)
 	
 	  /**
 	   * 把一次回答落到面板上 —— **所有**读回都从这里进。
@@ -1193,7 +1198,6 @@ window.__ModuleLoader__.load({
 	        // 一次失败的调用**没有读回任何东西**："读不到"不等于"地址是空的、缩放是未知的"。
 	        merged.url = previous.url
 	        merged.zoom = previous.zoom
-	        merged.zoomMode = previous.zoomMode
 	        merged.loading = previous.loading
 	        merged.backTarget = previous.backTarget
 	        merged.forwardTarget = previous.forwardTarget
@@ -1348,6 +1352,54 @@ window.__ModuleLoader__.load({
 	    }
 	  }, [])
 	
+	  /**
+	   * 档位菜单**展开之后自己会收**（票 #20b 的要求 2）。
+	   *
+	   * ## 为什么这一条是必须的，而不是"顺手加一下"
+	   *
+	   * 真机上量到过：用户那一格工具条高 **61px = 34 + 26**，第二行就是那排档位 —— 代码里
+	   * `menuOpen` 的初值是 `false`，所以问题不在"默认展开"，而在**展开之后不收**：点别处不收、
+	   * `Esc` 不收，菜单于是一直挂在那里，工具条永远是两行。用户的抱怨原文是"不用去把上面的聊天栏
+	   * 弄乱了"，而"弄乱"的机制正是这多出来的一行 —— 它把被测量的那一块往下推，原生画面跟着让位。
+	   *
+	   * ## 三条收法，各自走一条**道理上不同**的路
+	   *
+	   *  - **选了一个档位**：那颗档位按钮自己的 `onClick` 就收了（它紧接着要发一条 zoom-to）；
+	   *  - **点到工具条以外**：`pointerdown`（捕获阶段）。用捕获而不是冒泡，是因为"点别处"这件事
+	   *    不该取决于那一页上有没有人 `stopPropagation`；判据是"落点不在 {@link toolbarRef} 里"。
+	   *    **量出来的一个边界**：原生画面是另一块 `WebContentsView`，点在它上面的那一下**到不了**
+	   *    这个页面（见报告里的诚实清单）—— 所以这里收的是"点 DSH 界面别处"，不是"点网页里"。
+	   *  - **`Esc`**：与真浏览器的菜单同一条习惯。它同时 `preventDefault` + `stopPropagation`：
+	   *    一次按键只该有一个效果，而菜单开着的时候，用户的意思显然是"把菜单收掉"。
+	   *
+	   * 两个听众**只在开着的时候挂着**（`[menuOpen]` 的依赖就是这件事），关着的时候页面上一个多余
+	   * 的监听器都没有 —— 这个面板住在 DSH 的窗口里，它不该替整窗口的每一次点击接手。
+	   */
+	  react.useEffect(
+	    function () {
+	      if (menuOpen !== true) return undefined
+	      function onPointerDown(event) {
+	        var root = toolbarRef.current
+	        var target = event.target
+	        if (root !== null && root !== undefined && target !== null && target !== undefined && root.contains(target)) return
+	        setMenuOpen(false)
+	      }
+	      function onKeyDown(event) {
+	        if (event.key !== 'Escape') return
+	        event.preventDefault()
+	        event.stopPropagation()
+	        setMenuOpen(false)
+	      }
+	      document.addEventListener('pointerdown', onPointerDown, true)
+	      document.addEventListener('keydown', onKeyDown, true)
+	      return function () {
+	        document.removeEventListener('pointerdown', onPointerDown, true)
+	        document.removeEventListener('keydown', onKeyDown, true)
+	      }
+	    },
+	    [menuOpen],
+	  )
+	
 	  var words = copy()
 	  var children = []
 	  for (var index = 0; index < toolbar.BUTTONS.length; index++) {
@@ -1452,19 +1504,19 @@ window.__ModuleLoader__.load({
 	    },
 	  })
 	
-	  // 票 #19 + #20 C：读数只留用户要的信息（模式 + 百分比），必要时加"加载中"（F）与
+	  // 票 #19 + #20 C + #20b：读数只留用户要的那一个数（**百分比**），必要时加"加载中"（F）与
 	  // "为什么这一按没成"。宿主那些诊断话术一个字都没删 —— 它们在同一次渲染的
 	  // `data-dsh-view-diagnostic` 与 tooltip 上（另一个通道，仍然读得到）。
+	  //
+	  // 票 #20b 删掉了这里的两个词（`auto` / `manual`）：适配永远开着，"谁在管这个缩放"不再是一个
+	  // 会变的事实，前缀只会是一句废话。外壳**仍然在发布** `zoomMode`（旧插件在读它），
+	  // 但面板这一侧连读都不读它了 —— 它甚至不进 `state`（见上面那份初值）。
 	  var readingState = Object.assign({}, state, { message: addressError !== '' ? addressError : state.message })
 	  if (addressError !== '') readingState.ok = false
-	  var reading = toolbar.readingText(readingState, {
-	    auto: words.zoomAuto,
-	    manual: words.zoomManual,
-	    loading: words.loading,
-	  })
+	  var reading = toolbar.readingText(readingState, { loading: words.loading })
 	  var diagnostic = toolbar.diagnosticText(readingState)
 	
-	  // 票 #20 D：那颗百分比现在是一颗**菜单按钮**。菜单展开时工具条长高一行（于是被测量的那一块
+	  // 票 #20 D：那颗百分比是一颗**菜单按钮**。菜单展开时工具条长高一行（于是被测量的那一块
 	  // 自动变矮，外壳跟着把原生画面摆到新的矩形上）—— 不用浮层，因为浮层会被原生画面盖住。
 	  var currentPreset = toolbar.currentPreset(state.zoom)
 	  var presetItems = []
@@ -1503,13 +1555,41 @@ window.__ModuleLoader__.load({
 	    )
 	  }
 	
+	  /**
+	   * 那行读数：**一个**控件，既是读数也是档位菜单的开关（票 #20b 的要求 3）。
+	   *
+	   * 票 #20 D 的代码在这里渲染了**两遍**同一句话：一颗 `<button data-dsh-view-zoom-menu>` 与一个
+	   * `<span data-dsh-view-zoom data-dsh-view-reading>`，两个的孩子都是 `reading`。真机上量到的
+	   * 就是它（用户附的证据，本轮又原样量了一遍）：
+	   *
+	   * ```
+	   * BUTTON[data-dsh-view-zoom-menu=closed]                         → "自动 100%"
+	   * SPAN  [data-dsh-view-zoom][data-dsh-view-reading][…diagnostic] → "自动 100%"
+	   * ```
+	   *
+	   * 用户的原话是"同一个信息渲染了两遍……一个带框、旁边又一个"，而票面把这一条定成了验收：
+	   * 那句话**只许出现一次**，并且要能**数**出来（必须是 1）。
+	   *
+	   * 所以这两个元素**合成一个 `<button>`**：它显示那句话，点它就是展开/收起档位（真浏览器也是
+	   * 点百分比选档位），而诊断话术仍旧只挂在它的 `title` 与 `data-dsh-view-diagnostic` 上
+	   * （票 #20 C 那条规矩一个字没改）。合成而不是"再放一颗 ▾ 按钮"，是因为代码里那段注释本来
+	   * 写的就是这个意思 —— *"菜单关着时它既是读数也是菜单按钮"* —— 而实现多画了一个元素。
+	   *
+	   * `aria-label` 上是"点它能做什么"（文案表里那个词）。它**不是** `title`：`title` 的位置
+	   * 让给诊断了，而一个只有一句话的按钮不该因为"那句话是诊断"就没有名字。
+	   */
 	  var zoomControl = react.createElement(
 	    'button',
 	    {
 	      key: 'zoom-menu',
 	      type: 'button',
 	      'data-dsh-view-zoom-menu': menuOpen ? 'open' : 'closed',
-	      title: words.zoomMenuTitle,
+	      // `zoomLabel` 自己就把"读不到"渲染成 `—`（票 #19 的规矩），所以这里不再判一次。
+	      'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
+	      'data-dsh-view-reading': reading,
+	      'data-dsh-view-diagnostic': diagnostic,
+	      'aria-label': words.zoomMenuTitle,
+	      title: diagnostic,
 	      disabled: props.hasShell !== true,
 	      onClick: function () {
 	        setMenuOpen(function (open) {
@@ -1517,44 +1597,25 @@ window.__ModuleLoader__.load({
 	        })
 	      },
 	      style: {
-	        font: '11px/1 system-ui',
+	        font: '11px/1.3 system-ui',
 	        height: '22px',
 	        padding: '0 6px',
 	        border: '1px solid var(--dsh-color-border, #d0d7de)',
 	        borderRadius: '4px',
 	        background: 'var(--dsh-color-surface, #fff)',
-	        color: 'inherit',
-	        cursor: 'pointer',
-	        whiteSpace: 'nowrap',
-	        flex: '0 0 auto',
-	      },
-	    },
-	    reading,
-	  )
-	
-	  // 那一行读数：菜单关着时它既是读数也是菜单按钮（真浏览器也是点百分比选档位）。
-	  var readingSpan = react.createElement(
-	    'span',
-	    {
-	      // `zoomLabel` 自己就把"读不到"渲染成 `—`（票 #19 的规矩），所以这里不再判一次。
-	      'data-dsh-view-zoom': toolbar.zoomLabel(state.zoom),
-	      'data-dsh-view-reading': reading,
-	      'data-dsh-view-diagnostic': diagnostic,
-	      style: {
-	        font: '11px/1.3 system-ui',
 	        whiteSpace: 'nowrap',
 	        overflow: 'hidden',
 	        textOverflow: 'ellipsis',
 	        flex: '0 1 auto',
+	        cursor: 'pointer',
 	        opacity: state.ok === false || addressError !== '' ? 1 : 0.75,
 	        color: state.ok === false || addressError !== '' ? 'var(--dsh-color-danger, #b42318)' : 'inherit',
 	      },
-	      title: diagnostic,
 	    },
 	    reading,
 	  )
 	
-	  // 行一：导航按钮 + 地址栏。行二（只在菜单展开时存在）：那一排标准档位。
+	  // 行一：导航按钮 + 地址栏 + 那颗读数/菜单按钮。行二（只在菜单展开时存在）：那一排标准档位。
 	  var row = react.createElement(
 	    'div',
 	    {
@@ -1570,7 +1631,6 @@ window.__ModuleLoader__.load({
 	    children,
 	    addressField,
 	    zoomControl,
-	    readingSpan,
 	  )
 	
 	  var rows = [row]
@@ -1599,9 +1659,17 @@ window.__ModuleLoader__.load({
 	    'div',
 	    {
 	      'data-dsh-view-toolbar': 'ready',
+	      // 票 #20b 的要求 2 靠这一个引用判"点在工具条里面还是外面"（见上面那个 effect）。
+	      ref: toolbarRef,
 	      style: {
 	        // 菜单展开时长高一行（`height: auto` 让内容决定），于是被测量的那一块自动变矮 ——
 	        // 原生画面跟着让出那一行，菜单因此**不会**被它盖住（浮层一定会）。
+	        //
+	        // 票 #20b 的要求 2：**空闲时严格一行**。这一句本来就是对的（关着就是那个常量），
+	        // 出问题的是"关不上" —— 展开之后点别处/按 Esc 都不收，于是一行变成常驻的两行。
+	        // 那三条收法在 `menuOpen` 那个 effect 里；`tests/toolbar-panel.spec.ts` 与
+	        // `tests/panel-toolbar-placement.spec.ts` 都**读回几何**（工具条高度、面板矩形上边缘）
+	        // 来钉它，不读 `menuOpen` 这个状态变量本身。
 	        height: menuOpen ? 'auto' : toolbar.TOOLBAR_HEIGHT_PX + 'px',
 	        minHeight: toolbar.TOOLBAR_HEIGHT_PX + 'px',
 	        display: 'flex',

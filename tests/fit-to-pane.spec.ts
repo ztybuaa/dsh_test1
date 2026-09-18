@@ -391,58 +391,93 @@ describe('票 #19 · 栏宽一变，页面自己缩放到刚好塞得下（真�
     expect(Number(atEnd.scrollWidth)).toBeLessThanOrEqual(Number(atEnd.clientWidth))
   }, 300_000)
 
-  it('手动缩放优先：按过之后拖栏宽不会把用户的值改回去；「自动」再把这一格交回来', async () => {
+  it('票 #20b：手动缩放只是"现在的值" —— 栏宽一变、换一次页，都会被重新适配（适配永远开着）', async () => {
+    // 票 #19 时这一条量的是**相反**的结论（"手动缩放优先：按过之后拖栏宽不会把用户的值改回去"）。
+    // 票 #20b 把它改掉了，因为用户把"手动 / 自动"这一整套都要掉了（原话："这个手动、自动我觉得
+    // 反而是多此一举，直接自动就完事了"）：手动缩放**保留**，但它的语义降级成"现在的值" ——
+    // 下一次几何变化或换页会被重新适配。**这也是这条用例存在的理由**：它量的就是那个降级。
     await session.goto(`${shell.handshake.fixtureOrigin}/fixed-width`)
     await new Promise((settle) => setTimeout(settle, 400))
     await setPane(NARROW)
     await new Promise((settle) => setTimeout(settle, 600))
 
-    // 起点：自动适配已经把这一页缩到 620 的栏里了（换页之后它自己适配的，没人按过任何按钮）。
+    // ── 起点：自动适配已经把这一页缩到 620 的栏里了（没人按过任何按钮） ──
     const fitted = await facts()
     const autoReading = reading()
     console.log('RAW 自动适配之后: ' + JSON.stringify({ facts: fitted, reading: autoReading }))
     expect(Number(fitted.barWidth), 'the fixture is a fixed-width page: 1200px of content').toBeCloseTo(1200, 0)
-    expect(autoReading?.mode).toBe('auto')
     expect(autoReading?.zoom ?? 1, 'a 1200px page in a 620px pane has to be shrunk to fit').toBeLessThan(1)
+    // `mode` 这个字段还在发布（旧插件读它，票面明令兼容不许破），而它**永远是 auto**。
+    expect(autoReading?.mode, 'the published mode is a compatibility constant now').toBe('auto')
 
-    // 用户按了一次 `100%`（走的是会话那条真通道：请求文件 → 外壳）。这一按就是"我说了算"。
+    // ── 用户按了一次 `100%`：这就是"现在的值"。它真的生效了（这一页又塞不下了） ──
     const reset = await session.resetZoom()
     const manualFacts = await facts()
     console.log('RAW 按下 100% 之后: ' + JSON.stringify({ reset, facts: manualFacts, reading: reading() }))
     expect(reset.zoom).toBe(1)
-    expect(reading()?.mode, 'an explicit zoom means the person is in charge now').toBe('manual')
-    // 现在这一页**真的塞不下了** —— 这就是"手动接管"的可见代价，也是下面那条断言的前提。
     expect(Number(manualFacts.scrollWidth)).toBeGreaterThan(Number(manualFacts.clientWidth))
+    // **而这一按不再把适配关掉**：票 #20b 之前它会切成 `manual`，从此栏宽再变外壳也不动它。
+    expect(reading()?.mode, 'naming a zoom value must not turn automatic fitting off any more').toBe('auto')
 
-    // 再拖栏宽两次：自动适配必须**让位**（它明明有能力把这一页塞进来，但不许动手）。
+    // ── 另一半（**全量跑时实测抓到的**）：没有几何变化的时候，那个值不许被谁改回去 ──
+    // 票 #19 里这条由模式闸门保证（人一按，适配整个让位）；模式删掉之后，一次 `settle`、
+    // 一次"同样的矩形再报一遍"、宿主自己那一页刷新，都会请一轮适配并**把值改回适配值**。
+    // 所以这里再报一次**同一个矩形**（栏宽没变）并等一会儿：值必须站着不动。
+    await setPane(NARROW)
+    await new Promise((settle) => setTimeout(settle, 800))
+    const afterSameRect = await facts()
+    const readingAfterSameRect = reading()
+    console.log('RAW 手动之后同一个矩形再报一次: ' + JSON.stringify({ facts: afterSameRect, reading: readingAfterSameRect }))
+    expect(
+      Number(afterSameRect.scrollWidth),
+      'nothing moved, so the page must still be cut off: the hand-set value stands',
+    ).toBeGreaterThan(Number(afterSameRect.clientWidth))
+    expect(
+      readingAfterSameRect?.zoom ?? -1,
+      'a placement that does not move anything must not undo the value a person just pressed',
+    ).toBeCloseTo(1, 3)
+
+    // ── 栏宽变一次（拖窄再拖回来）：适配必须**重新接手**，页面又刚好塞得下 ──
     await dragPane(NARROW, 900, 8)
     await dragPane(900, NARROW, 8)
-    await new Promise((settle) => setTimeout(settle, 600))
+    await waitForPaneWidth(NARROW)
+    const refitAfterDragMs = await waitForFit()
     const afterDrag = await facts()
     const readingAfterDrag = reading()
-    console.log('RAW 手动模式下拖完栏宽: ' + JSON.stringify({ facts: afterDrag, reading: readingAfterDrag }))
-    expect(readingAfterDrag?.mode).toBe('manual')
-    expect(readingAfterDrag?.zoom, 'a manual zoom must survive a pane drag').toBeCloseTo(1, 3)
+    console.log('RAW 手动之后拖了一轮栏宽: ' + JSON.stringify({ facts: afterDrag, reading: readingAfterDrag, refitAfterDragMs }))
+    expect(refitAfterDragMs, 'a pane change must re-fit the page, with nobody pressing anything').toBeGreaterThanOrEqual(0)
     expect(
       Number(afterDrag.scrollWidth),
-      'the page must still be cut off: the fit was told to stand down, and it did',
-    ).toBeGreaterThan(Number(afterDrag.clientWidth))
+      'the page must be inside the layout viewport again: the fit took it back',
+    ).toBeLessThanOrEqual(Number(afterDrag.clientWidth))
+    expect(readingAfterDrag?.zoom ?? 1, 'the value is the fitted one now, not the hand-set 100%').toBeLessThan(1)
 
-    // 「自动」把它交回来：适配立刻接手，页面又刚好塞得下。
-    const handedBack = await session.useAutoZoom()
-    const afterAuto = await facts()
-    const readingAfterAuto = reading()
-    console.log('RAW 按下「自动」之后: ' + JSON.stringify({ handedBack, facts: afterAuto, reading: readingAfterAuto }))
-    expect(readingAfterAuto?.mode).toBe('auto')
-    expect(readingAfterAuto?.zoom ?? 1).toBeLessThan(1)
-    expect(Number(afterAuto.scrollWidth)).toBeLessThanOrEqual(Number(afterAuto.clientWidth))
-    // 交回去之后，栏宽再变它又跟着走了（这才叫"交回来了"，而不是只有那一次例外）。
-    await setPane(700)
-    await new Promise((settle) => setTimeout(settle, 600))
-    const afterSecondDrag = await facts()
-    console.log('RAW 交回自动之后再拖一次: ' + JSON.stringify(afterSecondDrag))
-    expect(Number(afterSecondDrag.scrollWidth)).toBeLessThanOrEqual(Number(afterSecondDrag.clientWidth))
-    expect(Number(afterSecondDrag.devicePixelRatio)).not.toBeCloseTo(Number(manualFacts.devicePixelRatio), 3)
+    // ── 再按一次 `100%`，然后**换页**：换页也必须重新适配（票面："换页时也适配"） ──
+    await session.resetZoom()
+    const beforeNavigation = await facts()
+    console.log('RAW 换页之前（手动 100%）: ' + JSON.stringify(beforeNavigation))
+    expect(
+      Number(beforeNavigation.scrollWidth),
+      'the hand-set value must really be too big for the pane before the navigation',
+    ).toBeGreaterThan(Number(beforeNavigation.clientWidth))
+    await session.goto(`${shell.handshake.fixtureOrigin}/fixed-width`)
+    const refitAfterNavigationMs = await waitForFit()
+    const afterNavigation = await facts()
+    const readingAfterNavigation = reading()
+    console.log(
+      'RAW 手动之后换了一次页: ' +
+        JSON.stringify({ facts: afterNavigation, reading: readingAfterNavigation, refitAfterNavigationMs }),
+    )
+    expect(refitAfterNavigationMs, 'a page change must re-fit the page').toBeGreaterThanOrEqual(0)
+    expect(Number(afterNavigation.scrollWidth), 'the whole page must be inside the layout viewport again').toBeLessThanOrEqual(
+      Number(afterNavigation.clientWidth),
+    )
+    expect(readingAfterNavigation?.zoom ?? 1).toBeLessThan(1)
+    // 而"重新适配"是**真的算过**（不是"那个值恰好又对了"）：适配跑过的轮数在两次变化里都涨了。
+    expect(
+      readingAfterNavigation?.fitPasses ?? 0,
+      'the fit must have run for each of the two changes',
+    ).toBeGreaterThan(autoReading?.fitPasses ?? 0)
   }, 300_000)
 
   it('不震荡：连续拖动时缩放单调收敛，而且跟手延迟量得出来', async () => {
@@ -451,7 +486,8 @@ describe('票 #19 · 栏宽一变，页面自己缩放到刚好塞得下（真�
     await new Promise((settle) => setTimeout(settle, 400))
     await setPane(WIDE)
     await settle()
-    // 从"交回自动"开始：上一条用例把它留在手动上。
+    // 从一个确定的起点开始：100% + 宽栏（`useAutoZoom` 就是"现在重新适配一次"，票 #20b 之后
+    // 它不再切换任何状态；这里用它只是为了让起点干净，与上一条用例留下的值无关）。
     await session.useAutoZoom()
     await settle()
     expect(reading()?.zoom, 'the starting point of this measurement is 100% at a pane wide enough').toBeCloseTo(1, 3)

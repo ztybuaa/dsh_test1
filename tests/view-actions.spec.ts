@@ -410,28 +410,44 @@ describe('票 #13 · 导航与缩放，以及面板上的那条工具条', () =>
     }
   }, 300_000)
 
-  it('缩放跟着**视图**走，不跟着网站走：同源换页与换到另一个站点都还在', async () => {
+  it('票 #20b：换页之后**决定权在适配** —— 外壳不再把你上一次选的数按回去', async () => {
+    // 这一条替换掉的是票 #13 的"缩放跟着**视图**走，不跟着网站走：同源换页与换到另一个站点都还在"。
+    // 那条语义（外壳在每次导航之后把期望值重新按上去）**票 #20b 删掉了**：用户把"手动 / 自动"
+    // 这一整套都要掉了，一次手动缩放只是"现在的值"，**换页会被重新适配**。
     await session.goto(`${origin}/one`)
     await session.zoomTo(0.5)
     expect((await pageFacts()).innerWidth).toBe(1240)
 
-    // 同源的下一页：缩放还在。
+    // 同源的下一页：这个值还在 —— 但要说清它是**谁**留下的：Chromium 自己的缩放按**站点**记，
+    // `/one` 与 `/two` 是同一个站点。这一条留在下面那条之前，正是为了把两个来源分开。
     await session.goto(`${origin}/two`)
-    const afterNavigation = await pageFacts()
-    console.log('RAW zoom 50% after navigating to page two: ' + JSON.stringify(afterNavigation))
-    expect(afterNavigation.innerWidth).toBe(1240)
-    expect(Math.abs(Number(afterNavigation.devicePixelRatio) - SCREEN_DPR * 0.5)).toBeLessThan(0.02)
+    const sameSite = await pageFacts()
+    console.log('RAW zoom 50% after navigating to page two: ' + JSON.stringify(sameSite))
+    expect(sameSite.innerWidth).toBe(1240)
 
-    // **另一个站点**（同一个服务器的另一个主机名）：Chromium 自己的缩放是按站点记的，
-    // 换站点会回到那个站点的默认值 —— 所以这件事必须由外壳在导航之后重新按上去，
-    // 否则"点了链接缩放就没了"。这一条量的正是那条重新按上去的规矩（见 ADR-0013）。
+    // **另一个站点**（同一个服务器的另一个主机名）：Chromium 回到那个站点的默认值，而"外壳把
+    // 期望值重新按上去"那一支已经没有了 ⇒ 这里量到的就是 100%（`innerWidth` 回到 620）。
     const otherSite = origin.replace('127.0.0.1', 'localhost')
     const moved = await session.goto(`${otherSite}/one`)
     const afterSiteChange = await pageFacts()
-    console.log('RAW zoom 50% after moving to another site: ' + JSON.stringify({ moved, afterSiteChange }))
+    console.log('RAW after moving to another site: ' + JSON.stringify({ moved, afterSiteChange }))
     expect(afterSiteChange.url).toContain('localhost')
-    expect(afterSiteChange.innerWidth, 'the zoom must follow the view, not the site').toBe(1240)
-    expect(Math.abs(Number(afterSiteChange.devicePixelRatio) - SCREEN_DPR * 0.5)).toBeLessThan(0.02)
+    expect(
+      afterSiteChange.innerWidth,
+      'a hand-set zoom must not be re-applied when the page changes: the fit owns the value now',
+    ).toBe(SLOT.width)
+    // 页面自己报的 dpr 也回到"100%"那个数（屏幕 dpr × 1）—— 这是页面自己的读数，不是文件里的。
+    expect(
+      Math.abs(Number(afterSiteChange.devicePixelRatio) - SCREEN_DPR),
+      'the page must really be drawn at 100% after the page change',
+    ).toBeLessThan(0.02)
+
+    // 为什么这一份里没有"适配把它算成多少"：这一格**没有被摆到面板上**（没有面板上报矩形），
+    // 因而没有"栏宽"可算 —— 适配那条闸门（`requestFit` 里"视图没显示就不算"）在这里是关着的，
+    // `did-navigate` 也在同一道闸门后面（它连那一次"回到 100%"的状态写盘都不做）。所以
+    // `zoom.json` 那一刻停在**上一次写它的那个数**上（0.5），而页面已经是 100% 了 ——
+    // "文件可能比事实旧"这件事在 ADR-0013 里记过，这里量到的是它的一个具体形状。
+    // 真被适配的那一份读回在 `tests/fit-to-pane.spec.ts` 的同名用例里（那边视图真的在屏上）。
 
     // 重置：回 100%，页面自己读到的也回 620。
     const reset = await session.resetZoom()

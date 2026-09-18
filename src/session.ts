@@ -2070,9 +2070,9 @@ export class AdoptedViewSession {
     // 历史读一次、用两处：面板上的两颗按钮与"这份数是从哪来的"必须描述同一个瞬间
     // （票 #18 加的那个来源字段说的就是这份读数的来源，分成两次读就会自相矛盾）。
     const reading = await this.historyState()
-    // 缩放（票 #19）**当场读回来**，不是报会话记的那个数：自动适配会在没人请求的时候改它，
-    // 而这份读数的用途正是让人看见"现在是多少、谁在管"。读不到就退回会话记的值，
-    // 并且**不声称**任何模式（`zoomMode` 缺席）—— "不知道谁在管"不该被渲染成"自动在管"。
+    // 缩放（票 #19）**当场读回来**，不是报会话记的那个数：自动适配会在没人请求的时候改它。
+    // 票 #20b 起这句话少了一半：`zoomMode` 还在**发布**（旧插件在读它，兼容不许破），但面板
+    // 不再看它了 —— 适配永远开着，那个字段永远是 `auto`。这里照旧原样转出去，不做任何解释。
     const fresh = await this.readZoomQuietly()
     const neighbours = this.historyReader.neighbours()
     return {
